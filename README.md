@@ -20,10 +20,10 @@ Normal → Sport → Mountain → Hold, so reaching a target mode means computin
 how many presses to send from the current mode — see DESIGN.md for why that
 makes a current-mode status signal a hard requirement.
 
-**Status:** design phase. Next step is signal discovery on the actual
-vehicle (Phase 1 in DESIGN.md) — confirming whether the button-press CAN
-message matches the Gen 2 reference project's, and finding a current-mode
-status signal.
+**Status:** hardware ordered (2026-08-23), awaiting arrival. Once it
+arrives: signal discovery on the actual vehicle (Phase 1 in DESIGN.md) —
+confirming whether the button-press CAN message matches the Gen 2
+reference project's, and finding a current-mode status signal.
 
 **Hardware:** PiCAN2 (Raspberry Pi CAN-bus HAT) + Raspberry Pi 3B, connected
 to the OBD-II port via an off-the-shelf OBD-II-to-DB9 cable, powered from

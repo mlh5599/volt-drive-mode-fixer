@@ -1,5 +1,9 @@
 # Volt Drive Mode Fixer — Design
 
+**Status (2026-08-23):** hardware ordered (see BOM in "Hardware design"),
+awaiting arrival. Next step on arrival: Phase 1 signal discovery (see
+"Phased plan") — nothing to do until then.
+
 ## Problem
 
 On an aging Gen 1 Chevy Volt (2011–2015), fully depleting the EV battery causes
@@ -198,15 +202,15 @@ Note: PiCAN2 draws its 5V entirely from the Pi's own 40-pin GPIO
 header — it has no separate power input of its own. This matters for the
 power design below.
 
-**Recommended BOM:**
+**BOM — ordered 2026-08-23:**
 
-| Part | Role | Approx. price |
-|---|---|---|
-| PiCAN2 (SK Pang) | CAN read/write interface, DB9 connector | ~$37 |
-| Raspberry Pi 3B | Runs the monitor/injector daemon; PiCAN2 mounts directly on it | ~$35 |
-| OBD-II-to-DB9 cable (e.g. iKKEGOL) | Connects PiCAN2's DB9 port to the vehicle's OBD-II port | ~$10–15 |
-| 12V cigarette-lighter/accessory-socket USB car charger (5V) | Power for the Pi | ~$8–10 |
-| microSD card | OS storage | ~$8 |
+| Part | Role | Price paid | Source |
+|---|---|---|---|
+| PiCAN2 (SK Pang, base version) | CAN read/write interface, DB9 connector | $59.95 | [Copperhill Technologies](https://copperhilltech.com/pican-2-can-bus-interface-for-raspberry-pi/) |
+| Raspberry Pi 3B | Runs the monitor/injector daemon; PiCAN2 mounts directly on it | $35.00 | [Adafruit #3055](https://www.adafruit.com/product/3055) |
+| OBD-II-to-DB9 cable (iKKEGOL) | Connects PiCAN2's DB9 port to the vehicle's OBD-II port | ~$10–15 | [Amazon](https://www.amazon.com/iKKEGOL-Adapter-Diagnostic-Extension-Connector/dp/B077SHQQ1D) — also Copperhill's own recommended replacement for their now-discontinued OBD2-DB9 cable, confirming the pinout matches PiCAN2's OBD-II jumper setting (CAN-H → OBD pin 6 → DB9 pin 3; CAN-L → OBD pin 14 → DB9 pin 5; ground → OBD pins 4/5 → DB9 pins 1/2) |
+| 12V cigarette-lighter/accessory-socket USB car charger (5V) | Power for the Pi | ~$8–10 | any standard USB car charger |
+| microSD card | OS storage | ~$8 | any Class 10/A1-rated card |
 
 This is a smaller footprint than the reference project (which added a
 touchscreen for a manual UI) since this design's whole point is to run
