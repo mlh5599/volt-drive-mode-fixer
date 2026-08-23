@@ -11,6 +11,22 @@ with a device on the car's CAN bus that applies configurable, independent
 trigger strategies (below) to switch modes before the pack gets low enough to
 cause the problem.
 
+## Design requirements
+
+- **DR1 — Prevent reduced-propulsion mode.** Act on EV battery SOC/range
+  before the pack depletes far enough to cause voltage sag and trigger
+  reduced-propulsion mode.
+- **DR2 — Configurable on-start trigger.** On every drive cycle (ignition
+  on), optionally switch to Mountain Mode.
+- **DR3 — Configurable SOC-threshold trigger.** When SOC drops to a
+  configurable percentage, optionally switch to Hold Mode.
+- **DR4 — Off-the-shelf hardware preferred.** Favor a proven, reusable CAN
+  interface over custom PCB/firmware design; hobbyist-level electronics
+  work (soldering, wiring, light scripting) is acceptable where needed.
+- **DR5 — Extensible to a future Trip Mode trigger.** The trigger/injector
+  architecture must accommodate adding a speed-based Hold trigger later
+  without a redesign.
+
 ## Vehicle context
 
 The Volt (both Gen 1 and Gen 2, model years 2011–2019) uses GM's **Global A**
@@ -28,7 +44,7 @@ for Gen 2 — plausibly even the same underlying signal (`0x1E1`, see below),
 though that's only confirmed on a 2017 (Gen 2) car and needs verification on
 this one.
 
-What each mode actually does, per the owner:
+Each mode's behavior:
 - **Normal** — uses the full EV battery before switching to gasoline.
 - **Sport** — same battery behavior as Normal, snappier throttle response.
 - **Mountain** — lets the pack drain to ~50% SOC, then maintains ~50% by
@@ -47,11 +63,11 @@ Two independent trigger strategies, each individually enabled/disabled and
 configured, plus a planned future third. They share the same underlying
 injector — a trigger just decides *when* to fire and *which* mode to request.
 
-1. **On-start → Mountain Mode.** Every drive cycle (ignition on), the device
-   switches to Mountain Mode. Mountain Mode keeps a buffer in the pack rather
-   than depleting it fully, so this is a simple, always-on hedge — the
-   original fallback idea from the initial ask.
-2. **SOC threshold → Hold Mode.** When SOC drops to a configurable
+1. **On-start → Mountain Mode (DR2).** Every drive cycle (ignition on), the
+   device switches to Mountain Mode. Mountain Mode keeps a buffer in the
+   pack rather than depleting it fully, so this is a simple, always-on
+   hedge that satisfies the baseline on-start requirement.
+2. **SOC threshold → Hold Mode (DR3).** When SOC drops to a configurable
    percentage, the device switches to Hold Mode. Hold maintains the pack at
    whatever SOC it's at when engaged (using the gas engine to avoid dropping
    further) — so triggering it right as SOC nears the danger zone should
@@ -59,7 +75,7 @@ injector — a trigger just decides *when* to fire and *which* mode to request.
    reduced-propulsion mode. (Mountain has a similar backstop effect once the
    pack hits ~50%, but Hold is the one that can be engaged at *any* SOC, which
    is why it's the threshold target rather than Mountain.)
-3. **Trip Mode (future work — not building this yet).** The
+3. **Trip Mode (DR5, future work — not building this yet).** The
    [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
    actual approach: switch to Hold above a speed threshold (e.g. highway
    driving) to bank EV range for later city driving, then release it
@@ -117,12 +133,12 @@ below.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | `0x206` | Bytes 1–2, ~0.25 kWh/count granularity per OVMS notes. **Needs calibration** against your car's dash %/kWh readings — treat the raw value as relative until you've confirmed the scaling for your pack. |
-| Drive mode cycle button press | `0x1E1`, bit 39 (candidate) | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`, documented on a 2017 (Gen 2) car. Gen 1 (this car) uses the same style of cycling button (Normal→Sport→Mountain→Hold per the owner), so this is the first thing to test on the actual car — **not yet confirmed on Gen 1**, but a strong candidate rather than an unknown. |
+| EV battery SOC | `0x206` | Bytes 1–2, ~0.25 kWh/count granularity per OVMS notes. **Needs calibration** against the vehicle's dash %/kWh readings — treat the raw value as relative until the scaling for this pack is confirmed. |
+| Drive mode cycle button press | `0x1E1`, bit 39 (candidate) | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`, documented on a 2017 (Gen 2) car. Gen 1 (this vehicle) uses the same style of cycling button (Normal→Sport→Mountain→Hold), so this is the first thing to test on the actual vehicle — **not yet confirmed on Gen 1**, but a strong candidate rather than an unknown. |
 | Ignition/drive-cycle start | — | **Not documented as a single signal**, but inferable: the panda has a hardware ignition-sense line, and/or bus activity itself (Global A buses go quiet with the car off) can serve as a start-of-drive-cycle marker. Confirm which is more reliable during signal discovery. |
 | Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
 | Shift/PRNDL position | `0x135` / `0x1F5` | Useful as a safety precondition (e.g., don't inject while not in Drive). |
-| EV range remaining | — | **Not documented anywhere found.** Use SOC (`0x206`) as the trigger signal instead — matches the original ask ("range or battery %") and is the metric that's actually accessible. |
+| EV range remaining | — | **Not documented anywhere found.** Use SOC (`0x206`) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
 | Current drive mode (status, not button-press) | — | **Not documented, and now required rather than optional** — because mode selection is a 4-way cycle, the daemon needs to know the current mode to compute how many button presses reach the target (see "Trigger strategies"). Also lets the device avoid overriding a mode the driver deliberately chose. See "Open items" for a fallback if no such signal exists. |
 
@@ -141,7 +157,7 @@ This is a smaller footprint than the reference project (which added a
 touchscreen for a manual UI) since this design's whole point is to run
 unattended — no display needed. Mount the SBC + panda somewhere accessible
 (e.g. under the dash near the OBD port) so it's easy to unplug entirely if
-something needs to be debugged or disabled — that's your physical kill
+something needs to be debugged or disabled — that's the physical kill
 switch, and it's free.
 
 Power the SBC from a switched (ignition-on) 12V source if possible, so the
@@ -224,7 +240,7 @@ this project needs. Tighten that:
 
 ## Phased plan
 
-1. **Signal discovery (your car, stationary).** Connect panda + laptop
+1. **Signal discovery (on-vehicle, stationary).** Connect panda + laptop
    (skip the SBC for now), log CAN traffic with `cabana` or SavvyCAN.
    Confirm `0x206` tracks SOC sensibly on this car. Then, with the car
    safely stationary:
@@ -256,10 +272,10 @@ this project needs. Tighten that:
    to the SBC.
 4. **Deployment.** Move to the SBC, mount it and the panda in the car,
    power from a switched 12V source, and test across several real drive
-   cycles, tuning the SOC threshold based on how early you need the switch
+   cycles, tuning the SOC threshold based on how early the switch needs
    to happen to reliably avoid reduced-propulsion mode.
 
-## Open items (need your car to resolve)
+## Open items (pending on-vehicle verification)
 
 - Whether the mode-cycle button press is `0x1E1` bit 39 (as on the Gen 2
   reference car) or a different message on this Gen 1 car — requires step 1
@@ -279,7 +295,7 @@ this project needs. Tighten that:
   signal too, or can assume a fixed starting mode.
 - The most reliable way to detect "drive cycle start" for the on-start
   trigger (panda ignition-sense line vs. bus-activity heuristic).
-- The SOC (`0x206`) raw-value-to-percentage scaling for your specific
+- The SOC (`0x206`) raw-value-to-percentage scaling for this specific
   pack/model year — calibrate against the dash reading.
 
 ## Sources
