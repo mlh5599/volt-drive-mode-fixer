@@ -15,10 +15,15 @@ together:
 See [DESIGN.md](DESIGN.md) for the full hardware/software design, config
 schema, phased plan, and safety model.
 
+Mode selection on this car is a single button that cycles
+Normal → Sport → Mountain → Hold, so reaching a target mode means computing
+how many presses to send from the current mode — see DESIGN.md for why that
+makes a current-mode status signal a hard requirement.
+
 **Status:** design phase. Next step is signal discovery on the actual
-vehicle (Phase 1 in DESIGN.md) — the CAN messages for Gen 1's Mountain Mode
-button and Hold Mode engagement aren't publicly documented and need to be
-captured directly.
+vehicle (Phase 1 in DESIGN.md) — confirming whether the button-press CAN
+message matches the Gen 2 reference project's, and finding a current-mode
+status signal.
 
 **Hardware:** comma.ai panda (red) + small SBC (e.g. Raspberry Pi Zero 2 W).
 

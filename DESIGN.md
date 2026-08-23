@@ -21,13 +21,25 @@ CAN buses. The Volt also has a second, auxiliary OBD-style connector
 (passenger side) exposing the HV/battery-management bus, but the standard
 port is sufficient for this project.
 
-Gen 1 and Gen 2 differ in how drive mode is selected:
-- **Gen 2** has a single "Drive Mode" button that *cycles* Normal → Sport →
-  Mountain/Hold.
-- **Gen 1** (this car) has a **discrete physical Mountain Mode button** —
-  not a cycling button. The CAN message it sends has not been publicly
-  documented (see "Open items" below); Gen 2's cycling-button message
-  (`0x1E1`, described below) does not directly apply.
+Gen 1 (this car) has a single physical mode button that **cycles** through
+four modes, in order: **Normal → Sport → Mountain → Hold** (then presumably
+back to Normal). This is the same kind of cycling control opendbc documents
+for Gen 2 — plausibly even the same underlying signal (`0x1E1`, see below),
+though that's only confirmed on a 2017 (Gen 2) car and needs verification on
+this one.
+
+What each mode actually does, per the owner:
+- **Normal** — uses the full EV battery before switching to gasoline.
+- **Sport** — same battery behavior as Normal, snappier throttle response.
+- **Mountain** — lets the pack drain to ~50% SOC, then maintains ~50% by
+  engaging the gas engine as needed.
+- **Hold** — maintains the pack at *whatever SOC it's at* when engaged, by
+  engaging the gas engine as needed.
+
+Because it's a cycle button rather than discrete per-mode controls, reaching
+a specific target mode means sending the same one button-press message a
+computed number of times from the current mode — not one distinct message
+per mode. See "Trigger strategies" and "Software architecture" below.
 
 ## Trigger strategies (configurable)
 
@@ -41,16 +53,26 @@ injector — a trigger just decides *when* to fire and *which* mode to request.
    original fallback idea from the initial ask.
 2. **SOC threshold → Hold Mode.** When SOC drops to a configurable
    percentage, the device switches to Hold Mode. Hold maintains the pack at
-   its current charge (using the gas engine to avoid dropping further)
-   rather than continuing to deplete it — so triggering it right as SOC
-   nears the danger zone should prevent the pack from ever reaching the
-   voltage-sag point that causes reduced-propulsion mode.
+   whatever SOC it's at when engaged (using the gas engine to avoid dropping
+   further) — so triggering it right as SOC nears the danger zone should
+   prevent the pack from ever reaching the voltage-sag point that causes
+   reduced-propulsion mode. (Mountain has a similar backstop effect once the
+   pack hits ~50%, but Hold is the one that can be engaged at *any* SOC, which
+   is why it's the threshold target rather than Mountain.)
 3. **Trip Mode (future work — not building this yet).** The
    [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
    actual approach: switch to Hold above a speed threshold (e.g. highway
    driving) to bank EV range for later city driving, then release it
    below the threshold. Worth adding once triggers 1 and 2 are working,
    reusing the same injector/config plumbing. Tracked, not scheduled.
+
+**Mechanics of reaching a target mode.** Since the button cycles
+Normal → Sport → Mountain → Hold, "switch to Hold" actually means "press the
+button N times," where N depends on the *current* mode (e.g. 3 presses from
+Normal, 1 press from Mountain). This makes reading back the current mode a
+requirement, not a nice-to-have — without it, the device can't know how many
+presses to send. See "Open items" for whether a current-mode status signal
+exists; if not, a fallback is discussed there too.
 
 Strategies 1 and 2 are meant to run **together** as the recommended default:
 Mountain Mode conserves the pack proactively from the start of every drive,
@@ -96,15 +118,13 @@ below.
 | Signal | ID | Notes |
 |---|---|---|
 | EV battery SOC | `0x206` | Bytes 1–2, ~0.25 kWh/count granularity per OVMS notes. **Needs calibration** against your car's dash %/kWh readings — treat the raw value as relative until you've confirmed the scaling for your pack. |
-| Drive mode button press (Gen 2 cycling button) | `0x1E1`, bit 39 | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`. **Does not apply directly to Gen 1's discrete Mountain Mode button** — different physical control, likely a different message. |
-| Mountain Mode engage (Gen 1 physical button) | — | **Not documented.** Requires capture, see "Open items." |
-| Hold Mode engage (Gen 1) | — | **Not documented, and not even confirmed to be a discrete button** — on Gen 1 this may be a touchscreen/menu selection (a multi-step HMI interaction) rather than a single momentary switch, which would make it harder to spoof with one CAN frame than a button press. Needs to be confirmed during signal discovery before assuming a simple injector will work. |
+| Drive mode cycle button press | `0x1E1`, bit 39 (candidate) | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`, documented on a 2017 (Gen 2) car. Gen 1 (this car) uses the same style of cycling button (Normal→Sport→Mountain→Hold per the owner), so this is the first thing to test on the actual car — **not yet confirmed on Gen 1**, but a strong candidate rather than an unknown. |
 | Ignition/drive-cycle start | — | **Not documented as a single signal**, but inferable: the panda has a hardware ignition-sense line, and/or bus activity itself (Global A buses go quiet with the car off) can serve as a start-of-drive-cycle marker. Confirm which is more reliable during signal discovery. |
 | Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
 | Shift/PRNDL position | `0x135` / `0x1F5` | Useful as a safety precondition (e.g., don't inject while not in Drive). |
 | EV range remaining | — | **Not documented anywhere found.** Use SOC (`0x206`) as the trigger signal instead — matches the original ask ("range or battery %") and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
-| Current drive mode (status, not button-press) | — | **Not documented.** Would let the device avoid overriding a mode the driver deliberately chose. See "Open items." |
+| Current drive mode (status, not button-press) | — | **Not documented, and now required rather than optional** — because mode selection is a 4-way cycle, the daemon needs to know the current mode to compute how many button presses reach the target (see "Trigger strategies"). Also lets the device avoid overriding a mode the driver deliberately chose. See "Open items" for a fallback if no such signal exists. |
 
 ## Hardware design
 
@@ -155,18 +175,22 @@ The custom code needed is small and specific to this project:
      `threshold_percent` (latch), and re-arms once SOC rises back above
      `reset_percent` (e.g. after charging) — this avoids repeatedly firing
      if SOC hovers near the threshold.
-4. **Injector** — a small function per target mode (Mountain, Hold — and
-   later, Trip Mode's Hold-at-speed) that sends the corresponding
-   (to-be-discovered) CAN frame, through the safety wrapper below. Each
-   trigger evaluator calls the injector for its configured `target_mode`;
-   the injector itself doesn't know or care which trigger fired.
+4. **Mode-cycle controller** — reads current mode (from the status signal,
+   if one is found — see "Open items"), computes the number of button
+   presses needed to reach a trigger's requested `target_mode` given the
+   fixed Normal→Sport→Mountain→Hold cycle order, and sends that many
+   presses (with realistic inter-press timing) through the safety wrapper
+   below. This is the one place that needs the actual button-press CAN
+   frame; every trigger just asks it for a `target_mode` and it doesn't
+   care which trigger asked.
 5. **Safety wrapper** (see next section) — the only code path allowed to
    transmit.
 
 Don't write this until step 1 in "Phased plan" below has confirmed the
-actual Gen 1 Mountain and Hold engage signals (and the ignition-detection
-approach) — a monitor/injector built against guessed CAN IDs is worse than
-not having one.
+actual button-press signal and a way to read current mode (or the fallback
+in "Open items" if no status signal exists) — a controller built against a
+guessed CAN ID, or one that can't tell what mode it's starting from, is
+worse than not having one.
 
 ## Safety model
 
@@ -175,12 +199,15 @@ approach means the panda can transmit *anything*, not just the one message
 this project needs. Tighten that:
 
 - **Single narrow send function.** All transmission goes through one
-  function that hard-codes the exact CAN ID + payload for each of the
-  handful of mode-switch messages this project needs (Mountain engage, Hold
-  engage — and later, Trip Mode's Hold engage/release) and nothing else. No
+  function that hard-codes the exact CAN ID + payload for the one
+  button-press message this project needs, and nothing else — the cycling
+  design means every mode transition reuses this same message. No
   general-purpose "send arbitrary frame" path in the daemon.
-- **Rate limiting.** Cap sends to, at most, the number of frames a real
-  button press would generate — never a sustained/looping transmission.
+- **Rate limiting.** Cap both the size and rate of a press burst — at most
+  3 presses (Normal→Hold, the longest possible cycle) with realistic
+  inter-press spacing, never a sustained/looping transmission. Re-check the
+  current mode (if readable) after sending to confirm it landed on the
+  intended target rather than blindly trusting the press count.
 - **Preconditions before injecting**: vehicle in Drive, speed within a
   sane range, ignition on — reduces the chance of triggering the switch in
   a state where it wouldn't make sense anyway.
@@ -201,23 +228,28 @@ this project needs. Tighten that:
    (skip the SBC for now), log CAN traffic with `cabana` or SavvyCAN.
    Confirm `0x206` tracks SOC sensibly on this car. Then, with the car
    safely stationary:
-   - Press the physical Mountain Mode button and diff CAN traffic
-     before/after to identify the message it sends.
-   - Engage Hold Mode however this car actually does it (button, or
-     touchscreen menu sequence) and do the same diff — if it turns out to
-     be a multi-step touchscreen interaction rather than a single frame,
-     note exactly what sequence of messages it produces, since that
-     changes how the injector for this one needs to work.
+   - Press the mode button once and diff CAN traffic before/after. Check
+     first whether it matches `0x1E1` bit 39 from `gm_global_a_powertrain.dbc`
+     — if so, this signal transfers directly from the Gen 2 reference
+     project and saves the rest of this reverse-engineering step.
+   - Cycle through all four modes (Normal→Sport→Mountain→Hold) while
+     logging, watching for any *other* message that changes value in sync
+     with the mode change — that's the current-mode status signal the
+     controller needs. A good place to check: whatever message drives the
+     dash cluster's mode indicator icon, since that has to be broadcast on
+     the bus regardless of what triggered the change.
    - Identify the most reliable "ignition on / drive cycle start" signal
      (panda ignition-sense line vs. bus-activity detection) for the
      on-start trigger.
-   - Check whether there's a distinguishable "current mode" status message
-     you can read back (would let the daemon avoid fighting a
-     manually-chosen mode).
-2. **Bench-safe injection test.** Using the discovered messages, replay them
-   from the laptop (still stationary) and confirm each actually switches to
-   the intended mode, and that nothing else on the bus reacts badly (watch
-   for new DTCs, warning lights).
+   - Separately, check whether the car resets to Normal on every ignition
+     cycle or remembers the last mode across power-off — this determines
+     whether the on-start trigger can assume a fixed starting mode or also
+     needs the status signal.
+2. **Bench-safe injection test.** Using the discovered button-press message,
+   replay presses from the laptop (still stationary) and confirm the mode
+   actually advances one step per press, in the expected order, and that
+   nothing else on the bus reacts badly (watch for new DTCs, warning
+   lights).
 3. **Daemon development.** Write the config loader, SOC monitor, trigger
    evaluators, and safety-wrapped injector(s) described above, using the
    confirmed CAN IDs. Test it still tethered to a laptop before deploying
@@ -229,17 +261,26 @@ this project needs. Tighten that:
 
 ## Open items (need your car to resolve)
 
-- The exact CAN ID/payload for Gen 1's physical Mountain Mode button —
-  not documented publicly; requires step 1 above.
-- How Hold Mode is actually engaged on this car (button vs. touchscreen
-  menu sequence) and its corresponding CAN message(s) — also not
-  documented publicly, and not even confirmed to be a single frame.
+- Whether the mode-cycle button press is `0x1E1` bit 39 (as on the Gen 2
+  reference car) or a different message on this Gen 1 car — requires step 1
+  above.
+- Whether a "current drive mode" status signal exists on the bus. This is
+  now a hard requirement for the mode-cycle controller to work correctly,
+  not a nice-to-have. **Fallback if none is found**: infer mode from
+  indirect evidence instead of a single dedicated signal — e.g., correlate
+  known Mountain/Hold behavior (gas engine engaging at a specific SOC
+  pattern) with other already-documented signals, or as a last resort,
+  track mode in software by counting presses from a known reset point (e.g.
+  right after confirming a fresh Normal-on-start) and accept that state can
+  drift if the driver also uses the physical button — which is also a
+  reason to prefer finding a real status signal over this fallback.
+- Whether the car resets to Normal on every ignition cycle or remembers the
+  last-used mode — affects whether the on-start trigger needs the status
+  signal too, or can assume a fixed starting mode.
 - The most reliable way to detect "drive cycle start" for the on-start
   trigger (panda ignition-sense line vs. bus-activity heuristic).
 - The SOC (`0x206`) raw-value-to-percentage scaling for your specific
   pack/model year — calibrate against the dash reading.
-- Whether a "current drive mode" status signal exists and is distinguishable
-  on the bus, to avoid overriding a manually-selected mode.
 
 ## Sources
 
