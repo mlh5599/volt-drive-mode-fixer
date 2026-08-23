@@ -121,13 +121,18 @@ automation — it auto-switches modes based on speed rather than SOC, using a
 comma.ai panda + Raspberry Pi. It's built directly on
 [`commaai/opendbc`](https://github.com/commaai/opendbc)'s
 `gm_global_a_powertrain.dbc`, which decodes the Volt/Bolt-era GM Global A
-bus. Reuse this DBC file and the general panda + Python approach rather than
-reverse-engineering the whole bus from scratch.
+bus. Reuse this DBC file and its CAN signal IDs rather than
+reverse-engineering the whole bus from scratch; this project reads/writes
+CAN over PiCAN2's SocketCAN interface rather than panda, but the signal
+discovery and injection logic transfer directly.
 
 Its known gap, worth fixing rather than copying: it runs the panda in
 `SAFETY_ALLOUTPUT` mode with no message whitelist, so the device is
-technically capable of transmitting anything on the bus. See "Safety model"
-below.
+technically capable of transmitting anything on the bus. This project has no
+hardware-level safety firmware equivalent (PiCAN has none built in, unlike
+panda), which makes the software-level "Safety model" below — the single
+narrow send function and rate limiting — load-bearing rather than a second
+layer of defense.
 
 ## Known CAN signals
 
@@ -135,7 +140,7 @@ below.
 |---|---|---|
 | EV battery SOC | `0x206` | Bytes 1–2, ~0.25 kWh/count granularity per OVMS notes. **Needs calibration** against the vehicle's dash %/kWh readings — treat the raw value as relative until the scaling for this pack is confirmed. |
 | Drive mode cycle button press | `0x1E1`, bit 39 (candidate) | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`, documented on a 2017 (Gen 2) car. Gen 1 (this vehicle) uses the same style of cycling button (Normal→Sport→Mountain→Hold), so this is the first thing to test on the actual vehicle — **not yet confirmed on Gen 1**, but a strong candidate rather than an unknown. |
-| Ignition/drive-cycle start | — | **Not documented as a single signal**, but inferable: the panda has a hardware ignition-sense line, and/or bus activity itself (Global A buses go quiet with the car off) can serve as a start-of-drive-cycle marker. Confirm which is more reliable during signal discovery. |
+| Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on — its own process start *is* the on-start trigger, no separate ignition-sense signal required. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
 | Shift/PRNDL position | `0x135` / `0x1F5` | Useful as a safety precondition (e.g., don't inject while not in Drive). |
 | EV range remaining | — | **Not documented anywhere found.** Use SOC (`0x206`) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
@@ -159,64 +164,74 @@ all. Among devices that do speak raw CAN:
 | **CANable / CANtact** | Yes | $30–60 | SocketCAN-compatible, works with generic `python-can`, but no GM-specific precedent or safety/ignition features — this project would own all the reverse-engineering and safety-model work with no reference to check against. |
 | **PCAN-USB (PEAK-System)** | Yes | $200+ | Industrial-grade and very reliable, but priced and positioned for professional automotive tooling rather than the hobbyist car-hacking community — little overlap with existing GM Global A tribal knowledge. |
 | **Kvaser Leaf Light** | Yes | $200–400+ | Similar tier to PCAN-USB — professional-grade and overkill for this project's scope. |
-| **PiCAN2 / PiCAN3** (Raspberry Pi HAT) | Yes | $60–90 + a Pi | Solid option, but requires wiring the HAT into the OBD-II connector by hand rather than using a ready-made connector, and has no GM-specific precedent either. |
 | **Macchina M2** | Yes | — | Purpose-built for vehicle hacking, similar spirit to panda, but reportedly hard to source or discontinued. |
 | **ESP32 + SN65HVD230 transceiver** (DIY) | Yes | $20–25 | Cheapest option, but the whole CAN stack, message filtering, and safety logic would need to be written from scratch — the most custom-firmware work of any option, cutting against the off-the-shelf/light-scripting preference (DR4). |
 | **Freematics ONE+** | Yes | — | Telematics-focused (built-in GPS/logging); CAN-capable but little presence in the GM/opendbc hobbyist community. |
-| **comma.ai panda (red)** — **chosen** | Yes | $99 | See below. |
+| **comma.ai panda (red)** | Yes | $99 | Only option with a documented Volt-specific precedent ([`vix597/chevy-volt-trip-mode`](https://github.com/vix597/chevy-volt-trip-mode)) and comes with openpilot's safety-firmware rate-limiting built in. Ruled out on sourcing grounds: the red panda's vehicle-side port is a proprietary "OBD-C" connector, not standard OBD-II — reaching a vehicle's OBD-II port needs a $49 third-party adapter ([konik.ai OBD2C connector](https://konik.ai/shop/obd2c-connector/)) that ships only from an EU warehouse, with no US stock or reseller found. Older pandas with a native OBD-II connector (white/grey/black) are discontinued and only findable used. |
+| **PiCAN2 / PiCAN3** (Raspberry Pi HAT) — **chosen** | Yes | $37–78 + a Pi | See below. |
 
-**Why panda:** it's the only option with a **documented, working precedent
-on this exact vehicle family** — the
-[`vix597/chevy-volt-trip-mode`](https://github.com/vix597/chevy-volt-trip-mode)
-project already uses a panda plus `opendbc`'s `gm_global_a_powertrain.dbc`
-to read and inject on a GM Global A Volt. That removes most of the
-guesswork this project would otherwise redo from scratch on any of the
-alternatives above: known-working Python tooling (`pandacan`), a CAN
-decoder file that already covers this platform, multiple physical CAN
-channels (relevant given the Volt's multi-bus architecture), and an active
-car-hacking/openpilot community for support. It satisfies DR4 (off-the-shelf,
-light scripting over custom firmware) better than the DIY ESP32 route, and
-carries less reverse-engineering risk than the other off-the-shelf raw-CAN
-adapters, none of which have GM Volt-specific precedent.
+**Why PiCAN2:** PiCAN2 and PiCAN3 use identical CAN silicon (MCP2515
+controller / MCP2551 transceiver) — read/write capability is the same on
+both. PiCAN3 adds Pi 4 support, an onboard automotive-range SMPS, reverse-polarity
+protection, and an RTC, none of which this project needs: **PiCAN2** paired
+with a Pi 3B is the simpler, cheaper choice. Both expose a DB9 connector
+(jumper-selectable for an "OBD-II cable" pinout), and standard off-the-shelf
+OBD-II-to-DB9 cables exist that carry exactly the three wires needed
+(CAN-H, CAN-L, ground) — e.g. the
+[iKKEGOL DB9-to-OBD2 cable](https://www.amazon.com/iKKEGOL-Adapter-Diagnostic-Extension-Connector/dp/B077SHQQ1D)
+(~$10–15, ships from a US Amazon warehouse). This sidesteps the sourcing
+problem that ruled out panda entirely — no proprietary connector, no
+overseas shipping, no DIY fabrication required. It satisfies DR4 better
+than panda on balance: slightly more wiring/config work (SocketCAN device-tree
+overlay setup) in exchange for a fully off-the-shelf, US-available parts
+list. Because PiCAN exposes standard Linux **SocketCAN** (`can0`), the same
+interface `python-can`/`cansend` use everywhere, the reference project's
+`opendbc`-based injection logic ports over by swapping the transport
+backend (socketcan instead of panda), not rewriting the injection logic.
+The read+write pattern itself is proven on this hardware generically (e.g.
+[skpang/PiCAN-Python-examples](https://github.com/skpang/PiCAN-Python-examples)
+transmits live CAN frames to drive a real instrument cluster gauge) —
+there's no GM/Volt-specific PiCAN precedent, but none was needed once the
+signal IDs are confirmed from the panda-based reference project's work.
 
-**Connector note:** the red panda's vehicle-side port is comma's proprietary
-**OBD-C connector** (resembles USB-C, different pinout), not a standard
-16-pin OBD-II plug. Comma's own $20 "OBD-C cable" is *not* what's needed
-here — it connects a comma device to their harness box for the full
-self-driving install, not directly to a vehicle's OBD-II port. The part
-that does that is the **OBD2C connector** ($49,
-[konik.ai](https://konik.ai/shop/obd2c-connector/) — a third-party
-comma-hardware reseller, not comma.ai itself), which adapts a standard
-vehicle OBD-II port straight to panda's OBD-C connector. It's open-source
-hardware ([github.com/dzid26/OBD2C](https://github.com/dzid26/OBD2C),
-KiCad schematics available), so it could also be self-fabricated instead of
-bought, consistent with DR4's hobbyist-electronics allowance. Its README
-notes that "often only diagnostic CAN is populated on OBD-2" on some
-vehicles — worth confirming during Phase 1 signal discovery, though prior
-research (SOC readable via the OBD-II port on this platform, and the
-reference project working the same way) suggests this Gen 1 Volt exposes
-what's needed.
+Note: PiCAN2 draws its 5V entirely from the Pi's own 40-pin GPIO
+header — it has no separate power input of its own. This matters for the
+power design below.
 
 **Recommended BOM:**
 
 | Part | Role | Approx. price |
 |---|---|---|
-| comma.ai **panda** (red) | CAN read/write interface | $99 (+shipping if international) |
-| OBD2C connector (konik.ai) | Adapts panda's OBD-C port to the vehicle's standard OBD-II port | $49 |
-| Small always-on SBC (e.g. Raspberry Pi Zero 2 W) | Runs the monitor/injector daemon | ~$15–20 |
-| USB cable (panda ↔ SBC) | Data link | — |
-| 12V→5V USB car power adapter, or tap from a switched 12V source | Power for the SBC | ~$10 |
+| PiCAN2 (SK Pang) | CAN read/write interface, DB9 connector | ~$37 |
+| Raspberry Pi 3B | Runs the monitor/injector daemon; PiCAN2 mounts directly on it | ~$35 |
+| OBD-II-to-DB9 cable (e.g. iKKEGOL) | Connects PiCAN2's DB9 port to the vehicle's OBD-II port | ~$10–15 |
+| 12V cigarette-lighter/accessory-socket USB car charger (5V) | Power for the Pi | ~$8–10 |
+| microSD card | OS storage | ~$8 |
 
 This is a smaller footprint than the reference project (which added a
 touchscreen for a manual UI) since this design's whole point is to run
-unattended — no display needed. Mount the SBC + panda somewhere accessible
+unattended — no display needed. Mount the Pi + PiCAN2 somewhere accessible
 (e.g. under the dash near the OBD port) so it's easy to unplug entirely if
 something needs to be debugged or disabled — that's the physical kill
 switch, and it's free.
 
-Power the SBC from a switched (ignition-on) 12V source if possible, so the
-device is only live while the car is on, rather than drawing parasitic
-current at all times.
+**Power.** This Volt's accessory (cigarette-lighter) socket is switched
+with the car rather than always-hot, so a standard USB car charger plugged
+into it is sufficient — no relay, no separate switched-12V tap, and no
+ignition-sense circuitry needed to avoid draining the 12V battery while
+parked. That still means power gets cut abruptly (no clean OS shutdown) on
+every drive cycle, which is addressed at the OS level instead of with extra
+hardware: configure Raspberry Pi OS's built-in **Overlay File System**
+(`raspi-config` → Performance Options) so the root partition is mounted
+read-only with a RAM (tmpfs) overlay for writes — nothing is physically
+written to the SD card during normal operation, so an abrupt power cut
+can't corrupt it. This requires also write-protecting `/boot/firmware`
+(asked as a separate prompt in the same raspi-config flow) and disabling
+swap, both easy to miss. The tradeoff: anything not explicitly persisted
+outside the overlay (logs, runtime config changes) is lost on every power
+cycle — acceptable here since drive-mode state is re-derived from the CAN
+bus on each boot, but something to keep in mind if the daemon later needs
+to persist SOC-threshold calibration or logs across drives.
 
 ## Software architecture
 
@@ -224,11 +239,12 @@ Reuse rather than rebuild:
 - **`opendbc`**'s `gm_global_a_powertrain.dbc` for decoding/encoding CAN
   frames (SOC, speed, shift position, and — once discovered — the Gen 1 mode
   button signal).
-- **`pandacan`** (comma's Python library) or generic **`python-can`** for
-  talking to the panda from the SBC.
-- **`cabana`** (comma's CAN viewer) or **SavvyCAN** for the manual
-  reverse-engineering phase (see below) — no need to write custom logging
-  tools.
+- **`python-can`** (with its SocketCAN backend) for talking to PiCAN2's
+  `can0` interface from the Pi.
+- **SavvyCAN** (has native SocketCAN support on Linux) or **can-utils**'
+  `candump`/`cansend` for the manual reverse-engineering phase (see below)
+  — no need to write custom logging tools. (`cabana`, used in the panda-based
+  reference project, is panda-specific and doesn't apply here.)
 
 The custom code needed is small and specific to this project:
 
@@ -294,8 +310,9 @@ this project needs. Tighten that:
 
 ## Phased plan
 
-1. **Signal discovery (on-vehicle, stationary).** Connect panda + laptop
-   (skip the SBC for now), log CAN traffic with `cabana` or SavvyCAN.
+1. **Signal discovery (on-vehicle, stationary).** Connect PiCAN2 + laptop
+   (skip the Pi for now, or use the Pi itself with a monitor/SSH), log CAN
+   traffic with SavvyCAN or `candump`.
    Confirm `0x206` tracks SOC sensibly on this car. Then, with the car
    safely stationary:
    - Press the mode button once and diff CAN traffic before/after. Check
@@ -308,9 +325,6 @@ this project needs. Tighten that:
      controller needs. A good place to check: whatever message drives the
      dash cluster's mode indicator icon, since that has to be broadcast on
      the bus regardless of what triggered the change.
-   - Identify the most reliable "ignition on / drive cycle start" signal
-     (panda ignition-sense line vs. bus-activity detection) for the
-     on-start trigger.
    - Separately, check whether the car resets to Normal on every ignition
      cycle or remembers the last mode across power-off — this determines
      whether the on-start trigger can assume a fixed starting mode or also
@@ -322,12 +336,12 @@ this project needs. Tighten that:
    lights).
 3. **Daemon development.** Write the config loader, SOC monitor, trigger
    evaluators, and safety-wrapped injector(s) described above, using the
-   confirmed CAN IDs. Test it still tethered to a laptop before deploying
-   to the SBC.
-4. **Deployment.** Move to the SBC, mount it and the panda in the car,
-   power from a switched 12V source, and test across several real drive
-   cycles, tuning the SOC threshold based on how early the switch needs
-   to happen to reliably avoid reduced-propulsion mode.
+   confirmed CAN IDs. Test on the Pi with the overlay filesystem enabled
+   (see "Hardware design") before final deployment.
+4. **Deployment.** Mount the Pi + PiCAN2 in the car, power from the
+   accessory socket, and test across several real drive cycles, tuning the
+   SOC threshold based on how early the switch needs to happen to reliably
+   avoid reduced-propulsion mode.
 
 ## Open items (pending on-vehicle verification)
 
@@ -347,8 +361,6 @@ this project needs. Tighten that:
 - Whether the car resets to Normal on every ignition cycle or remembers the
   last-used mode — affects whether the on-start trigger needs the status
   signal too, or can assume a fixed starting mode.
-- The most reliable way to detect "drive cycle start" for the on-start
-  trigger (panda ignition-sense line vs. bus-activity heuristic).
 - The SOC (`0x206`) raw-value-to-percentage scaling for this specific
   pack/model year — calibrate against the dash reading.
 
@@ -357,7 +369,9 @@ this project needs. Tighten that:
 - [vix597/chevy-volt-trip-mode](https://github.com/vix597/chevy-volt-trip-mode)
 - [seanlaplante.com writeup](https://seanlaplante.com/2021/11/13/hacking-my-chevy-volt-to-auto-switch-driving-modes-for-efficiency/)
 - [commaai/opendbc](https://github.com/commaai/opendbc)
-- [comma.ai panda](https://comma.ai/shop/panda)
+- [PiCAN2 (SK Pang Electronics)](https://www.skpang.co.uk/products/pican2-can-bus-board-for-raspberry-pi-2-3)
+- [skpang/PiCAN-Python-examples](https://github.com/skpang/PiCAN-Python-examples)
+- [Raspberry Pi Overlay File System (read-only root)](https://learn.adafruit.com/read-only-raspberry-pi/overview)
 - [OVMS voltampera_canbusnotes.txt](https://github.com/openvehicles/Open-Vehicle-Monitoring-System/blob/master/vehicle/Car%20Module/VoltAmpera/voltampera_canbusnotes.txt)
 - [GM Volt Reverse Engineering Wiki](https://vehicle-reverse-engineering.fandom.com/wiki/GM_Volt)
 - [GM-Volt.com OBD2 FAQ](https://www.gm-volt.com/threads/obd2-obdii-obd-ii-device-faq.110641/)
