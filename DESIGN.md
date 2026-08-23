@@ -144,6 +144,41 @@ below.
 
 ## Hardware design
 
+### Alternatives considered
+
+DR1–DR3 require a device that can both read and write raw CAN traffic on
+the vehicle's buses — not just standard OBD-II diagnostic PIDs. That rules
+out generic ELM327-style OBD2 USB/Bluetooth adapters (e.g. the ones used
+with Torque): they speak the OBD2 diagnostic request/response protocol
+only, can't sniff non-standard manufacturer IDs like `0x206` (SOC) or the
+mode-cycle button message, and generally can't transmit arbitrary frames at
+all. Among devices that do speak raw CAN:
+
+| Device | Read+Write | Approx. price | Why not chosen |
+|---|---|---|---|
+| **CANable / CANtact** | Yes | $30–60 | SocketCAN-compatible, works with generic `python-can`, but no GM-specific precedent or safety/ignition features — this project would own all the reverse-engineering and safety-model work with no reference to check against. |
+| **PCAN-USB (PEAK-System)** | Yes | $200+ | Industrial-grade and very reliable, but priced and positioned for professional automotive tooling rather than the hobbyist car-hacking community — little overlap with existing GM Global A tribal knowledge. |
+| **Kvaser Leaf Light** | Yes | $200–400+ | Similar tier to PCAN-USB — professional-grade and overkill for this project's scope. |
+| **PiCAN2 / PiCAN3** (Raspberry Pi HAT) | Yes | $60–90 + a Pi | Solid option, but requires wiring the HAT into the OBD-II connector by hand rather than using a ready-made connector, and has no GM-specific precedent either. |
+| **Macchina M2** | Yes | — | Purpose-built for vehicle hacking, similar spirit to panda, but reportedly hard to source or discontinued. |
+| **ESP32 + SN65HVD230 transceiver** (DIY) | Yes | $20–25 | Cheapest option, but the whole CAN stack, message filtering, and safety logic would need to be written from scratch — the most custom-firmware work of any option, cutting against the off-the-shelf/light-scripting preference (DR4). |
+| **Freematics ONE+** | Yes | — | Telematics-focused (built-in GPS/logging); CAN-capable but little presence in the GM/opendbc hobbyist community. |
+| **comma.ai panda (red)** — **chosen** | Yes | $99 | See below. |
+
+**Why panda:** it's the only option with a **documented, working precedent
+on this exact vehicle family** — the
+[`vix597/chevy-volt-trip-mode`](https://github.com/vix597/chevy-volt-trip-mode)
+project already uses a panda plus `opendbc`'s `gm_global_a_powertrain.dbc`
+to read and inject on a GM Global A Volt. That removes most of the
+guesswork this project would otherwise redo from scratch on any of the
+alternatives above: known-working Python tooling (`pandacan`), a CAN
+decoder file that already covers this platform, multiple physical CAN
+channels (relevant given the Volt's multi-bus architecture), and an active
+car-hacking/openpilot community for support. It satisfies DR4 (off-the-shelf,
+light scripting over custom firmware) better than the DIY ESP32 route, and
+carries less reverse-engineering risk than the other off-the-shelf raw-CAN
+adapters, none of which have GM Volt-specific precedent.
+
 **Recommended BOM:**
 
 | Part | Role | Approx. price |
