@@ -5,11 +5,11 @@
 On an aging Gen 1 Chevy Volt (2011–2015), fully depleting the EV battery causes
 the pack voltage to sag under load, which trips "reduced propulsion" mode: the
 gas engine revs to near max RPM to generate power directly, and the car
-becomes sluggish. The owner currently avoids this by manually switching to
-Mountain Mode before the battery runs low. This project automates that: a
-device on the car's CAN bus watches the EV battery state of charge (SOC) and
-automatically triggers a mode switch before the pack gets low enough to cause
-the problem.
+becomes sluggish. The owner currently avoids this by manually switching
+drive/charge modes before the battery runs low. This project automates that
+with a device on the car's CAN bus that applies configurable, independent
+trigger strategies (below) to switch modes before the pack gets low enough to
+cause the problem.
 
 ## Vehicle context
 
@@ -28,6 +28,51 @@ Gen 1 and Gen 2 differ in how drive mode is selected:
   not a cycling button. The CAN message it sends has not been publicly
   documented (see "Open items" below); Gen 2's cycling-button message
   (`0x1E1`, described below) does not directly apply.
+
+## Trigger strategies (configurable)
+
+Two independent trigger strategies, each individually enabled/disabled and
+configured, plus a planned future third. They share the same underlying
+injector — a trigger just decides *when* to fire and *which* mode to request.
+
+1. **On-start → Mountain Mode.** Every drive cycle (ignition on), the device
+   switches to Mountain Mode. Mountain Mode keeps a buffer in the pack rather
+   than depleting it fully, so this is a simple, always-on hedge — the
+   original fallback idea from the initial ask.
+2. **SOC threshold → Hold Mode.** When SOC drops to a configurable
+   percentage, the device switches to Hold Mode. Hold maintains the pack at
+   its current charge (using the gas engine to avoid dropping further)
+   rather than continuing to deplete it — so triggering it right as SOC
+   nears the danger zone should prevent the pack from ever reaching the
+   voltage-sag point that causes reduced-propulsion mode.
+3. **Trip Mode (future work — not building this yet).** The
+   [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
+   actual approach: switch to Hold above a speed threshold (e.g. highway
+   driving) to bank EV range for later city driving, then release it
+   below the threshold. Worth adding once triggers 1 and 2 are working,
+   reusing the same injector/config plumbing. Tracked, not scheduled.
+
+Strategies 1 and 2 are meant to run **together** as the recommended default:
+Mountain Mode conserves the pack proactively from the start of every drive,
+and the SOC-threshold trigger is the backstop that engages Hold if the pack
+still gets low anyway.
+
+Config sketch (exact schema TBD when the daemon is written):
+
+```yaml
+on_start:
+  enabled: true
+  target_mode: mountain
+
+soc_threshold:
+  enabled: true
+  target_mode: hold
+  threshold_percent: 25       # calibrated against dash %, see "Open items"
+  reset_percent: 40           # SOC must rise back above this to re-arm
+
+trip_mode:
+  enabled: false              # future work
+```
 
 ## Prior art (reuse this, don't rebuild it)
 
@@ -52,6 +97,9 @@ below.
 |---|---|---|
 | EV battery SOC | `0x206` | Bytes 1–2, ~0.25 kWh/count granularity per OVMS notes. **Needs calibration** against your car's dash %/kWh readings — treat the raw value as relative until you've confirmed the scaling for your pack. |
 | Drive mode button press (Gen 2 cycling button) | `0x1E1`, bit 39 | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`. **Does not apply directly to Gen 1's discrete Mountain Mode button** — different physical control, likely a different message. |
+| Mountain Mode engage (Gen 1 physical button) | — | **Not documented.** Requires capture, see "Open items." |
+| Hold Mode engage (Gen 1) | — | **Not documented, and not even confirmed to be a discrete button** — on Gen 1 this may be a touchscreen/menu selection (a multi-step HMI interaction) rather than a single momentary switch, which would make it harder to spoof with one CAN frame than a button press. Needs to be confirmed during signal discovery before assuming a simple injector will work. |
+| Ignition/drive-cycle start | — | **Not documented as a single signal**, but inferable: the panda has a hardware ignition-sense line, and/or bus activity itself (Global A buses go quiet with the car off) can serve as a start-of-drive-cycle marker. Confirm which is more reliable during signal discovery. |
 | Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
 | Shift/PRNDL position | `0x135` / `0x1F5` | Useful as a safety precondition (e.g., don't inject while not in Drive). |
 | EV range remaining | — | **Not documented anywhere found.** Use SOC (`0x206`) as the trigger signal instead — matches the original ask ("range or battery %") and is the metric that's actually accessible. |
@@ -94,21 +142,31 @@ Reuse rather than rebuild:
 
 The custom code needed is small and specific to this project:
 
-1. **SOC monitor** — reads `0x206`, converts to a usable SOC value, applies
+1. **Config loader** — reads the YAML sketched above, validates it (e.g.
+   `reset_percent > threshold_percent`), and produces the set of active
+   triggers for the run.
+2. **SOC monitor** — reads `0x206`, converts to a usable SOC value, applies
    a debounce/smoothing filter (raw CAN values can be noisy frame-to-frame).
-2. **Threshold + hysteresis logic** — triggers a mode-switch action once SOC
-   crosses a configurable low threshold, but only **once per drive cycle**
-   (latch), and resets the latch once SOC rises back above a higher
-   threshold (e.g. after charging) — this avoids repeatedly firing the
-   button-press message if SOC hovers near the threshold.
-3. **Injector** — sends the (to-be-discovered) Gen 1 Mountain Mode CAN
-   frame, through the safety wrapper below.
-4. **Safety wrapper** (see next section) — the only code path allowed to
+3. **Trigger evaluators** — one per strategy, sharing the SOC monitor's
+   output and a shared drive-cycle/ignition signal:
+   - *on-start*: fires once per drive cycle as soon as ignition-on is
+     detected.
+   - *soc-threshold*: fires once when SOC crosses below
+     `threshold_percent` (latch), and re-arms once SOC rises back above
+     `reset_percent` (e.g. after charging) — this avoids repeatedly firing
+     if SOC hovers near the threshold.
+4. **Injector** — a small function per target mode (Mountain, Hold — and
+   later, Trip Mode's Hold-at-speed) that sends the corresponding
+   (to-be-discovered) CAN frame, through the safety wrapper below. Each
+   trigger evaluator calls the injector for its configured `target_mode`;
+   the injector itself doesn't know or care which trigger fired.
+5. **Safety wrapper** (see next section) — the only code path allowed to
    transmit.
 
 Don't write this until step 1 in "Phased plan" below has confirmed the
-actual Gen 1 button-press signal — a monitor/injector built against a
-guessed CAN ID is worse than not having one.
+actual Gen 1 Mountain and Hold engage signals (and the ignition-detection
+approach) — a monitor/injector built against guessed CAN IDs is worse than
+not having one.
 
 ## Safety model
 
@@ -117,9 +175,10 @@ approach means the panda can transmit *anything*, not just the one message
 this project needs. Tighten that:
 
 - **Single narrow send function.** All transmission goes through one
-  function that hard-codes the exact CAN ID + payload for the mode-switch
-  message (and only that). No general-purpose "send arbitrary frame" path
-  in the daemon.
+  function that hard-codes the exact CAN ID + payload for each of the
+  handful of mode-switch messages this project needs (Mountain engage, Hold
+  engage — and later, Trip Mode's Hold engage/release) and nothing else. No
+  general-purpose "send arbitrary frame" path in the daemon.
 - **Rate limiting.** Cap sends to, at most, the number of frames a real
   button press would generate — never a sustained/looping transmission.
 - **Preconditions before injecting**: vehicle in Drive, speed within a
@@ -141,17 +200,28 @@ this project needs. Tighten that:
 1. **Signal discovery (your car, stationary).** Connect panda + laptop
    (skip the SBC for now), log CAN traffic with `cabana` or SavvyCAN.
    Confirm `0x206` tracks SOC sensibly on this car. Then, with the car
-   safely stationary, press the physical Mountain Mode button and diff the
-   CAN traffic before/after to identify the message it sends. Also check
-   whether there's a distinguishable "current mode" status message you can
-   read back (would let the daemon avoid fighting a manually-chosen mode).
-2. **Bench-safe injection test.** Using the discovered message, replay it
-   from the laptop (still stationary) and confirm it actually switches the
-   mode, and that nothing else on the bus reacts badly (watch for new DTCs,
-   warning lights).
-3. **Daemon development.** Write the SOC monitor + threshold/hysteresis +
-   safety-wrapped injector described above, using the confirmed CAN IDs.
-   Test it still tethered to a laptop before deploying to the SBC.
+   safely stationary:
+   - Press the physical Mountain Mode button and diff CAN traffic
+     before/after to identify the message it sends.
+   - Engage Hold Mode however this car actually does it (button, or
+     touchscreen menu sequence) and do the same diff — if it turns out to
+     be a multi-step touchscreen interaction rather than a single frame,
+     note exactly what sequence of messages it produces, since that
+     changes how the injector for this one needs to work.
+   - Identify the most reliable "ignition on / drive cycle start" signal
+     (panda ignition-sense line vs. bus-activity detection) for the
+     on-start trigger.
+   - Check whether there's a distinguishable "current mode" status message
+     you can read back (would let the daemon avoid fighting a
+     manually-chosen mode).
+2. **Bench-safe injection test.** Using the discovered messages, replay them
+   from the laptop (still stationary) and confirm each actually switches to
+   the intended mode, and that nothing else on the bus reacts badly (watch
+   for new DTCs, warning lights).
+3. **Daemon development.** Write the config loader, SOC monitor, trigger
+   evaluators, and safety-wrapped injector(s) described above, using the
+   confirmed CAN IDs. Test it still tethered to a laptop before deploying
+   to the SBC.
 4. **Deployment.** Move to the SBC, mount it and the panda in the car,
    power from a switched 12V source, and test across several real drive
    cycles, tuning the SOC threshold based on how early you need the switch
@@ -161,6 +231,11 @@ this project needs. Tighten that:
 
 - The exact CAN ID/payload for Gen 1's physical Mountain Mode button —
   not documented publicly; requires step 1 above.
+- How Hold Mode is actually engaged on this car (button vs. touchscreen
+  menu sequence) and its corresponding CAN message(s) — also not
+  documented publicly, and not even confirmed to be a single frame.
+- The most reliable way to detect "drive cycle start" for the on-start
+  trigger (panda ignition-sense line vs. bus-activity heuristic).
 - The SOC (`0x206`) raw-value-to-percentage scaling for your specific
   pack/model year — calibrate against the dash reading.
 - Whether a "current drive mode" status signal exists and is distinguishable
