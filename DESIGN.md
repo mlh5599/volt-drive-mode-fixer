@@ -179,11 +179,30 @@ light scripting over custom firmware) better than the DIY ESP32 route, and
 carries less reverse-engineering risk than the other off-the-shelf raw-CAN
 adapters, none of which have GM Volt-specific precedent.
 
+**Connector note:** the red panda's vehicle-side port is comma's proprietary
+**OBD-C connector** (resembles USB-C, different pinout), not a standard
+16-pin OBD-II plug. Comma's own $20 "OBD-C cable" is *not* what's needed
+here — it connects a comma device to their harness box for the full
+self-driving install, not directly to a vehicle's OBD-II port. The part
+that does that is the **OBD2C connector** ($49,
+[konik.ai](https://konik.ai/shop/obd2c-connector/) — a third-party
+comma-hardware reseller, not comma.ai itself), which adapts a standard
+vehicle OBD-II port straight to panda's OBD-C connector. It's open-source
+hardware ([github.com/dzid26/OBD2C](https://github.com/dzid26/OBD2C),
+KiCad schematics available), so it could also be self-fabricated instead of
+bought, consistent with DR4's hobbyist-electronics allowance. Its README
+notes that "often only diagnostic CAN is populated on OBD-2" on some
+vehicles — worth confirming during Phase 1 signal discovery, though prior
+research (SOC readable via the OBD-II port on this platform, and the
+reference project working the same way) suggests this Gen 1 Volt exposes
+what's needed.
+
 **Recommended BOM:**
 
 | Part | Role | Approx. price |
 |---|---|---|
-| comma.ai **panda** (red) | CAN read/write interface, OBD-II connector | $99 (+shipping if international) |
+| comma.ai **panda** (red) | CAN read/write interface | $99 (+shipping if international) |
+| OBD2C connector (konik.ai) | Adapts panda's OBD-C port to the vehicle's standard OBD-II port | $49 |
 | Small always-on SBC (e.g. Raspberry Pi Zero 2 W) | Runs the monitor/injector daemon | ~$15–20 |
 | USB cable (panda ↔ SBC) | Data link | — |
 | 12V→5V USB car power adapter, or tap from a switched 12V source | Power for the SBC | ~$10 |

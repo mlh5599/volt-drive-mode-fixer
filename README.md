@@ -25,7 +25,9 @@ vehicle (Phase 1 in DESIGN.md) — confirming whether the button-press CAN
 message matches the Gen 2 reference project's, and finding a current-mode
 status signal.
 
-**Hardware:** comma.ai panda (red) + small SBC (e.g. Raspberry Pi Zero 2 W).
+**Hardware:** comma.ai panda (red) + [OBD2C connector](https://konik.ai/shop/obd2c-connector/)
+(adapts panda's OBD-C port to the vehicle's standard OBD-II port) + small SBC
+(e.g. Raspberry Pi Zero 2 W).
 
 **Reused software:** [`opendbc`](https://github.com/commaai/opendbc)
 (`gm_global_a_powertrain.dbc`), `cabana`/SavvyCAN for logging, `pandacan`/
