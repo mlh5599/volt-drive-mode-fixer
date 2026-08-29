@@ -122,19 +122,47 @@ class CanInterface:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    # -- observation helper (used by the injection test) -----------------
-    def read_drive_mode(self, timeout: float = 1.0) -> DriveMode | None:
-        """Return the current drive mode from the next decodable 0x1F4 frame."""
+    # -- observation helpers (used by the injection test) ---------------
+    def _latest_status(self, decode, timeout: float) -> DriveMode | None:
+        """Newest decodable 0x1F4 currently in the RX queue.
+
+        ``recv()`` hands back the OLDEST queued frame first, and this socket
+        buffers 0x1F4 at ~40 Hz the whole time ``send_mode_button_press()``
+        runs (that path only drains 0x1E1). Returning the first 0x1F4 we see
+        gives the caller a reading that can be >1 s stale -- enough to desync
+        the closed-loop walk: it read "SPORT" while the cursor had already
+        stepped to MOUNTAIN (field session 3, 2026-08-29). So block up to
+        ``timeout`` for the first hit, then sweep the rest of the queue
+        non-blocking and keep only the newest.
+        """
         if self._bus is None:
             raise RuntimeError("open() first")
         end = time.time() + timeout
-        while time.time() < end:
-            msg = self._bus.recv(timeout=max(0.0, end - time.time()))
-            if msg is not None and msg.arbitration_id == MODE_STATUS_ADDR:
-                mode = signals.decode_drive_mode(bytes(msg.data))
-                if mode is not None:
-                    return mode
-        return None
+        latest: DriveMode | None = None
+        while True:
+            wait = 0.0 if latest is not None else max(0.0, end - time.time())
+            msg = self._bus.recv(timeout=wait)
+            if msg is None:
+                if latest is not None or time.time() >= end:
+                    return latest
+                continue
+            if msg.arbitration_id != MODE_STATUS_ADDR:
+                continue
+            decoded = decode(bytes(msg.data))
+            if decoded is not None:
+                latest = decoded
+
+    def read_drive_mode(self, timeout: float = 1.0) -> DriveMode | None:
+        """Return the *committed* drive mode (0x1F4 byte 1 -- lags a menu
+        commit by ~3 s), from the newest frame in the RX queue."""
+        return self._latest_status(signals.decode_drive_mode, timeout)
+
+    def read_menu_cursor(self, timeout: float = 0.5) -> DriveMode | None:
+        """Return the LIVE drive-mode menu cursor (0x1F4 byte 4 -- steps
+        ~40 ms after each button tap; see ``signals.decode_menu_cursor``),
+        from the newest frame in the RX queue. Used to close the loop on a
+        walk, so it MUST be current -- see :meth:`_latest_status`."""
+        return self._latest_status(signals.decode_menu_cursor, timeout)
 
     # -- the only transmit path ----------------------------------------
     def _next_button_frame(self, timeout: float) -> bytes | None:

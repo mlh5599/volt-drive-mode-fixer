@@ -143,12 +143,19 @@ def decode_speed_mph(data: bytes) -> float | None:
 # --- Drive mode status (0x1F4) -----------------------------------------
 #
 # Confirmed 2026-08-29 on-vehicle (Gen 1, HS-CAN 500k). 6-byte message from a
-# body module at ~40 Hz: `00 <mode> 00 00 <btn_ramp> <btn_down>`.
-#   byte 1  latched current mode (values below)
-#   byte 4  button hold-time ramp (0x80 -> 0x40 -> 0x20 the longer it's held)
-#   byte 5  0x80 while the button is physically pressed, else 0x00
+# body module at ~40 Hz: `00 <mode> 00 00 <cursor> <menu_open>`.
+#   byte 1  latched / committed mode (values below). Changes ONLY on commit,
+#           ~3.0 s after the last button tap.
+#   byte 4  LIVE drive-mode MENU CURSOR -- steps with every button edge, in
+#           walk order, ~40 ms after the tap (00 N / 80 S / 40 M / 20 H).
+#           (An earlier note called this a "hold-time ramp"; the frame-count
+#           sweep on 2026-08-29 showed it is the menu cursor -- one clean step
+#           per tap when taps are >= ~1.2 s apart.)
+#   byte 5  menu-open hint: 0x80 while the drive-mode menu is open, clears
+#           ~3 s after the last tap (coincident with the commit). Flickers
+#           mid-walk on the injected path, so treat as a hint, not gospel.
 # Every one of a 9-transition button walk (NORMAL/SPORT/MOUNTAIN/HOLD dwell +
-# 5 taps) matched this exactly, in cycle order.
+# 5 taps) matched byte 1 exactly, in cycle order.
 _DRIVE_MODE_BY_BYTE1: dict[int, DriveMode] = {
     0x00: DriveMode.NORMAL,
     0x80: DriveMode.SPORT,
@@ -156,17 +163,53 @@ _DRIVE_MODE_BY_BYTE1: dict[int, DriveMode] = {
     0x08: DriveMode.HOLD,
 }
 
+#: 0x1F4 byte 4 -- the live menu cursor. NOTE the byte-4 codes differ from the
+#: byte-1 codes: MOUNTAIN is 0x40 here (0x20 in byte 1) and HOLD is 0x20 here
+#: (0x08 in byte 1). NORMAL is 0x00 in both, which is also what an idle
+#: (menu-closed) frame carries -- so a 0x00 cursor is only meaningful right
+#: after a tap.
+_MENU_CURSOR_BY_BYTE4: dict[int, DriveMode] = {
+    0x00: DriveMode.NORMAL,
+    0x80: DriveMode.SPORT,
+    0x40: DriveMode.MOUNTAIN,
+    0x20: DriveMode.HOLD,
+}
+
+#: 0x1F4 byte 5 bit 7 -- drive-mode menu is open.
+MENU_OPEN_BIT = 0x80
+
 
 def decode_drive_mode(data: bytes) -> DriveMode | None:
     """Latched drive mode from byte 1 of frame 0x1F4.
 
     Returns ``None`` for a short frame or an unrecognised byte-1 value.
-    Bytes 4-5 (momentary button activity) are intentionally ignored -- byte 1
-    holds the current mode steady even mid-press.
+    Bytes 4-5 (menu cursor / open flag) are intentionally ignored -- byte 1
+    holds the *committed* mode steady even mid-walk.
     """
     if len(data) < 2:
         return None
     return _DRIVE_MODE_BY_BYTE1.get(data[1])
+
+
+def decode_menu_cursor(data: bytes) -> DriveMode | None:
+    """Live drive-mode menu cursor from byte 4 of frame 0x1F4.
+
+    This tracks the menu highlight as it walks (one step per button edge),
+    ~40 ms behind the tap -- unlike :func:`decode_drive_mode`, which only
+    moves on the commit ~3 s later. Use it to close the loop on a menu walk.
+
+    Returns ``None`` for a short frame or an unrecognised value. A ``0x00``
+    result is ``NORMAL`` but is also what an idle/closed frame carries, so
+    only trust it in the window just after a tap.
+    """
+    if len(data) < 5:
+        return None
+    return _MENU_CURSOR_BY_BYTE4.get(data[4])
+
+
+def menu_is_open(data: bytes) -> bool:
+    """True if frame 0x1F4 says the drive-mode menu is currently open."""
+    return len(data) >= 6 and bool(data[5] & MENU_OPEN_BIT)
 
 
 # --- Shift position (0x135 / 0x1F5) --------------------------------------

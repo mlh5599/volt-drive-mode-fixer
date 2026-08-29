@@ -14,7 +14,8 @@ Prereqs: `can0` up at the right bitrate (see `../host/`), `can-utils` and
 | `mode_diff.py` | Phase C | Diffs bus traffic before/after one mode-button press; checks the `0x1E1` bit-39 candidate and flags any other frame that moved. |
 | `cycle_modes.py` | Phase C | Walks all four modes, tabulating candidate status frames per mode -> finds the current-mode status signal. |
 | `ignition_check.py` | Phase C | Whether the bus goes quiet with the car off, and whether a chosen status frame resets to Normal across an ignition cycle. |
-| `inject_test.py` | Phase C.5 | **Transmits.** Replays the discovered button press, stationary only, one press at a time with confirmation. |
+| `inject_test.py` | Phase C.5 | **Transmits.** Lower-level walk/timing sweep (`--cycle`, `--repeat`, `--frames`) with its own copy of the walk loop. Use for tuning frames/gap. |
+| `set_mode.py` | Phase C.5 | **Transmits.** One walk to `--target <mode>` through the real `ModeCycleController.switch_to()` + `canio` TX path. Closed loop: taps, reads the live menu cursor (`0x1F4` byte 4), stops when it's on the target, then polls byte 1 for the commit and prints the timeline. `--dry-run` needs no CAN hardware (open-loop `switch_to()` against a fake presser). Use to exercise the shipping menu-walk code. |
 
 Deliverable of Phase C: fill the confirmed values into `voltdmf/signals.py` and
 `voltdmf/canio.py`, flip the `confirmed` flags, and write

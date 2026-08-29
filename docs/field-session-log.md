@@ -6,6 +6,116 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 3 — 2026-08-29 (Phase C.5 — found a live cursor; fixed the overshoot; closed the loop)
+
+Autonomous troubleshooting from the Pi, car in Park / READY, owner not
+watching the dash (byte-1 readback stands in for the dash — it always
+matched in earlier sessions). Three inject-and-sample scripts on the Pi
+(`tools/explore_walk.py`, `explore_frames.py`, `explore_gap.py` — scratch
+copies, not committed): a raw socket sampled `0x1F4` while `CanInterface`
+injected on `0x1E1` from a second socket.
+
+### What we found
+
+1. **`0x1F4` byte 4 is a LIVE menu cursor.** It steps `00 → 80 → 40 → 20`
+   (N/S/M/H) ~40 ms after each button edge, in menu-walk order — *not* the
+   "hold-time ramp" an earlier note guessed. Byte 1 (committed mode) still
+   only moves on the commit, +3.0 s after the last tap. Byte 5 `0x80` =
+   menu open, clears at the commit (flickers mid-walk on the injected path).
+2. **The overshoot was tap spacing, not frame count.** `WALK_GAP_S` was
+   `0.75 s`. Measured, 2 taps from NORMAL: → SPORT at 1.5–2.0 s spacing,
+   → MOUNTAIN at 0.75–1.0 s, → HOLD at 0.5 s. Taps closer than ~1.2 s get
+   coalesced / auto-repeated into extra cursor steps. `PRESS_TRACK_FRAMES`
+   ∈ {1,2,3,6,16} all walked cleanly at 1.2 s spacing — frame count is not
+   the lever.
+3. **Menu open point depends on how cold the menu is.** From a *cold* menu
+   (car resting in a mode, no recent presses) it opens on NORMAL: tap 1
+   opens with no step, taps 2..N step — `index+1` to the target. From a
+   *warm* menu (a press within ~3 s of the last commit, e.g. back-to-back
+   `set_mode.py` runs) the cursor is already on the current mode and tap 1
+   opens *and* steps — taps to target = `(index(target) − index(current))
+   mod 4`. The earlier "always opens on NORMAL" was all cold-menu presses.
+   The closed loop is immune to the difference (it stops on cursor match);
+   the open-loop `presses_to_reach` is only right from a cold NORMAL.
+4. **Parked car reverts / rate-limits.** In `explore_gap.py` (~90 taps over
+   ~12 min) the cursor kept walking to the target correctly but byte 1
+   stopped committing partway through, and `can0` drifted ERROR-ACTIVE →
+   PASSIVE → WARNING. Bouncing `can0` and waiting a minute or two returns
+   `0x1F4` to a resting `00 00 00 00 00 00` (NORMAL). Real mode-hold
+   verification needs the car moving.
+
+### On-car validation of the closed loop (2026-08-29, later)
+
+After fixing a stale-read bug in `read_menu_cursor` (it returned the
+*oldest* queued `0x1F4`, not the newest — the RX socket buffers ~40 Hz of
+`0x1F4` while `send_mode_button_press` runs and only drains `0x1E1`; the
+first run committed MOUNTAIN when asked for SPORT because the loop read a
+stale "SPORT" frame while the cursor had already stepped to MOUNTAIN). Fix:
+`CanInterface._latest_status` drains the queue to the newest frame; both
+`read_drive_mode` and `read_menu_cursor` use it. Covered by
+`tests/test_canio.py`.
+
+`tools/set_mode.py --yes-stationary --target <mode>` on the Pi, car in Park
+/ READY, five runs:
+
+| from | target | taps | committed (0x1F4 b1 @ +2.8 s) |
+|---|---|---|---|
+| normal   | sport    | 2 | sport ✓ |
+| sport    | mountain | 1 | mountain ✓ |
+| mountain | hold     | 1 | hold ✓ |
+| hold     | normal   | 1 | normal ✓ |
+| normal   | hold     | 4 | hold ✓ |
+
+- **All four modes select and commit correctly.** The closed loop is a
+  PASS for selection. `can0` stayed ERROR-ACTIVE across all five runs — no
+  degradation (short runs, 1.4 s gap).
+- **Tap counts confirm the cold/warm-menu split** (row 1/5 = `index+1` from
+  cold NORMAL; rows 2–4 = one relative step from a warm non-NORMAL mode).
+- **Parked revert is mode-selective.** SPORT held between runs; the earlier
+  MOUNTAIN commit had reverted to NORMAL by the next run. SPORT (throttle
+  map) sticks parked; MOUNTAIN / HOLD (battery-management) still need a
+  drive to prove they *hold* — selection itself is proven.
+
+### What changed in the code (committed separately)
+
+- `signals.py`: `decode_menu_cursor()` (byte 4), `menu_is_open()` (byte 5),
+  documented the real byte-4/5 meaning.
+- `canio.py`: `CanInterface.read_menu_cursor()`; `_latest_status()` drains
+  the RX queue to the *newest* `0x1F4` (both status reads use it — the
+  first-frame version handed the closed loop stale readings).
+- `modecycle.py`: `WALK_GAP_S` 0.75 → **1.4**; `switch_to()` now runs a
+  **closed loop** when a `menu_cursor_source` is wired — tap, settle, read
+  the cursor, stop the instant it is on the target (so a coalesced double
+  or a dropped tap only changes how many more taps we send, never an
+  overshoot-and-hold). `MAX_WALK_TAPS` (8) cap → `ModeSwitchFailed`. Blind
+  `index+1` walk is still the fallback with no cursor source (the daemon).
+- `tools/set_mode.py`: wires `read_menu_cursor` as the cursor source;
+  `--walk-gap` guard is now `~1.2–2.5 s`; stale `--frames` advice removed.
+- `tests/test_modecycle.py`: closed-loop coverage (stop-on-target, dropped
+  step recovery, no overshoot on a doubled step, wrap-around, tap cap).
+
+### Next session — pick up here
+
+Stationary selection is validated (table above). What's left:
+
+1. **On a drive**: `tools/set_mode.py --yes-stationary --target <mode>` for
+   each of sport / mountain / hold / normal, confirm on the dash, and
+   re-check ~30 s later that MOUNTAIN and HOLD *hold* (they reverted
+   parked). Then OBD-II DTC scan.
+2. If that passes: flip `drive_mode_button.confirmed = True` in
+   `voltdmf/signals.py`.
+3. **Move the daemon onto the closed loop.** `daemon.py` still uses the
+   open-loop `presses_to_reach` + `PressCountingModeTracker`; the on-car
+   runs showed that count is only right from a cold NORMAL (warm menu steps
+   relative to the current mode). Wire `0x1F4` into the RX path so the
+   daemon can pass `read_drive_mode` as `current_mode_source` and
+   `read_menu_cursor` as `menu_cursor_source`; add `0x1F4` to
+   `signals.is_signal_frame` and the `_DecodeListener`.
+4. Housekeeping: `rm /etc/sudoers.d/50-voltdmf-canlink` on the Pi once field
+   work is done.
+
+---
+
 ## Session 2 — 2026-08-29 (Phase C.5 — injection reproduces the menu walk; not yet an automated PASS)
 
 Car in Park, brake set, full READY. Added a scoped sudoers drop-in on the Pi
@@ -109,9 +219,12 @@ edits were needed.
    menu-open window, the physical inter-press interval, and how long byte 1
    takes to latch. Set `--walk-gap` (and `PRESS_TRACK_FRAMES` if needed) so
    all 4 injected presses land inside one menu session.
-2. Re-run `inject_test.py --yes-stationary --cycle` and get the owner to
-   confirm every step on the dash. `can0` must stay ERROR-ACTIVE, zero error
-   frames.
+2. Per-mode check through the shipping code:
+   `tools/set_mode.py --yes-stationary --target <mode>` (drives the real
+   `ModeCycleController.switch_to()` + `canio` TX, then prints the `0x1F4`
+   timeline). Owner confirms each on the dash; `can0` must stay ERROR-ACTIVE,
+   zero error frames. Use `inject_test.py --cycle` / `--frames` for the wider
+   timing sweep.
 3. **Real verification is the first dry-run drive** — that is where modes
    actually commit and hold, so the daemon (still `--dry-run`) can be checked
    against `journalctl` while someone else drives. Do the OBD-II DTC scan
@@ -120,12 +233,31 @@ edits were needed.
    the walk-gap into `voltdmf/canio.py` + `voltdmf/modecycle.py`, flip
    `drive_mode_button.confirmed = True`, and record the numbers here.
 
-### `voltdmf/modecycle.py` needs the menu model too (back at a keyboard)
+### `voltdmf/modecycle.py` — menu model applied (keyboard session, 2026-08-29)
 
-`ModeCycleController.switch_to()` currently assumes "N presses = N cursor
-steps from the current mode". The real model is: one isolated press → NORMAL;
-to reach a non-NORMAL mode, fire `index+1` presses < 2 s apart then stop.
-`BUTTON_PRESS_COOLDOWN_S` (0.75) is the *walk-gap*, not a post-switch cooldown.
+Done. `ModeCycleController.switch_to()` no longer does a relative "N presses =
+N cursor steps from current mode" walk.
+
+- `presses_to_reach(target)` — signature dropped `current`; returns the
+  **absolute** `index(target) + 1` (NORMAL 1, SPORT 2, MOUNTAIN 3, HOLD 4),
+  because the menu always reopens on NORMAL.
+- `switch_to()` — reads the status source only to no-op when already on
+  target / refuse when it is `None`; then fires `index+1` presses `WALK_GAP_S`
+  apart. **No synchronous readback** any more (0x1F4 lags a commit ~7–9 s and
+  reverts parked, so the old post-send check always false-failed). Callers
+  verify against 0x1F4 over the following seconds.
+- `MAX_PRESSES_PER_BURST` 3 → `MAX_WALK_PRESSES` 4 (alias kept).
+  `BUTTON_PRESS_COOLDOWN_S` → `WALK_GAP_S` (alias kept), re-documented as the
+  intra-walk gap with both bounds (< ~1.5 s to stay in the menu window,
+  ≥ `canio.RELEASE_GAP_S` for button-up + TEC recovery).
+- `PressCountingModeTracker.note_walk(presses)` sets the mode to the
+  **absolute** `MODE_CYCLE_ORDER[presses-1]`; `note_presses` kept as the
+  alias the daemon wires to `on_presses_sent`.
+- `pytest`: 56 passed (relative-walk tests replaced).
+
+Still open: `WALK_GAP_S = 0.75` is a placeholder until the physical-walk
+capture (step 1 above); it is not yet re-coupled to `canio.PRESS_TRACK_FRAMES`
+/ `RELEASE_GAP_S`, and `drive_mode_button.confirmed` stays `False`.
 
 ### Left running / state
 

@@ -1,14 +1,20 @@
 # Confirmed CAN signals (Gen 1 Chevy Volt, this vehicle)
 
-**Status (2026-08-29, session 2): current-mode STATUS signal confirmed
-(`0x1F4` byte 1). The button INPUT is `0x1E1` byte 4 bit 7 (an earlier call
-this session that `0x1E1` "is not the button" was wrong — it only checked
-bytes 0–3). Injection by "tracking echo" (reply to each live `0x1E1` in its
-gap with bit 7 set) reproduced a full owner-confirmed drive-mode menu walk
-with `can0` ERROR-ACTIVE and zero error frames — but Phase C.5 is NOT a
-clean automated PASS yet: on a parked car `0x1F4` byte 1 lags the commit and
-reverts to NORMAL, and multi-press walk timing is not run-to-run
-consistent. SOC, shift, and ignition behaviour still need a drive.**
+**Status (2026-08-29, session 3): the drive-mode menu now has a LIVE cursor
+readback — `0x1F4` byte 4 (`00` N / `80` S / `40` M / `20` H) steps ~40 ms
+after every button edge, distinct from byte 1 (the committed mode, which
+only moves on the ~3 s commit). `voltdmf/modecycle.py` closes the loop on
+it: tap, read the cursor, stop when it is on the target. The old
+"steps too far" overshoot was `WALK_GAP_S` at 0.75 s — on-car sweeps showed
+taps closer than ~1.2 s coalesce into extra cursor steps; frame count
+(1..16) did not matter. `WALK_GAP_S` is now 1.4 s. A second bug: the cursor
+read returned the OLDEST queued `0x1F4`, not the newest — fixed
+(`_latest_status` drains the RX queue). With both fixes the closed loop
+**selected and committed all four modes correctly on the parked car**
+(sport/mountain/hold/normal, `can0` ERROR-ACTIVE throughout). Still parked:
+MOUNTAIN and HOLD (battery modes) reverted toward NORMAL after the commit —
+a drive is needed to prove they *hold*, not to select them. SPORT held.
+SOC, shift, ignition still need a drive.**
 
 This file is the Phase C deliverable (DESIGN.md). Fill it in from the
 `tools/` output, then update `voltdmf/signals.py` / `voltdmf/canio.py` and
@@ -52,20 +58,31 @@ a checked-in file.
   tracking it), then bit 7 clears. ~350 ms total. Nothing else in the frame
   changes. (The earlier "`0x1E1` is not the button" call was made by
   diffing only bytes 0–3 — wrong.)
-- **The cluster counts button edges, not hold time** (confirmed via `0x1F4`
-  earlier: a 3 s hold = one step, a 0.6 s triple-tap = three).
+- **The cluster mostly counts button edges** — but a *held* button
+  auto-repeats the menu and taps closer than ~1.2 s coalesce into extra
+  steps (session-3 sweeps). Treat "1 tap = 1 step" as true only for
+  well-spaced isolated taps; otherwise close the loop on the byte-4 cursor.
 
-### Drive-mode MENU model (owner watched the dash, 2026-08-29)
+### Drive-mode MENU model (owner watched the dash + on-car injection, 2026-08-29)
 
-- **Menu CLOSED** → any single press opens the menu and selects **NORMAL**,
-  whatever the current mode.
-- **Menu OPEN** (next press within ~2 s) → each press walks the cursor
-  `NORMAL → SPORT → MOUNTAIN → HOLD → NORMAL → …`.
-- **~3 s idle** → menu times out, cursor commits, next press restarts at
-  NORMAL.
-- So reaching a mode is a **walk**: `index + 1` presses < ~2 s apart
-  (NORMAL 1, SPORT 2, MOUNTAIN 3, HOLD 4), then stop. "Reset to NORMAL" for
-  the daemon is a single isolated press.
+- **Cold menu** (no press for a while) → the first press opens the menu on
+  **NORMAL** with no step, whatever the committed mode. Further presses walk
+  the cursor `NORMAL → SPORT → MOUNTAIN → HOLD → NORMAL → …`. Reaching a
+  mode from cold is `index + 1` presses (NORMAL 1, SPORT 2, MOUNTAIN 3,
+  HOLD 4).
+- **Warm menu** (a press within ~3 s of the last commit — e.g. back-to-back
+  `set_mode.py` runs) → the cursor is already on the committed mode and the
+  first press opens *and* steps. Presses to target =
+  `(index(target) − index(current)) mod 4`. Confirmed on-car: SPORT→MOUNTAIN,
+  MOUNTAIN→HOLD, HOLD→NORMAL each took **one** tap.
+- **One step per press** only when presses are ~1.2–2.5 s apart (tighter
+  coalesces into extra steps; see the byte-4 cursor section).
+- **~3 s idle** → menu times out, cursor commits.
+- So the press *count* is context-dependent — **close the loop on the byte-4
+  cursor** instead of trusting a count. The open-loop `presses_to_reach`
+  (`index + 1`) is only correct from a cold NORMAL; the daemon's
+  "single press = reset to NORMAL" assumption holds only from a cold menu
+  and needs the closed loop once `0x1F4` is wired into RX.
 
 ### Injection -- TRACKING ECHO (`voltdmf/canio.py::send_mode_button_press`)
 
@@ -86,29 +103,69 @@ a checked-in file.
   back-to-back blast of a frozen echo (module frames punch through it at
   random points → 0–2 presses per burst, unpredictable).
 
-### Why Phase C.5 is not a clean automated PASS yet
+### `0x1F4` byte 4 — LIVE menu cursor (CONFIRMED 2026-08-29, session 3)
 
-- `0x1F4` byte 1 **lags the commit ~7–9 s** and, on a stationary car in
-  Park, the cluster **reverts toward NORMAL** a few seconds after committing
-  a non-NORMAL mode. So `tools/inject_test.py` can't reliably self-verify a
-  parked walk — real verification needs a drive (modes hold there).
-- Walk **timing is sensitive**: the ~400 ms tracking press + `--walk-gap`
-  can exceed the ~2 s menu window, so a 4-press walk sometimes times out
-  mid-walk and lands short (SPORT instead of HOLD).
+Two Pi-side injection sweeps (`explore_frames.py`, `explore_gap.py`; a raw
+socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
+
+| byte | role | codes |
+|---|---|---|
+| **byte 1** | committed mode; moves only on commit, +3.0 s after last tap | `00` N `80` S `20` M `08` H |
+| **byte 4** | **live menu cursor**; steps ~40 ms after each button edge | `00` N `80` S `40` M `20` H |
+| **byte 5** | menu-open hint (`0x80` open); clears at the commit; flickers mid-walk on the injected path | `00` / `80` |
+
+- Menu **always opens on NORMAL** (seen from HOLD, MOUNTAIN, SPORT starts).
+  Tap 1 opens (cursor → NORMAL, no step); taps 2..N step one row each.
+- **One clean step per tap when taps are ≥ ~1.2 s apart.** Measured
+  overshoot at tighter spacing: 2 taps from NORMAL → SPORT at 1.5–2.0 s,
+  → MOUNTAIN at 0.75–1.0 s, → HOLD at 0.5 s. `WALK_GAP_S` was **0.75** —
+  that was the "steps too far" bug. Now **1.4 s** (clean window ~1.2–2.5 s).
+- **Frame count did not matter**: `PRESS_TRACK_FRAMES` ∈ {1,2,3,6,16} all
+  walked N→S→M cleanly at 1.2 s spacing.
+- New decoders: `signals.decode_menu_cursor()`, `signals.menu_is_open()`;
+  new reader `CanInterface.read_menu_cursor()`.
+
+### What the parked car still can't tell us
+
+- **Selection: PASSES.** The closed loop selected and committed all four
+  modes on the parked car (see field log). `can0` stayed ERROR-ACTIVE.
+- **Mode hold: unproven for MOUNTAIN / HOLD.** `0x1F4` byte 1 lags the
+  commit ~3 s, and in Park the cluster reverts MOUNTAIN and HOLD toward
+  NORMAL within a minute or so (battery-management modes with engagement
+  conditions). SPORT held. Whether MOUNTAIN / HOLD *keep* needs a drive.
+- **Cluster rate-limit / TEC** (from the earlier sweep, not the validation
+  runs): ~90 taps over ~12 min drove `can0` ERROR-ACTIVE → PASSIVE →
+  WARNING and commits stopped landing. Keep runs short, bounce `can0`
+  between them, wait for `0x1F4` to rest at `00 00 00 00 00 00`. The
+  five short validation runs showed none of this.
 
 ### Next
 
-1. Capture a known-good **physical** 4-press walk
-   (`candump -l 'can0,1E1:7FF,1F4:7FF'`) to measure the real menu-open
-   window, inter-press interval, and byte-1 latch delay.
-2. Tune `--walk-gap` / `PRESS_TRACK_FRAMES` so all 4 injected presses land
-   in one menu session; re-run `inject_test.py --cycle`, owner confirms each
-   step, `can0` ERROR-ACTIVE / zero error frames.
-3. Real verification on the first dry-run drive; OBD-II DTC scan there.
-4. Then bake the numbers into `canio.py` + `modecycle.py` and flip
-   `drive_mode_button.confirmed = True`.
-- `voltdmf/modecycle.py` also needs the menu model — its `switch_to()` still
-  assumes "N presses = N steps from the current mode".
+1. **On a drive**: `tools/set_mode.py --yes-stationary --target <mode>` for
+   each mode, confirm on the dash, re-check MOUNTAIN / HOLD ~30 s later,
+   OBD-II DTC scan.
+2. If every mode holds on a drive: flip `drive_mode_button.confirmed = True`
+   (`WALK_GAP_S` / cursor codes are already baked into `signals.py` /
+   `modecycle.py`).
+3. Wire `0x1F4` into the daemon RX path so `daemon.py` uses `read_drive_mode`
+   as `current_mode_source` and `read_menu_cursor` as `menu_cursor_source`
+   (the closed loop) — the open-loop count is only right from a cold NORMAL.
+   Currently only `set_mode.py` runs the closed loop.
+
+### `voltdmf/modecycle.py` state (session 3)
+
+- `presses_to_reach(target)` = `index + 1`. Correct only from a **cold
+  NORMAL** menu — on-car runs showed a warm menu steps relative to the
+  current mode. Still fine as the open-loop / dry-run planner; the real
+  path is the closed loop.
+- `switch_to()` runs the **closed loop** when a `menu_cursor_source` is
+  wired (`set_mode.py` does): tap → `CURSOR_SETTLE_S` → read cursor → stop
+  on match, else `WALK_GAP_S` and tap again; `MAX_WALK_TAPS` (8) cap →
+  `ModeSwitchFailed`. Falls back to the blind `index+1` walk with no cursor
+  source (the daemon, for now).
+- `WALK_GAP_S` = **1.4** (was 0.75). Not coupled to
+  `canio.PRESS_TRACK_FRAMES` — the sweep showed frame count is not the
+  lever.
 
 ## Current-mode status -- `0x1F4` byte 1  (CONFIRMED 2026-08-29)
 
