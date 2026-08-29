@@ -1,38 +1,56 @@
 #!/usr/bin/env python3
-"""Unattended drive-log: walk each drive mode and record whether it HOLDS.
+"""Unattended drive session log: mode-hold + SOC/shift discovery in one run.
 
     THIS TRANSMITS on 0x1E1 ("ASCMSteeringButton", byte 4 bit 7 = pressed).
 
-Purpose: the parked car proved the closed loop can *select* every mode, but
-MOUNTAIN and HOLD reverted toward NORMAL a minute or so after the commit
-(battery-management modes with engagement conditions). Whether they hold
-needs the car moving -- and SSH-ing in from a moving car is not practical.
+Start it stationary and in READY, then drive normally. It runs autonomously
+-- no live SSH -- and produces two files to review at home:
 
-So this runs autonomously. Start it stationary and in READY, then drive
-normally. For each mode in the sequence it:
+  * ~/vdmf-drivelog-<ts>.log   -- this tool's own event log (shared clock)
+  * candump-<ts>.log           -- a full raw `candump -l` capture of the
+                                  whole session (mine offline)
 
-  1. walks to the mode through the production closed loop
-     (voltdmf.modecycle.ModeCycleController + voltdmf.canio, same path as
-     tools/set_mode.py),
-  2. polls 0x1F4 byte 1 for the commit,
-  3. then samples byte 1 (and a tentative speed off 0x3E9) every few
-     seconds for a couple of minutes and logs every change.
+Three things it gathers:
 
-A parked-only revert vs a genuine moving-car hold is then plain in the log.
-Review it at home over wifi; no live SSH during the drive.
+1. MODE HOLD (primary). For each mode in --sequence: walk to it through the
+   production closed loop (voltdmf.modecycle + voltdmf.canio, same path as
+   tools/set_mode.py), poll 0x1F4 byte 1 for the commit, then sample byte 1
+   for a couple of minutes. The parked car selects every mode but MOUNTAIN
+   / HOLD reverted toward NORMAL after the commit; this shows whether they
+   hold while moving.
 
-  DO NOT touch the Pi while driving. Start the run before you pull away
-  (use --start-delay to give yourself time), then leave it alone. Stop it
-  only when parked again (Ctrl-C, or just let it finish).
+2. SHIFT / PRNDL (--shift-routine SECS, done parked before the drive). Logs
+   a banner, then samples 0x135 / 0x1F5 and any frame that moved while you
+   walk the shifter P->R->N->D->L->P with the brake pressed. Say each
+   position out loud for your voice memo.
 
-Typical drive is ~ len(sequence) * (--commit-verify + --hold) + --start-delay
-seconds -- the tool prints the estimate before it starts.
+3. SOC. This dash has no % -- only EV range (miles) and a coarse battery
+   bar. So there is no live SOC decode here; the raw capture is the whole
+   point. Every --mark-every seconds the log prints a "SOC-MARK" line as a
+   timeline anchor -- narrate your EV range + battery bars into a voice memo
+   as you drive, and align it to the capture offline. Take the battery from
+   near full to well down so the SOC frame has a clear trend to find.
+
+NOT covered: ignition behaviour. Key-off kills power to the Pi, so it can't
+observe an ignition cycle -- that stays a separate manual check.
+
+Mine the capture afterward with tools/mine_capture.py (monotonic-frame scan
+for SOC, discrete-state scan for the shifter).
+
+  DO NOT touch the Pi while driving. Start before you pull away (use
+  --start-delay), then leave it alone. Stop only when parked (Ctrl-C, or let
+  it finish). Estimate printed before it starts.
+
+Add --lcd to mirror the shared t+<s> clock, the current phase, the
+committed mode and the can0 state to a SparkFun serial 4x20 LCD, with the
+SAY prompt flashed on each SOC-MARK -- so the voice-memo readout lines up
+with the log without guesswork. Missing/unwired LCD just logs a warning.
 
 Usage:
-  # start parked, 90 s to pull away, ~12 min of logging, default sequence
-  ./drive_log.py --yes-unattended --start-delay 90
+  # full session: 75 s parked shifter routine, 90 s to pull away, all modes
+  ./drive_log.py --yes-unattended --shift-routine 75 --start-delay 90 --lcd
 
-  # just SPORT vs NORMAL, 3 min hold each
+  # mode-hold only, SPORT vs NORMAL, 3 min each
   ./drive_log.py --yes-unattended --sequence sport,normal --hold 180
 
   # sanity-check the plan, no CAN hardware, no TX
@@ -46,6 +64,7 @@ import datetime as _dt
 import logging
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -54,6 +73,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from voltdmf import canio, modecycle, signals  # noqa: E402
 from voltdmf.canio import CanInterface  # noqa: E402
+from voltdmf.lcd import SerLcd  # noqa: E402
 from voltdmf.modecycle import (  # noqa: E402
     ModeCycleController,
     ModeSwitchFailed,
@@ -112,6 +132,172 @@ def _spd(v: float | None) -> str:
     return "n/a" if v is None else f"{v:4.0f}?"  # '?' = unconfirmed decode
 
 
+def latest_payload(bus, addr: int, timeout: float = 0.4) -> bytes | None:
+    """Newest raw payload for one arbitration id, draining the RX backlog."""
+    end = time.time() + timeout
+    latest: bytes | None = None
+    while True:
+        wait = 0.0 if latest is not None else max(0.0, end - time.time())
+        msg = bus.recv(timeout=wait)
+        if msg is None:
+            if latest is not None or time.time() >= end:
+                return latest
+            continue
+        if msg.arbitration_id == addr:
+            latest = bytes(msg.data)
+
+
+def snapshot_ids(bus, seconds: float = 2.0) -> dict[int, bytes]:
+    """One (latest) payload per arbitration id seen over ``seconds``."""
+    end = time.time() + seconds
+    seen: dict[int, bytes] = {}
+    while time.time() < end:
+        msg = bus.recv(timeout=max(0.0, end - time.time()))
+        if msg is not None:
+            seen[msg.arbitration_id] = bytes(msg.data)
+    return seen
+
+
+def start_capture(channel: str, outdir: str, log):
+    """Spawn `candump -l` for the whole session. Returns (Popen|None, path|None)."""
+    d = pathlib.Path(outdir).expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    before = set(d.glob("candump-*.log"))
+    try:
+        proc = subprocess.Popen(["candump", "-l", channel], cwd=d,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        log(f"  candump did not start ({exc}); continuing without raw capture")
+        return None, None
+    time.sleep(0.8)
+    if proc.poll() is not None:
+        log("  candump exited immediately; continuing without raw capture")
+        return None, None
+    new = sorted(set(d.glob("candump-*.log")) - before)
+    path = new[-1] if new else None
+    log(f"  raw capture: candump -l {channel} -> {path or (str(d) + '/candump-*.log')}")
+    return proc, path
+
+
+def stop_capture(proc, path, log) -> None:
+    if proc is None:
+        return
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    sz = (path.stat().st_size / 1e6) if path and path.exists() else 0.0
+    log(f"raw capture closed: {path} ({sz:.1f} MB)")
+
+
+class Marks:
+    """Periodic 'note your EV range + battery bars' timeline anchors.
+
+    ``t0`` is the shared clock origin: SOC-MARK log lines, the LCD ``t+``
+    readout, and your voice memo all reference it.
+    """
+
+    def __init__(self, every: float) -> None:
+        self.every = every
+        self.t0 = time.time()
+        self.next = every
+        self.dash: "Dash | None" = None
+
+    def tick(self, log) -> None:
+        if self.every <= 0:
+            return
+        dt = time.time() - self.t0
+        if dt >= self.next:
+            log(f"  SOC-MARK +{dt:6.1f}s  --> SAY: EV range (mi) + battery bars")
+            if self.dash is not None:
+                self.dash.say()
+            while self.next <= dt:
+                self.next += self.every
+
+
+class Dash:
+    """Optional 4x20 LCD mirror of the session clock. All calls are no-ops
+    when no LCD is wired (``lcd is None``), so callers never have to guard.
+
+    Row 0: shared ``t+<s>`` clock + wall time   Row 1: current phase
+    Row 2: committed mode + can0 state          Row 3: SAY prompt when a
+    SOC-MARK just fired (see :meth:`Marks.tick`).
+    """
+
+    def __init__(self, lcd, marks: "Marks") -> None:
+        self.lcd = lcd
+        self.marks = marks
+        self.phase = "starting"
+        self.mode = "?"
+        self.state = "?"
+        self.say_until = 0.0
+        self._paints = 0
+        if lcd is not None:
+            self.paint()
+
+    def set_phase(self, text: str) -> None:
+        self.phase = text
+        self.paint()
+
+    def update(self, phase: str, mode: str, state: str) -> None:
+        """Set phase + mode + state and repaint once."""
+        self.phase = phase
+        self.paint(mode=mode, state=state)
+
+    def say(self, seconds: float = 8.0) -> None:
+        self.say_until = time.time() + seconds
+        self.paint()
+
+    def paint(self, mode: str | None = None, state: str | None = None) -> None:
+        if self.lcd is None:
+            return
+        if mode is not None:
+            self.mode = mode
+        if state is not None:
+            self.state = state
+        el = int(time.time() - self.marks.t0)
+        self.lcd.line(0, f"t+{el:>5}s  {_dt.datetime.now():%H:%M:%S}")
+        self.lcd.line(1, self.phase[:20])
+        self.lcd.line(2, f"{self.mode:<9} {self.state[:10]}")
+        self.lcd.line(3, ">> SAY: range + bars"
+                      if time.time() < self.say_until else "")
+        self._paints += 1
+        if self._paints % 20 == 0:
+            self.lcd.refresh()  # recover the panel if it browned out mid-drive
+
+
+def shift_routine_phase(bus, secs: float, marks: "Marks", dash: "Dash",
+                        log) -> None:
+    """Parked phase: log 0x135 / 0x1F5 + movers while the driver walks PRNDL."""
+    log("")
+    log("========== SHIFT ROUTINE (car parked, foot on brake) ==========")
+    log("Walk the shifter slowly, pausing ~8 s in each detent:")
+    log("   P -> R -> N -> D -> L -> D -> N -> R -> P")
+    log("Say each position out loud for the voice memo.")
+    base = snapshot_ids(bus, 2.0)
+    log(f"  baseline: {len(base)} ids seen  "
+        f"135={base.get(0x135, b'').hex(' ') or 'n/a'}  "
+        f"1F5={base.get(0x1F5, b'').hex(' ') or 'n/a'}")
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        time.sleep(2.0)
+        marks.tick(log)
+        dt = time.time() - t0
+        dash.set_phase(f"SHIFT P-R-N-D-L {secs - dt:.0f}s")
+        p135 = latest_payload(bus, 0x135, 0.3)
+        p1f5 = latest_payload(bus, 0x1F5, 0.3)
+        now = snapshot_ids(bus, 0.4)
+        movers = sorted(i for i, v in now.items()
+                        if i in base and v != base[i] and i not in (0x135, 0x1F5))
+        log(f"  SHIFT +{dt:5.1f}s  "
+            f"135={(p135.hex(' ') if p135 else '-'):<23} "
+            f"1F5={(p1f5.hex(' ') if p1f5 else '-'):<17} "
+            f"movers={[hex(i) for i in movers[:10]]}")
+    log("===== shift routine done =====")
+
+
 def make_logger(path: pathlib.Path):
     fh = open(path, "a", buffering=1)  # line-buffered
 
@@ -123,9 +309,10 @@ def make_logger(path: pathlib.Path):
     return log, fh
 
 
-def run_mode(controller, can_if, target, args, log) -> dict:
+def run_mode(controller, can_if, target, args, marks, dash, log) -> dict:
     """Walk to ``target``, then watch byte 1 hold. Returns a summary dict."""
     bus = can_if._bus  # throwaway tool: direct read for the tentative speed
+    dash.set_phase(f"-> {target.value.upper()}  walking")
     pre = can_if.read_drive_mode(timeout=2.0)
     log(f"--- {target.value.upper()} ---  (byte1 now: "
         f"{pre.value if pre else 'None'}, spd~{_spd(read_speed(bus))})")
@@ -147,6 +334,7 @@ def run_mode(controller, can_if, target, args, log) -> dict:
         return res
 
     # -- commit watch ---------------------------------------------------
+    dash.set_phase(f"-> {target.value.upper()}  commit?")
     t0 = time.time()
     last = None
     while time.time() - t0 < args.commit_verify:
@@ -154,6 +342,8 @@ def run_mode(controller, can_if, target, args, log) -> dict:
         if m is not None and m != last:
             dt = time.time() - t0
             log(f"    +{dt:5.1f}s  commit-watch  byte1 -> {m.value}")
+            dash.update(f"-> {target.value.upper()}  commit?",
+                        m.value, can_state(args.channel))
             last = m
             if m == target:
                 res["committed"] = m.value
@@ -172,11 +362,16 @@ def run_mode(controller, can_if, target, args, log) -> dict:
     left = False
     while time.time() - h0 < args.hold:
         time.sleep(args.sample)
+        marks.tick(log)
         dt = time.time() - h0
         m = can_if.read_drive_mode(timeout=1.0)
         sp = read_speed(bus)
         cur = can_if.read_menu_cursor(timeout=0.4)
         tag = "" if m == target else "  <-- LEFT TARGET"
+        held_s = args.hold - dt
+        dash.update(f"{target.value.upper()} hold {held_s:.0f}s"
+                    + ("" if m == target else " LEFT!"),
+                    m.value if m else "?", can_state(args.channel))
         if m != prev:
             log(f"    +{dt:5.1f}s  hold-watch  byte1={m.value if m else 'None'} "
                 f"cursor={cur.value if cur else '-'} spd~{_spd(sp)}{tag}")
@@ -222,6 +417,28 @@ def main() -> None:
     ap.add_argument("--walk-gap", type=float, default=modecycle.WALK_GAP_S,
                     help=f"seconds between taps (default {modecycle.WALK_GAP_S}; "
                          f"~1.2..2.5)")
+    ap.add_argument("--shift-routine", type=float, default=0.0, metavar="SECS",
+                    help="parked phase before the drive: SECS of 0x135/0x1F5 "
+                         "logging while you walk the shifter P-R-N-D-L-P "
+                         "(0 = skip; try 75)")
+    ap.add_argument("--mark-every", type=float, default=90.0, metavar="SECS",
+                    help="seconds between SOC-MARK timeline anchors in the log "
+                         "(0 = off; default 90)")
+    ap.add_argument("--capture", dest="capture", action="store_true",
+                    default=True, help="run `candump -l` for the whole session "
+                                       "(default on)")
+    ap.add_argument("--no-capture", dest="capture", action="store_false",
+                    help="do not spawn the raw candump capture")
+    ap.add_argument("--capture-dir", default="~",
+                    help="where candump -l writes its log (default ~)")
+    ap.add_argument("--lcd", action="store_true",
+                    help="mirror the session clock / phase / mode to a "
+                         "SparkFun serial 4x20 LCD (see tools/lcd.py)")
+    ap.add_argument("--lcd-port", default="/dev/serial0")
+    ap.add_argument("--lcd-baud", type=int, default=9600)
+    ap.add_argument("--lcd-backlight", type=int, default=60, metavar="PCT",
+                    help="LCD backlight 0..100 (default 60; lower it if the "
+                         "panel resets -- that is a 5 V sag, not software)")
     ap.add_argument("--no-bounce", action="store_true",
                     help="skip the can0 down/up at the start")
     ap.add_argument("--bounce-between", action="store_true",
@@ -249,18 +466,30 @@ def main() -> None:
     if not 1.0 <= args.walk_gap <= 2.6:
         sys.exit(f"--walk-gap {args.walk_gap}s out of range (~1.2..2.5)")
 
-    est = args.start_delay + len(seq) * (args.commit_verify + args.hold) + 20
+    est = (args.shift_routine + args.start_delay
+           + len(seq) * (args.commit_verify + args.hold) + 20)
     plan = " -> ".join(m.value for m in seq)
     print(f"plan: {plan}")
     print(f"estimate: ~{est/60:.1f} min "
-          f"({args.start_delay:.0f}s pull-away + {len(seq)} modes x "
-          f"~{(args.commit_verify + args.hold):.0f}s)")
+          f"({args.shift_routine:.0f}s shift routine + {args.start_delay:.0f}s "
+          f"pull-away + {len(seq)} modes x ~{(args.commit_verify + args.hold):.0f}s)")
+    cap_desc = f"candump -l -> {args.capture_dir}" if args.capture else "OFF"
+    mark_desc = (f"every {args.mark_every:.0f}s" if args.mark_every > 0 else "off")
+    print(f"capture: {cap_desc}   SOC-MARK: {mark_desc}")
 
     modecycle.WALK_GAP_S = args.walk_gap
 
     if args.dry_run:
-        print("\n[DRY RUN] no bus, no TX. Tap counts from a fake NORMAL "
-              "source:")
+        print("\n[DRY RUN] no bus, no TX.")
+        if args.shift_routine > 0:
+            print(f"  shift routine: {args.shift_routine:.0f}s parked, logging "
+                  f"0x135/0x1F5 + movers while you walk P-R-N-D-L-P")
+        else:
+            print("  shift routine: skipped (--shift-routine 0)")
+        print(f"  raw capture:   {cap_desc}")
+        print(f"  SOC-MARK:      {mark_desc}")
+        print(f"  LCD mirror:    {args.lcd_port + ' @ ' + str(args.lcd_baud) if args.lcd else 'OFF'}")
+        print("  tap counts from a fake NORMAL source:")
         for m in seq:
             gaps: list[float] = []
 
@@ -299,6 +528,24 @@ def main() -> None:
         fh.close()
         sys.exit(1)
 
+    marks = Marks(args.mark_every)
+    lcd = None
+    if args.lcd:
+        try:
+            lcd = SerLcd(args.lcd_port, args.lcd_baud,
+                         backlight=args.lcd_backlight).open()
+            log(f"LCD mirror on {args.lcd_port} @ {args.lcd_baud} "
+                f"(backlight {args.lcd_backlight}%)")
+        except OSError as exc:
+            log(f"LCD open failed ({exc}); continuing without the mirror")
+    dash = Dash(lcd, marks)
+    marks.dash = dash
+    dash.set_phase("bus up; waiting")
+
+    cap_proc = cap_path = None
+    if args.capture:
+        cap_proc, cap_path = start_capture(args.channel, args.capture_dir, log)
+
     summaries: list[dict] = []
     try:
         with CanInterface(args.channel, dry_run=False) as can_if:
@@ -315,10 +562,16 @@ def main() -> None:
                 fh.close()
                 sys.exit(1)
 
+            if args.shift_routine > 0:
+                shift_routine_phase(can_if._bus, args.shift_routine, marks,
+                                    dash, log)
+
             end = time.time() + args.start_delay
             log(f"start-delay {args.start_delay:.0f}s -- pull away now.")
             while time.time() < end:
-                time.sleep(min(30.0, max(0.0, end - time.time())))
+                dash.set_phase(f"PULL AWAY  {end - time.time():.0f}s")
+                time.sleep(min(15.0, max(0.0, end - time.time())))
+                marks.tick(log)
                 if time.time() < end:
                     log(f"  ...{end - time.time():.0f}s to first walk")
 
@@ -327,13 +580,20 @@ def main() -> None:
                 log(f"===== {i}/{len(seq)}  ->  {m.value.upper()} =====")
                 if args.bounce_between and i > 1:
                     bounce(args.channel, log)
-                s = run_mode(controller, can_if, m, args, log)
+                s = run_mode(controller, can_if, m, args, marks, dash, log)
                 summaries.append(s)
                 if s["error"] and "can0 went" in s["error"]:
                     break
     except KeyboardInterrupt:
         log("\ninterrupted -- stopping (hope you're parked).")
+        dash.set_phase("interrupted")
     finally:
+        stop_capture(cap_proc, cap_path, log)
+        if lcd is not None:
+            n_held = sum(1 for s in summaries if s.get("held_full"))
+            dash.update("DONE -- review log",
+                        f"{n_held}/{len(summaries)} held", "")
+            lcd.close()
         log("")
         log("================ SUMMARY ================")
         for s in summaries:
@@ -347,6 +607,8 @@ def main() -> None:
                 f"commit={s['committed']}@{s['commit_s']}s  hold: {held}")
         log("========================================")
         log(f"log written to {logpath}")
+        if cap_path:
+            log(f"raw capture:  {cap_path}   (mine with tools/mine_capture.py)")
         fh.close()
 
 
