@@ -1,8 +1,14 @@
 # Confirmed CAN signals (Gen 1 Chevy Volt, this vehicle)
 
-**Status (2026-08-29): current-mode STATUS signal confirmed on-vehicle
-(`0x1F4` byte 1). Button *injection* not yet proven (Phase C.5). SOC, shift,
-and ignition behaviour still need a drive.**
+**Status (2026-08-29, session 2): current-mode STATUS signal confirmed
+(`0x1F4` byte 1). The button INPUT is `0x1E1` byte 4 bit 7 (an earlier call
+this session that `0x1E1` "is not the button" was wrong — it only checked
+bytes 0–3). Injection by "tracking echo" (reply to each live `0x1E1` in its
+gap with bit 7 set) reproduced a full owner-confirmed drive-mode menu walk
+with `can0` ERROR-ACTIVE and zero error frames — but Phase C.5 is NOT a
+clean automated PASS yet: on a parked car `0x1F4` byte 1 lags the commit and
+reverts to NORMAL, and multi-press walk timing is not run-to-run
+consistent. SOC, shift, and ignition behaviour still need a drive.**
 
 This file is the Phase C deliverable (DESIGN.md). Fill it in from the
 `tools/` output, then update `voltdmf/signals.py` / `voltdmf/canio.py` and
@@ -31,41 +37,78 @@ a checked-in file.
   - `______`
 - => `voltdmf/signals.py`: `SOC_KWH_PER_COUNT = ___`, `GEN1_PACK_USABLE_KWH = ___`
 
-## Drive-mode button press (TX) -- `0x1F4`  (address confirmed; injection NOT proven)
+## Drive-mode button press (TX) -- `0x1E1` byte 4 bit 7  (ADDRESS confirmed; injection efficacy not yet a clean PASS)
 
-- **Same arbitration ID as the status message** (`0x1F4`). There is no
-  separate Gen-2-style `0x1E1` button frame on this bus.
-- Steady frame from the body module: `00 <mode> 00 00 00 00` @ ~40 Hz.
-- A physical tap, observed over 5 timestamped presses:
-  - byte 5 -> `0x80` while the button is held (~0.3-1 s), else `0x00`
-  - byte 4 ramps `0x80 -> 0x40 -> 0x20` the longer it is held
-  - byte 1 stays = the *current* mode throughout the press
-  - the latched mode (byte 1) advances one step ~2-3 s **after** release
-- All 5 taps advanced exactly one step: HOLD->NORMAL->SPORT->MOUNTAIN->HOLD->NORMAL.
-- Injection findings (Phase C.5, in progress on-vehicle 2026-08-29):
-  - Our `0x1F4` frames DO reach the cluster -- they wake the drive-mode screen.
-  - The press is **duration-gated**: ~0.3 s of byte5=`0x80` only wakes the
-    screen; ~1.2 s (with the byte4 ramp) counted as ~3 presses (NORMAL->HOLD
-    in one shot). The byte4 release ramp **auto-repeats** when injected.
-  - TX is hard on the MCP2515 here (RX stays clean): the controller walks
-    ERROR-ACTIVE -> ERROR-PASSIVE -> BUS-OFF across a few shots. Suspect a
-    marginal CAN-H/L solder joint.
-- Approach (`voltdmf/canio.py`), aligned with the Gen 2 prior art
-  (`vix597/chevy-volt-trip-mode`) -- **burst-and-release**:
-  - Mirror byte 1 from the live bus. Send a short burst of
-    `PRESS_BURST_FRAMES` byte 5 = `0x80` frames at `PRESS_FRAME_INTERVAL_S`
-    (default 45 @ 100 Hz = 0.45 s), then **stop transmitting** -- no release
-    frame, no ramp. The body module's own ~40 Hz idle `0x1F4` is the
-    "button up".
-  - Callers leave `RELEASE_GAP_S` (0.75 s, the reference's
-    `BUTTON_PRESS_COOLDOWN`) of silence before the next press. That gap
-    separates one counted press from the next *and* lets the transmit-error
-    counter recover.
-  - `tools/inject_test.py` is closed-loop: it reads `0x1F4` back after every
-    press and stops when the dash reaches the goal -- no blind counting.
-- **Open:** sweep `--burst-ms` / `--rate-hz` for **exactly one step per
-  press** around the full cycle, `can0` staying ERROR-ACTIVE, zero error
-  frames / new DTCs. Then bake the winning values into `canio.py`.
+- **`0x1E1` "ASCMSteeringButton"** -- 7-byte frame, streamed by a module at
+  ~40 Hz. This is the button INPUT; `0x1F4` (above) is only the status echo.
+  Same ID/bit the Gen 2 prior art (`vix597/chevy-volt-trip-mode`) injects.
+- Idle frame: `00 00 00 00 0c YY ZZ`.
+  - byte 4 low 2 bits = a rolling counter `0..3`
+  - bytes 5–6 = a counter-derived tail: counter `0/1/2/3` ->
+    `(1C,C0)/(10,F0)/(14,E0)/(18,D0)`
+  - bytes 0–3 = always `00`
+- **A real physical press = only ~14 consecutive frames with byte 4 bit 7
+  set** (`83 82 81 80 …` — the counter keeps advancing, the tail keeps
+  tracking it), then bit 7 clears. ~350 ms total. Nothing else in the frame
+  changes. (The earlier "`0x1E1` is not the button" call was made by
+  diffing only bytes 0–3 — wrong.)
+- **The cluster counts button edges, not hold time** (confirmed via `0x1F4`
+  earlier: a 3 s hold = one step, a 0.6 s triple-tap = three).
+
+### Drive-mode MENU model (owner watched the dash, 2026-08-29)
+
+- **Menu CLOSED** → any single press opens the menu and selects **NORMAL**,
+  whatever the current mode.
+- **Menu OPEN** (next press within ~2 s) → each press walks the cursor
+  `NORMAL → SPORT → MOUNTAIN → HOLD → NORMAL → …`.
+- **~3 s idle** → menu times out, cursor commits, next press restarts at
+  NORMAL.
+- So reaching a mode is a **walk**: `index + 1` presses < ~2 s apart
+  (NORMAL 1, SPORT 2, MOUNTAIN 3, HOLD 4), then stop. "Reset to NORMAL" for
+  the daemon is a single isolated press.
+
+### Injection -- TRACKING ECHO (`voltdmf/canio.py::send_mode_button_press`)
+
+- For `PRESS_TRACK_FRAMES` (~16) iterations: wait for the module's next live
+  `0x1E1`, OR `0x80` into its byte 4, send it back into the ~24 ms gap
+  before the module's next frame. Result on the wire: a replica of the
+  ~14-frame physical press with a valid advancing counter, landing *between*
+  module frames — no same-ID collisions. Caller leaves `RELEASE_GAP_S`
+  (0.75 s) of silence, then the next press.
+- On-vehicle result: `can0` stayed **ERROR-ACTIVE** with **zero error
+  frames** across ~10 runs; every tracked frame reached the wire (verified
+  by `candump can0,1E1:7FF`). **A full injected `NORMAL → SPORT → MOUNTAIN →
+  HOLD → NORMAL` walk was visually confirmed on the dash by the owner**, with
+  `0x1F4` byte 1 stepping `00 → 80 → 20 → 08 → 00` in lock-step.
+- What did NOT work: transmitting on `0x1F4` (same-ID contention with the
+  module → TEC → ERROR-PASSIVE); a static `0x1E1` frame with a frozen
+  counter (cluster ignores it, only the menu screen woke); a blind
+  back-to-back blast of a frozen echo (module frames punch through it at
+  random points → 0–2 presses per burst, unpredictable).
+
+### Why Phase C.5 is not a clean automated PASS yet
+
+- `0x1F4` byte 1 **lags the commit ~7–9 s** and, on a stationary car in
+  Park, the cluster **reverts toward NORMAL** a few seconds after committing
+  a non-NORMAL mode. So `tools/inject_test.py` can't reliably self-verify a
+  parked walk — real verification needs a drive (modes hold there).
+- Walk **timing is sensitive**: the ~400 ms tracking press + `--walk-gap`
+  can exceed the ~2 s menu window, so a 4-press walk sometimes times out
+  mid-walk and lands short (SPORT instead of HOLD).
+
+### Next
+
+1. Capture a known-good **physical** 4-press walk
+   (`candump -l 'can0,1E1:7FF,1F4:7FF'`) to measure the real menu-open
+   window, inter-press interval, and byte-1 latch delay.
+2. Tune `--walk-gap` / `PRESS_TRACK_FRAMES` so all 4 injected presses land
+   in one menu session; re-run `inject_test.py --cycle`, owner confirms each
+   step, `can0` ERROR-ACTIVE / zero error frames.
+3. Real verification on the first dry-run drive; OBD-II DTC scan there.
+4. Then bake the numbers into `canio.py` + `modecycle.py` and flip
+   `drive_mode_button.confirmed = True`.
+- `voltdmf/modecycle.py` also needs the menu model — its `switch_to()` still
+  assumes "N presses = N steps from the current mode".
 
 ## Current-mode status -- `0x1F4` byte 1  (CONFIRMED 2026-08-29)
 

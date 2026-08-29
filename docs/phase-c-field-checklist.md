@@ -7,10 +7,16 @@ Covers DESIGN.md **Phase A** (CAN bring-up) → **Phase C** (signal discovery) �
 > or injection while the vehicle can move.** Physical abort = unplug the OBD
 > cable.
 
-> **Progress:** see `docs/field-session-log.md`. As of session 1 (2026-08-29):
+> **Progress:** see `docs/field-session-log.md`. As of session 2 (2026-08-29):
 > Phase A **PASS**; Phase C current-mode **status** signal **CONFIRMED**
-> (`0x1F4` byte 1); Phase C.5 **in progress** (injection reaches the cluster,
-> not yet one-step-per-press); SOC / shift / ignition still need a drive.
+> (`0x1F4` byte 1); the button INPUT is **`0x1E1` byte 4 bit 7** (an earlier
+> call this session that `0x1E1` isn't the button only checked bytes 0–3).
+> "Tracking echo" injection reproduced a full owner-confirmed drive-mode
+> **menu walk** with `can0` ERROR-ACTIVE and zero error frames. Phase C.5 is
+> **not a clean automated PASS yet**: on a parked car `0x1F4` byte 1
+> lags/reverts, and multi-press walk timing is not run-to-run consistent —
+> needs a physical-walk capture to tune against, then a drive to verify.
+> SOC / shift / ignition still need a drive.
 
 ---
 
@@ -68,12 +74,15 @@ Stationary, car in "ready"/on, Park, parking brake set.
 
 ### 2a · Drive-mode button + current-mode status signal  ✅ status CONFIRMED (2026-08-29)
 
-Result: **`0x1F4`** carries both. Byte 1 = latched mode (NORMAL `0x00`,
-SPORT `0x80`, MOUNTAIN `0x20`, HOLD `0x08`). Byte 5 = `0x80` button-down;
-byte 4 = post-release decay ramp. `0x1E1` does **not** exist on this bus.
-The `mode_diff.py` / `cycle_modes.py` diff-on-a-running-car approach was too
+Result: **status** is `0x1F4` byte 1 (NORMAL `0x00`, SPORT `0x80`, MOUNTAIN
+`0x20`, HOLD `0x08`). The button **input** is a separate ID, **`0x1E1`
+byte 4 bit 7** ("ASCMSteeringButton"; a real press = ~14 frames with bit 7
+set, counter still advancing) — `0x1E1` *is* on this bus in full READY; it
+was briefly mis-ruled-out by diffing only bytes 0–3. The
+`mode_diff.py` / `cycle_modes.py` diff-on-a-running-car approach was too
 noisy — what worked was a timestamped dwell-per-mode capture + offline
-per-byte scan. Full detail in `docs/signals-confirmed.md`.
+per-byte scan, then a full-frame diff of a physical press. Full detail in
+`docs/signals-confirmed.md`.
 
 - [x] Identify the drive-mode message and the current-mode byte
 - [x] Confirm the 4-step cycle order and each mode's byte value
@@ -117,8 +126,8 @@ P-R-N-D-L.
 - [x] `voltdmf/signals.py`: `0x1F4` in `SIGNAL_IDS`, `drive_mode_status`
       `confirmed=True`, `decode_drive_mode()` implemented. SOC constants and
       `decode_shift()` still stubbed.
-- [x] `voltdmf/canio.py`: `MODE_BUTTON_ADDR = 0x1F4`, press waveform
-      (`PRESS_*` constants), `SEND_CLUSTER_SIZE`
+- [x] `voltdmf/canio.py`: `MODE_BUTTON_ADDR = 0x1E1`, tracking-echo press
+      (`PRESS_TRACK_FRAMES`, `_next_button_frame()`), `SEND_CLUSTER_SIZE`
 - [x] Rewrote `test_nothing_is_confirmed_yet` → `test_confirmed_signal_set`;
       added `decode_drive_mode` tests from captured hex
 - [ ] `voltdmf/daemon.py`: wire the real `decode_drive_mode` as
@@ -128,31 +137,45 @@ P-R-N-D-L.
 
 ---
 
-## 3 · Phase C.5 — injection gate  🔄 IN PROGRESS (2026-08-29)
+## 3 · Phase C.5 — injection gate  🟡 IN PROGRESS — walk reproduced, not yet a clean PASS (2026-08-29, session 2)
 
 Stationary, Park, parking brake set, **car in full READY**; engine off or on
 jack stands; ventilate if the engine may start.
 
-Session 1 status: injected `0x1F4` frames reach the cluster (screen wakes) and
-one shot moved NORMAL→HOLD. Not yet one-step-per-press; `can0` degrades to
-BUS-OFF under sustained TX. The TX path is now **burst-and-release** (short
-byte5=0x80 burst, then silence = the real module's idle frames are the
-"button up") and `inject_test.py` is **closed-loop** (reads `0x1F4` back
-after each press). Findings + next-session recipe: **`docs/field-session-log.md`**.
+Session 2 status: the "reflow the board" call earlier this session was
+**wrong** (owner: soldering is fine). The failures were software — wrong ID
+(transmitting on `0x1F4` collided same-ID with the module → ERROR-PASSIVE)
+and a static `0x1E1` frame the cluster ignores. Fixed by (a) targeting
+**`0x1E1` byte 4 bit 7** and (b) a **tracking-echo** press: reply to each
+live `0x1E1` in its ~24 ms gap with bit 7 set, ~16×, replicating the
+14-frame physical press with a valid advancing counter. A full injected
+`NORMAL→SPORT→MOUNTAIN→HOLD→NORMAL` **menu walk** was owner-confirmed on the
+dash, `can0` ERROR-ACTIVE, zero error frames. Remaining: walk-timing
+consistency (~2 s menu window vs ~400 ms/press + walk-gap) and a drive to
+confirm the mode actually commits/holds (parked `0x1F4` byte 1 lags ~7–9 s
+and reverts to NORMAL). Full detail + next-session recipe:
+**`docs/field-session-log.md`**.
 
-- [x] Terminal 2: `candump can0 | grep -iE 'err'` running (watch for error frames)
-- [x] `tools/inject_test.py --yes-stationary` — frames reach the cluster
-- [ ] Dash mode advances **exactly one step** per press. Sweep:
-      `inject_test.py --yes-stationary --steps 1 --burst-ms 450`
-      (overshoot → lower `--burst-ms`; wake-only → raise it / `--rate-hz 150`)
-- [ ] Full lap: `--steps 4` returns to start in exactly 4 presses
+- [x] Terminal 2: `candump can0,1E1:7FF | grep -iE 'err'` running (watch for error frames)
+- [x] `tools/inject_test.py --yes-stationary` — frames reach the cluster (screen wakes)
+- [x] Determined the press-count mechanism: button edges, not hold duration
+- [x] `0x1E1` byte 4 bit 7 confirmed as the button (full-frame diff of a physical press)
+- [x] Tracking-echo injection: `can0` stays ERROR-ACTIVE, zero error frames, all frames on the wire
+- [x] Full injected `--cycle` walk reproduced and **owner-confirmed on the dash**
+- [ ] Capture a known-good **physical** 4-press walk to measure the menu-open
+      window / inter-press interval / byte-1 latch delay
+- [ ] Tune `--walk-gap` (and `--frames`) so `inject_test.py --yes-stationary
+      --cycle` lands every step run-to-run; owner confirms each on the dash
 - [ ] `can0` stays `ERROR-ACTIVE` throughout; no new warning lights, chimes,
       drivetrain messages, or `candump` error frames
-- [ ] OBD-II scan for stored DTCs; clear only ones you caused and understand
-- [ ] **GATE:** do not run the daemon on a moving car unless every press =
-      exactly one step and zero new DTCs
-- [ ] Bake the winning `--burst-ms` / `--rate-hz` into `voltdmf/canio.py`
-      (`PRESS_BURST_FRAMES` / `PRESS_FRAME_INTERVAL_S`); flip
+- [ ] First dry-run drive: modes commit/hold; check `journalctl -u voltdmf`
+      against the dash. OBD-II scan for stored DTCs; clear only ones you
+      caused and understand
+- [ ] **GATE:** do not run the daemon on a moving car unless the walk reaches
+      every mode reliably and there are zero new DTCs
+- [ ] Bake the winning `PRESS_TRACK_FRAMES` / `RELEASE_GAP_S` / walk-gap into
+      `voltdmf/canio.py` + `voltdmf/modecycle.py` (which still assumes
+      "N presses = N steps from current mode"); flip
       `drive_mode_button.confirmed = True`
 
 ---

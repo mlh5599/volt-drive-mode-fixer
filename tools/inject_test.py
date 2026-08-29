@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
 """On-vehicle injection test (DESIGN.md Phase C.5).  THIS TRANSMITS.
 
-Closed-loop mode-button injection on 0x1F4 through the production TX path
-(voltdmf.canio.CanInterface.send_mode_button_press). Each press is one
-burst-and-release: a short burst of byte5=0x80 frames, then silence so the
-body module's own idle 0x1F4 stream is the "button up". After every press the
-tool reads 0x1F4 back, prints the mode transition + can0 health, and decides
-whether to press again -- it does NOT blind-count.
+Mode-button injection on 0x1E1 ("ASCMSteeringButton", byte 4 bit 7 = pressed)
+through the production TX path
+(voltdmf.canio.CanInterface.send_mode_button_press). Each press is a tracking
+echo: for ~PRESS_TRACK_FRAMES iterations the daemon waits for the module's
+next live 0x1E1, sets byte 4 bit 7, and sends it back into the gap -- a
+replica of the captured ~14-frame physical press -- then goes silent.
 
-Goal of the sweep: find a --burst-ms / --rate-hz where one press advances the
-dash exactly one step, all the way around NORMAL -> SPORT -> MOUNTAIN -> HOLD
--> NORMAL, with can0 staying ERROR-ACTIVE and zero error frames / new DTCs.
+MENU MODEL (confirmed on-vehicle 2026-08-29, from the owner watching the dash):
+  * Menu CLOSED -> any single press opens the menu and selects NORMAL,
+    whatever the current mode is.
+  * Menu OPEN (next press within ~2 s) -> each press walks the cursor
+    NORMAL -> SPORT -> MOUNTAIN -> HOLD -> NORMAL -> ...
+  * ~3 s with no press -> the menu times out, the cursor commits, and the
+    next press starts over from NORMAL.
+
+So reaching a mode is a WALK: press ``index+1`` times, each < ~2 s apart
+(NORMAL index 0 -> 1 press, SPORT 1 -> 2, MOUNTAIN 2 -> 3, HOLD 3 -> 4), then
+stop and let it commit. This tool does exactly that and reads 0x1F4 back.
 
 Car MUST be stationary and in full READY: in Park, parking brake set. Run
-`candump can0 | grep -iE 'err'` in another shell; scan for DTCs afterward.
+`candump -L can0 > /tmp/x.log` in another shell; scan for DTCs afterward.
+NOTE: with the car stationary in Park the cluster tends to revert to NORMAL a
+few seconds after committing a non-NORMAL mode -- that is a "needs a drive"
+question, not an injection failure. What this tool checks is that the walk
+reaches the target cursor at all.
 
 Usage:
   ./inject_test.py --yes-stationary [--channel can0]
-                   (--steps 1 | --target sport)
-                   [--burst-ms 450] [--rate-hz 100] [--gap 0.75]
-                   [--settle 3.0] [--max-presses 6] [--step-confirm] [--dry-run]
+                   (--target sport | --cycle)
+                   [--frames 16]        # bit-7-set frames per press (~14 = real)
+                   [--walk-gap 1.2]     # seconds between presses in a walk
+                   [--commit 3.5]       # seconds to wait for timeout+commit
+                   [--repeat 3]         # do the walk N times (--target only)
+                   [--dry-run]
 """
 
 from __future__ import annotations
@@ -38,6 +53,8 @@ from voltdmf.canio import CanInterface  # noqa: E402
 from voltdmf.signals import MODE_CYCLE_ORDER, DriveMode  # noqa: E402
 
 _MODE_BY_NAME = {m.value: m for m in MODE_CYCLE_ORDER}
+#: Walk model: presses to reach a mode from a closed menu = index + 1.
+_PRESSES_TO_REACH = {m: i + 1 for i, m in enumerate(MODE_CYCLE_ORDER)}
 
 
 def can_state(channel: str) -> str:
@@ -51,10 +68,40 @@ def can_state(channel: str) -> str:
     return m.group(1) if m else "?"
 
 
-def advance(mode: DriveMode, n: int = 1) -> DriveMode:
-    """The mode ``n`` single button steps forward from ``mode``."""
-    order = MODE_CYCLE_ORDER
-    return order[(order.index(mode) + n) % len(order)]
+def walk_to(can_if: CanInterface, target: DriveMode, *, walk_gap: float,
+            commit: float, channel: str, dry_run: bool) -> DriveMode | None:
+    """Do one menu walk to ``target``; return the mode read back from 0x1F4.
+
+    0x1F4 byte 1 lags the commit by several seconds, so after the presses we
+    poll it for up to ``commit`` seconds, returning as soon as it reaches the
+    target (or whatever it settled on when the budget runs out).
+    """
+    n = _PRESSES_TO_REACH[target]
+    before = can_if.read_drive_mode(timeout=2.0)
+    print(f"  walk -> {target.value}: {n} press(es) @ {walk_gap:.1f}s "
+          f"(from {before.value if before else '?'})", flush=True)
+    for i in range(n):
+        st = can_state(channel)
+        if not dry_run and st != "ERROR-ACTIVE":
+            print(f"    can0 is {st!r} -- aborting walk.")
+            return None
+        can_if.send_mode_button_press()
+        if i < n - 1:
+            time.sleep(walk_gap)
+    if dry_run:
+        print(f"    [dry-run] would now poll 0x1F4 for <= {commit:.1f}s")
+        return None
+    deadline = time.time() + commit
+    after = before
+    while time.time() < deadline:
+        after = can_if.read_drive_mode(timeout=1.0) or after
+        if after == target:
+            break
+    settled = commit - max(0.0, deadline - time.time())
+    print(f"    -> 0x1F4 reads {after.value if after else 'None'} after "
+          f"~{settled:.1f}s   | can0: {can_state(channel)}   "
+          f"(confirm against the dash)", flush=True)
+    return after
 
 
 def main() -> None:
@@ -63,43 +110,40 @@ def main() -> None:
                     help="required: you confirm the vehicle is stationary and in Park")
     ap.add_argument("--channel", default="can0")
 
-    goal = ap.add_mutually_exclusive_group()
-    goal.add_argument("--steps", type=int, default=1,
-                      help="advance this many single steps from the current mode (default 1)")
+    goal = ap.add_mutually_exclusive_group(required=True)
     goal.add_argument("--target", choices=sorted(_MODE_BY_NAME),
-                      help="press until the dash reaches this mode")
+                      help="walk the menu to this mode")
+    goal.add_argument("--cycle", action="store_true",
+                      help="walk NORMAL->SPORT->MOUNTAIN->HOLD->NORMAL, one walk each")
 
-    ap.add_argument("--burst-ms", type=int, default=None,
-                    help="override the byte5=0x80 burst length (ms); default from canio")
-    ap.add_argument("--rate-hz", type=float, default=None,
-                    help="override the in-burst frame rate; default from canio")
-    ap.add_argument("--gap", type=float, default=None,
-                    help="seconds of silence between presses (default = canio.RELEASE_GAP_S)")
-    ap.add_argument("--settle", type=float, default=3.0,
-                    help="seconds after a press before reading the mode back")
-    ap.add_argument("--max-presses", type=int, default=6,
-                    help="hard cap on presses per run (safety)")
-    ap.add_argument("--step-confirm", action="store_true",
-                    help="pause for Enter before each press (default: run the loop through)")
+    ap.add_argument("--frames", type=int, default=None,
+                    help="bit-7-set frames per press (default canio.PRESS_TRACK_FRAMES "
+                         "~16; a real physical press is ~14)")
+    ap.add_argument("--walk-gap", type=float, default=1.2,
+                    help="seconds between presses within a walk (must be < ~2s "
+                         "or the menu times out mid-walk)")
+    ap.add_argument("--commit", type=float, default=12.0,
+                    help="max seconds to poll 0x1F4 after the last press "
+                         "(byte 1 lags the commit ~7-9s on this car)")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="repeat the --target walk this many times")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     if not args.yes_stationary:
         sys.exit("refusing to transmit without --yes-stationary")
+    if args.walk_gap >= 2.5:
+        sys.exit(f"--walk-gap {args.walk_gap}s is too long; the menu times out "
+                 f"around 3s -- use <= ~2s so the walk stays in one menu session")
 
-    # Apply CLI overrides to the production TX constants before opening the bus.
-    if args.rate_hz is not None:
-        canio.PRESS_FRAME_INTERVAL_S = 1.0 / args.rate_hz
-    if args.burst_ms is not None:
-        canio.PRESS_BURST_FRAMES = max(1, round(
-            args.burst_ms / 1000 / canio.PRESS_FRAME_INTERVAL_S))
-    canio.SEND_CLUSTER_SIZE = canio.PRESS_BURST_FRAMES
-    gap = canio.RELEASE_GAP_S if args.gap is None else max(args.gap, canio.RELEASE_GAP_S)
+    if args.frames is not None:
+        canio.PRESS_TRACK_FRAMES = max(1, args.frames)
+    canio.PRESS_BURST_FRAMES = canio.PRESS_TRACK_FRAMES
+    canio.SEND_CLUSTER_SIZE = canio.PRESS_TRACK_FRAMES
 
-    burst_s = canio.PRESS_BURST_FRAMES * canio.PRESS_FRAME_INTERVAL_S
-    print(f"burst-and-release: byte5=0x80 x{canio.PRESS_BURST_FRAMES} @ "
-          f"{1 / canio.PRESS_FRAME_INTERVAL_S:.0f} Hz ({burst_s:.2f}s), then "
-          f">={gap:.2f}s silence. byte1 mirrors the live bus.")
+    print(f"tracking echo press on 0x1E1: module frame + byte4|=0x80 x"
+          f"{canio.PRESS_TRACK_FRAMES} (~{canio.PRESS_TRACK_FRAMES * 25}ms). "
+          f"walk-gap {args.walk_gap:.1f}s, commit wait {args.commit:.1f}s.")
 
     st = can_state(args.channel)
     if not args.dry_run and st != "ERROR-ACTIVE":
@@ -107,97 +151,44 @@ def main() -> None:
                  f"cleanly first (ip link set {args.channel} up type can "
                  f"bitrate 500000 restart-ms 100). Refusing to transmit.")
 
+    if args.cycle:
+        plan = [DriveMode.NORMAL, DriveMode.SPORT, DriveMode.MOUNTAIN,
+                DriveMode.HOLD, DriveMode.NORMAL]
+    else:
+        plan = [_MODE_BY_NAME[args.target]] * max(1, args.repeat)
+
     with CanInterface(args.channel, dry_run=args.dry_run) as can_if:
-        start = can_if.read_drive_mode(timeout=2.0)
-        if start is None and not args.dry_run:
-            sys.exit("no decodable 0x1F4 seen -- is the car in full READY? "
-                     "Cannot run closed-loop without a mode readback.")
-        start = start or DriveMode.NORMAL
+        if can_if.read_drive_mode(timeout=2.0) is None and not args.dry_run:
+            sys.exit("no decodable 0x1F4 seen -- is the car in full READY?")
 
-        # Two goal styles. --target: press until the dash shows that mode.
-        # --steps N: do N presses, each of which should advance exactly one
-        # step -- the tuning mode, since it catches both overshoot and
-        # wake-only. cap presses either way.
-        seek_target = args.target is not None
-        if seek_target:
-            final_goal = _MODE_BY_NAME[args.target]
-            cap = args.max_presses
-            print(f"start: {start.value}   goal: reach {final_goal.value}   "
-                  f"(<= {cap} presses)   | can0: {st}\n")
-        else:
-            final_goal = advance(start, args.steps)  # informational
-            cap = min(args.max_presses, args.steps)
-            print(f"start: {start.value}   goal: {args.steps} single step(s) "
-                  f"-> {final_goal.value}   | can0: {st}\n")
-
-        def more() -> bool:
-            if presses >= cap:
-                return False
-            return current != final_goal if seek_target else True
-
-        presses = 0
-        current = start
-        clean_steps = 0
-        while more():
-            if args.step_confirm:
-                input(f"[press {presses + 1}] Enter to inject one press "
-                      f"(at {current.value}, want {final_goal.value})...")
-
-            state_now = can_state(args.channel)
-            if not args.dry_run and state_now != "ERROR-ACTIVE":
-                print(f"  can0 is {state_now!r}, not ERROR-ACTIVE -- aborting. "
-                      f"Recover the bus and restart.")
-                break
-
-            before = can_if.read_drive_mode(timeout=2.0) or current
-            expected = advance(before, 1)
-            can_if.send_mode_button_press()
-            presses += 1
-            time.sleep(args.settle)
-            after = can_if.read_drive_mode(timeout=2.0)
-
-            if args.dry_run:
-                print(f"  press {presses}: [dry-run] would expect "
-                      f"{before.value} -> {expected.value}")
-                break
-            if after is None:
-                print(f"  press {presses}: lost the 0x1F4 readback -- stopping.")
-                break
-
-            if after == expected:
-                verdict = "OK (one step)"
-                clean_steps += 1
-            elif after == before:
-                verdict = "WAKE-ONLY / no movement"
-            else:
-                verdict = f"OVERSHOT (expected {expected.value})"
-            print(f"  press {presses}: {before.value} -> {after.value}  "
-                  f"[{verdict}]   | can0: {can_state(args.channel)}   "
-                  f"(confirm against the dash)")
-
-            current = after
-            if current != final_goal:
-                time.sleep(gap)
+        ok = 0
+        for target in plan:
+            got = walk_to(can_if, target, walk_gap=args.walk_gap,
+                          commit=args.commit, channel=args.channel,
+                          dry_run=args.dry_run)
+            if not args.dry_run:
+                if got == target:
+                    ok += 1
+                else:
+                    print(f"    MISS: wanted {target.value}, 0x1F4 said "
+                          f"{got.value if got else 'None'}")
+                time.sleep(2.0)  # let the cluster settle between walks
 
         if args.dry_run:
             print("\n[dry-run] no frames were sent.")
         else:
-            reached = current == final_goal
-            if reached and clean_steps == presses:
-                tail = f"  ALL {presses} PRESS(ES) CLEAN -- one step each."
-            elif reached:
-                tail = (f"  reached, but only {clean_steps}/{presses} presses "
-                        f"were clean single steps.")
-            else:
-                tail = ("  Tune: OVERSHOT -> lower --burst-ms (350, 300); "
-                        "WAKE-ONLY -> raise --burst-ms (550) or --rate-hz 150.")
-            print(f"\n{'REACHED' if reached else 'DID NOT REACH'} "
-                  f"{final_goal.value} in {presses} press(es) (cap {cap}). "
+            print(f"\n{ok}/{len(plan)} walks landed on their target. "
                   f"can0: {can_state(args.channel)}")
-            print(tail)
+            if ok == len(plan):
+                print("  Injection reproduces the menu walk. Confirm each step "
+                      "against the dash, then scan for DTCs.")
+            else:
+                print("  Tune: raise --frames (18, 20) if presses are missed; "
+                      "adjust --walk-gap (1.0, 1.5) if the menu times out mid-walk "
+                      "or presses merge. Check can0 for error frames.")
 
     print("\nScan for new DTCs before any driving; keep the daemon in --dry-run "
-          "until one press reliably = one step around the full cycle.")
+          "until the walk reliably reaches every mode.")
 
 
 if __name__ == "__main__":

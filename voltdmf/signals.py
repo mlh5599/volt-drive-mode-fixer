@@ -76,12 +76,15 @@ SIGNAL_IDS: dict[str, SignalId] = {
     ),
     "drive_mode_button": SignalId(
         "Drive mode cycle button press (TX only)",
-        0x1F4,
+        0x1E1,
         confirmed=False,
-        note="ADDRESS confirmed 2026-08-29 on-vehicle: same message as the "
-        "status. A physical tap drives byte 5 -> 0x80 (button down) for "
-        "~0.3s, byte 4 then ramps 80->40->20 while held; the mode latches "
-        "~2-3s after release. INJECTION efficacy is unproven -- Phase C.5.",
+        note="ADDRESS confirmed 2026-08-29 on-vehicle (session 2): 0x1E1 "
+        "\"ASCMSteeringButton\", byte 4 bit 7 = drive-mode button pressed "
+        "(byte 4 goes 00/01/02/03 -> 80/81/82/83 during a physical press; low "
+        "bits are a rolling counter). Same ID/bit the Gen 2 prior art injects. "
+        "The receiver counts button edges, not hold time. INJECTION efficacy "
+        "is unproven -- Phase C.5 (a module also streams 0x1E1 at ~40 Hz, so "
+        "the injected burst must go out back-to-back at line rate).",
     ),
     "drive_mode_status": SignalId(
         "Current drive mode (status)",

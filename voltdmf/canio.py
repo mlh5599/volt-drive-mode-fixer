@@ -27,34 +27,67 @@ log = logging.getLogger(__name__)
 # physical tap drives byte 5 -> 0x80 ("button down"), byte 4 then ramps
 # 80->40->20 while held, and the mode latches ~2-3 s after release.
 #
-# Injection model: BURST-AND-RELEASE (mirrors vix597/chevy-volt-trip-mode).
-# One logical press = a short burst of byte5=0x80 frames, then we STOP
-# transmitting -- the body module's own ~40 Hz idle 0x1F4 frames are the
-# "button up". We never send a release frame and never reproduce the byte 4
-# ramp (on-vehicle, an injected ramp AUTO-REPEATS -- each value lands as
-# another press). The caller must leave >= RELEASE_GAP_S of silence before
-# the next press; that gap both separates one counted press from the next and
-# gives the MCP2515's transmit-error counter room to recover (TX is hard on
-# this controller while RX stays clean -- suspect a marginal CAN-H/L joint).
-# Byte 1 mirrors the live bus so our frames never disagree on the mode.
+# Two different IDs:
+#   MODE_STATUS_ADDR 0x1F4 -- body module streams `00 <mode> 00 00 <ramp>
+#     <btn>` at ~40 Hz; byte 1 = latched mode. READ ONLY (read_drive_mode).
+#   MODE_BUTTON_ADDR 0x1E1 -- "ASCMSteeringButton". byte 4 bit 7 = drive-mode
+#     button pressed. This is what we TRANSMIT. Confirmed session 2
+#     (2026-08-29): during a physical press 0x1E1 byte 4 goes 00/01/02/03 ->
+#     80/81/82/83 (low bits are a rolling counter; bit 7 is the press flag).
+#     Same ID/bit/payload the Gen 2 prior art (vix597/chevy-volt-trip-mode)
+#     injects successfully.
 #
-# On-vehicle findings 2026-08-29: ~0.3 s burst only woke the drive-mode
-# screen; ~1.2 s continuous (with the ramp) counted as ~3 presses. Burst
-# length still needs a sweep (tools/inject_test.py --burst-ms); the
-# burst-then-release *structure* is the fix for the multi-step overshoot.
+# Injection model: TRACKING ECHO PRESS.
+# 0x1E1 is NOT a static frame here. byte 4 low 2 bits are a rolling counter,
+# bytes 5-6 are a counter-derived tail, and the module streams the frame at
+# ~40 Hz. A captured *physical* press (session 2, 2026-08-29) is just ~14
+# consecutive frames with byte 4 bit 7 set, the counter still advancing
+# normally (..83 82 81 80..), then bit 7 clears -- ~350 ms total.
+#
+# So we replay exactly that: for PRESS_TRACK_FRAMES iterations, wait for the
+# module's next live 0x1E1, OR 0x80 into its byte 4, and send that back into
+# the ~24 ms gap before the module's next frame. Every injected frame carries
+# the module's current counter + tail (only bit 7 differs), and it lands
+# *between* module frames rather than colliding with one -- so the cluster's
+# ~40 Hz poll sees a clean run of "pressed" frames with a valid advancing
+# counter, then a release edge when we stop. The caller leaves >=
+# RELEASE_GAP_S of silence before the next press.
+#
+# What did NOT work (session 2, on-vehicle): the wrong ID (0x1F4, a status
+# echo); time.sleep()-paced 0x1E1 that collided with the module (TEC ->
+# ERROR-PASSIVE); a static 0x1E1 frame with a frozen counter (ignored / only
+# woke the menu); and a blind back-to-back blast of a frozen echo frame --
+# long blasts get punched through by module frames at random points, so the
+# cluster saw an unpredictable 0-2 presses per burst.
+#
+# The cluster also RATE-LIMITS: injected presses ~5 s apart register, presses
+# ~2 s apart are all ignored. And this menu takes a wake press first (press 1
+# from an idle menu only lights it up). Both are the caller's problem
+# (ModeCycleController / tools/inject_test.py), not this function's.
 #
 # INJECTION EFFICACY IS NOT YET CONFIRMED -- tools/inject_test.py (Phase C.5)
 # is the gate. Until it passes, the daemon must stay in --dry-run.
-MODE_BUTTON_ADDR = 0x1F4
-PRESS_FRAME_INTERVAL_S = 0.010   # 100 Hz within a burst
-PRESS_BURST_FRAMES = 45          # 0.45 s burst of byte5 = 0x80 (sweep start)
-RELEASE_GAP_S = 0.75            # min silence after a burst = the "button up"
+MODE_STATUS_ADDR = 0x1F4
+MODE_BUTTON_ADDR = 0x1E1
+PRESS_BYTE4 = 0x80               # 0x1E1 byte 4 bit 7 = button pressed
+PRESS_TRACK_FRAMES = 16         # bit-7-set frames per press (~14 in a real one)
+_TRACK_FRAME_TIMEOUT_S = 0.1    # give up waiting for the next live 0x1E1
+RELEASE_GAP_S = 0.75            # min silence after a press = the "button up"
                                 # (reference project's BUTTON_PRESS_COOLDOWN)
+_TX_SEND_TIMEOUT_S = 0.1        # let python-can wait for a TX slot instead of
+                                # raising "Transmit buffer full" immediately
+
+# Back-compat: the old blast knobs some callers/tests still poke.
+PRESS_FRAME_INTERVAL_S = 0.0
+PRESS_BURST_FRAMES = PRESS_TRACK_FRAMES
+
+#: Fallback 0x1E1 "button down" payload (no live counter) -- matches
+#: vix597/chevy-volt-trip-mode's PRESS_MSG. Used only if no live 0x1E1 can be
+#: read at all; the cluster has been seen to ignore this on the Gen 1.
+_STATIC_PRESS_PAYLOAD = bytes((0x00, 0x00, 0x00, 0x00, PRESS_BYTE4, 0x00, 0x00))
 
 #: Frames per logical press (compat alias for callers/tests).
-SEND_CLUSTER_SIZE = PRESS_BURST_FRAMES
-
-_MODE_TO_BYTE1 = {v: k for k, v in signals._DRIVE_MODE_BY_BYTE1.items()}
+SEND_CLUSTER_SIZE = PRESS_TRACK_FRAMES
 
 
 class CanInterface:
@@ -97,51 +130,87 @@ class CanInterface:
         end = time.time() + timeout
         while time.time() < end:
             msg = self._bus.recv(timeout=max(0.0, end - time.time()))
-            if msg is not None and msg.arbitration_id == MODE_BUTTON_ADDR:
+            if msg is not None and msg.arbitration_id == MODE_STATUS_ADDR:
                 mode = signals.decode_drive_mode(bytes(msg.data))
                 if mode is not None:
                     return mode
         return None
 
     # -- the only transmit path ----------------------------------------
-    def _press_frame(self, mode_byte1: int) -> can.Message:
-        """The 'button down' frame: byte 5 = 0x80, byte 1 mirrors the mode."""
-        return can.Message(
-            arbitration_id=MODE_BUTTON_ADDR,
-            data=bytes((0x00, mode_byte1, 0x00, 0x00, 0x00, 0x80)),
-            is_extended_id=False,
-        )
+    def _next_button_frame(self, timeout: float) -> bytes | None:
+        """Block up to ``timeout`` for the module's NEXT live 0x1E1 (>=7 B).
+
+        Unlike _latest_button_frame this does not drain a backlog -- it
+        returns on the first 0x1E1 off the wire so the caller can reply into
+        the gap right behind it. Same RX-queue caveat: standalone use only.
+        """
+        if self._bus is None:
+            raise RuntimeError("open() first")
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self._bus.recv(timeout=max(0.0, end - time.time()))
+            if (msg is not None and msg.arbitration_id == MODE_BUTTON_ADDR
+                    and len(msg.data) >= 7):
+                return bytes(msg.data)
+        return None
 
     def send_mode_button_press(self) -> None:
-        """Inject ONE logical button press on 0x1F4: burst-and-release.
+        """Inject ONE logical button press on 0x1E1: a tracking echo press.
 
-        Sends a burst of PRESS_BURST_FRAMES 'button down' frames (byte5=0x80)
-        at PRESS_FRAME_INTERVAL_S, then returns without any release frame --
-        the body module's own ~40 Hz idle 0x1F4 stream is the "button up".
+        For PRESS_TRACK_FRAMES iterations: wait for the module's next live
+        0x1E1, OR 0x80 into its byte 4, and send that straight back into the
+        ~24 ms gap before the module's next frame. The result on the wire is
+        ~PRESS_TRACK_FRAMES frames with bit 7 set and the counter still
+        advancing normally -- a replica of the captured ~14-frame physical
+        press -- followed by a release edge when we stop. No collisions with
+        the module (we transmit between its frames, not on top of them).
+
         The caller MUST leave >= RELEASE_GAP_S of silence before the next
-        press (ModeCycleController and tools/inject_test.py both do). Byte 1
-        mirrors the mode currently on the bus. The car commits the new mode
-        ~2-3 s after this returns.
+        press, must send a wake press first if the menu is idle, and must
+        space presses ~5 s apart (the cluster rate-limits) -- see the module
+        comment. The car commits the new mode ~2-3 s later.
         """
-        current = None if self._dry_run else self.read_drive_mode(timeout=0.5)
-        mode_byte1 = _MODE_TO_BYTE1.get(current, 0x00)
-        burst_s = PRESS_BURST_FRAMES * PRESS_FRAME_INTERVAL_S
         if self._dry_run:
-            log.info("[dry-run] would inject 0x1F4 press: byte5=0x80 x%d @ "
-                     "%.0f Hz (%.2fs burst), then release (stop TX) for "
-                     ">=%.2fs (byte1=0x%02x)",
-                     PRESS_BURST_FRAMES, 1.0 / PRESS_FRAME_INTERVAL_S, burst_s,
-                     RELEASE_GAP_S, mode_byte1)
+            log.info("[dry-run] would inject 0x1E1 press: track module + "
+                     "byte4|=0x%02x x%d, then stop TX for >=%.2fs",
+                     PRESS_BYTE4, PRESS_TRACK_FRAMES, RELEASE_GAP_S)
             return
         if self._bus is None:
             raise RuntimeError("open() first")
-        if current is None:
-            log.warning("no 0x1F4 seen before inject; using byte1=0x00 (NORMAL)")
-        frame = self._press_frame(mode_byte1)
-        for _ in range(PRESS_BURST_FRAMES):
-            self._bus.send(frame)
-            time.sleep(PRESS_FRAME_INTERVAL_S)
-        # No release frame on purpose -- see the docstring / module comment.
+        sent = misses = 0
+        for _ in range(PRESS_TRACK_FRAMES):
+            base = self._next_button_frame(_TRACK_FRAME_TIMEOUT_S)
+            if base is None:
+                misses += 1
+                if misses > 3:
+                    break  # bus went quiet -- stop rather than spin
+                continue
+            buf = bytearray(base)
+            buf[4] |= PRESS_BYTE4
+            frame = can.Message(arbitration_id=MODE_BUTTON_ADDR,
+                                data=bytes(buf), is_extended_id=False)
+            try:
+                self._bus.send(frame, timeout=_TX_SEND_TIMEOUT_S)
+            except can.CanError as exc:
+                log.warning("0x1E1 press: TX backpressure after %d/%d (%s)",
+                            sent, PRESS_TRACK_FRAMES, exc)
+                time.sleep(0.005)
+                continue
+            sent += 1
+        if sent == 0:
+            log.warning("0x1E1 press: no live frame to track -- sending static "
+                        "fallback once (cluster may ignore it)")
+            try:
+                self._bus.send(
+                    can.Message(arbitration_id=MODE_BUTTON_ADDR,
+                                data=_STATIC_PRESS_PAYLOAD, is_extended_id=False),
+                    timeout=_TX_SEND_TIMEOUT_S)
+            except can.CanError:
+                pass
+        else:
+            log.debug("0x1E1 press: %d/%d tracked frames on the wire",
+                      sent, PRESS_TRACK_FRAMES)
+        # No explicit release frame -- the module's own bit-7-clear stream is it.
 
 
 class _DecodeListener(can.Listener):
