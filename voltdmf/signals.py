@@ -255,5 +255,6 @@ def decode_shift(data: bytes) -> ShiftPosition:
 def is_signal_frame(addr: int) -> bool:
     """True if ``addr`` is one we know how to decode into VehicleState."""
     known = {SIGNAL_IDS["soc"].addr, SIGNAL_IDS["speed"].addr,
-             SIGNAL_IDS["shift"].addr, _ALT_SHIFT_ADDR}
+             SIGNAL_IDS["shift"].addr, SIGNAL_IDS["drive_mode_status"].addr,
+             _ALT_SHIFT_ADDR}
     return addr in known

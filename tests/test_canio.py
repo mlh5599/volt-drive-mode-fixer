@@ -7,8 +7,9 @@ RX backlog -- ``recv()`` hands back the oldest queued frame first, and the
 socket buffers 0x1F4 at ~40 Hz while ``send_mode_button_press`` runs.
 """
 
-from voltdmf.canio import MODE_STATUS_ADDR, CanInterface
-from voltdmf.signals import DriveMode
+from voltdmf.canio import MODE_STATUS_ADDR, CanInterface, _DecodeListener
+from voltdmf.signals import DriveMode, ShiftPosition
+from voltdmf.state import VehicleState
 
 
 class _Frame:
@@ -80,3 +81,36 @@ def test_read_drive_mode_returns_newest_committed_byte1():
         _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x20, 0, 0, 0, 0))),
     ])
     assert iface.read_drive_mode(timeout=0.1) is DriveMode.MOUNTAIN
+
+
+# -- _DecodeListener: 0x1F4 byte 1 feeds VehicleState.drive_mode ---------
+def test_decode_listener_populates_drive_mode_from_1f4():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    assert state.drive_mode is None
+
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x20, 0, 0, 0, 0))))
+    assert state.drive_mode is DriveMode.MOUNTAIN
+
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x80, 0, 0, 0, 0))))
+    assert state.drive_mode is DriveMode.SPORT
+
+
+def test_decode_listener_leaves_drive_mode_alone_on_unknown_byte1():
+    state = VehicleState()
+    state.drive_mode = DriveMode.HOLD
+    listener = _DecodeListener(state)
+
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0xFF, 0, 0, 0, 0))))
+    assert state.drive_mode is DriveMode.HOLD  # undecodable -> unchanged
+
+
+def test_decode_listener_ignores_non_signal_frames():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(_Frame(0x1E1, bytes(7)))
+    assert state.drive_mode is None
+    assert state.shift is ShiftPosition.UNKNOWN

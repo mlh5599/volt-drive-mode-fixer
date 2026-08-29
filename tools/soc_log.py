@@ -64,6 +64,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from voltdmf import lcdlock  # noqa: E402
 from voltdmf.lcd import SerLcd  # noqa: E402
 from voltdmf.signals import SIGNAL_IDS  # noqa: E402
 
@@ -323,12 +324,12 @@ def main() -> None:
     ap.add_argument("--buttons", action="store_true",
                     help="wire two GPIO panel buttons: A = gauge dropped one "
                          "increment, B = gauge went up one")
-    ap.add_argument("--button-a-gpio", type=int, default=5, metavar="BCM",
-                    help="BCM pin for button A / gauge-down (default 5 = "
-                         "header pin 29)")
-    ap.add_argument("--button-b-gpio", type=int, default=6, metavar="BCM",
-                    help="BCM pin for button B / gauge-up (default 6 = "
-                         "header pin 31)")
+    ap.add_argument("--button-a-gpio", type=int, default=24, metavar="BCM",
+                    help="BCM pin for button A / gauge-down (default 24 = "
+                         "PiCAN2 switch SW1)")
+    ap.add_argument("--button-b-gpio", type=int, default=23, metavar="BCM",
+                    help="BCM pin for button B / gauge-up (default 23 = "
+                         "PiCAN2 switch SW2)")
     ap.add_argument("--bars", type=int, default=10, metavar="N",
                     help="increments in the dash battery gauge (default 10)")
     ap.add_argument("--bars-start", type=int, default=None, metavar="N",
@@ -393,6 +394,7 @@ def main() -> None:
 
     lcd = None
     if args.lcd:
+        lcdlock.claim("soc_log.py")  # daemon watch screen yields the panel
         try:
             lcd = SerLcd(args.lcd_port, args.lcd_baud,
                          backlight=args.lcd_backlight).open()
@@ -460,6 +462,8 @@ def main() -> None:
     if lcd is not None:
         dash.set_phase("DONE -- review log")
         lcd.close()
+    if args.lcd:
+        lcdlock.release()  # hand the panel back to the daemon watch screen
     if cap_path:
         log(f"  raw capture:  {cap_path}")
         log(f"  next:  tools/mine_capture.py {cap_path} --monotonic --top 25")
