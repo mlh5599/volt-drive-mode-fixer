@@ -100,6 +100,35 @@ decoded-signal reference). Newest session first.
 
 Local `pytest`: **59 passed**.
 
+### Post-session — reference-project review (`vix597/chevy-volt-trip-mode`)
+
+Compared our approach against the Gen 2 prior art. It solved an easier
+problem (different message `0x1e1`, no hold-timer ramp) but its *structure*
+is the fix for both our symptoms:
+
+- **One press = a short burst of identical "button down" frames, then STOP
+  transmitting.** It never sends a release frame — the real steering
+  module's own idle `0x1e1` frames are the "button up". No ramp.
+- **`BUTTON_PRESS_COOLDOWN = 0.75 s` between bursts.** Multi-step switches
+  are discrete bursts 0.75 s apart, never a continuous hold. That gap both
+  separates one counted press from the next (our overshoot) and gives the
+  transmit-error counter room to recover (our BUS-OFF).
+- It blind-counts with a 60 s cooldown and no status signal; we have
+  `0x1F4` byte 1, so we can close the loop instead.
+
+**Applied to the code (committed this session, on the branch):**
+
+- `voltdmf/canio.py` — `send_mode_button_press()` is now burst-and-release:
+  `PRESS_BURST_FRAMES` frames of byte5=0x80 at `PRESS_FRAME_INTERVAL_S`,
+  then return, no release frame. New `RELEASE_GAP_S = 0.75` (callers must
+  leave that much silence before the next press). `PRESS_RAMP_*` /
+  `PRESS_IDLE_FRAMES` gone.
+- `tools/inject_test.py` — rewritten closed-loop: reads `0x1F4` after every
+  press, prints the transition + `can0` state, stops when the dash reaches
+  the goal or hits `--max-presses`. `--steps N` (advance N single steps) or
+  `--target <mode>`. Knobs: `--burst-ms`, `--rate-hz`, `--gap` (floored at
+  `RELEASE_GAP_S`), `--settle`, `--step-confirm`.
+
 ### Next session — pick up here
 
 1. **Car in full READY**, foot on brake, Park. Confirm `candump can0` streams
@@ -119,20 +148,19 @@ Local `pytest`: **59 passed**.
    ip -details link show can0     # expect: can state ERROR-ACTIVE
    ```
 4. Second shell: `candump can0 | grep -iE 'err'`.
-5. Sweep for **one shot = one step**, starting gentle:
+5. Closed-loop sweep — one step at a time, watching the dash and `can0`:
    ```
    /opt/voltdmf/venv/bin/python ~/vdmf/tools/inject_test.py \
-       --yes-stationary --no-ramp --down-ms 450 --presses 1 --shots 4
+       --yes-stationary --steps 1 --burst-ms 450
    ```
-   - Overshoots (>1 step/shot) → `--down-ms 350`, then `300`.
-   - Only wakes the screen → `--down-ms 550`, or add `--rate-hz 150`.
-   - Target: clean single steps all the way around
-     NORMAL → SPORT → MOUNTAIN → HOLD → NORMAL, `can0` staying `ERROR-ACTIVE`,
-     zero error frames.
-6. When a config wins: bake `--down-ms` / `--rate-hz` into
-   `voltdmf/canio.py` (`PRESS_DOWN_FRAMES`, `PRESS_FRAME_INTERVAL_S`) as the
-   production press, flip `drive_mode_button.confirmed = True`, add a decode
-   test, and record the winning numbers here.
+   - Overshoots (one run advances >1 step) → lower `--burst-ms` (350, 300).
+   - Wake-only / "no change" → raise `--burst-ms` (550) or add `--rate-hz 150`.
+   - Once single steps are clean, do a full lap: `--steps 4` should return to
+     the start in exactly 4 presses, `can0` staying `ERROR-ACTIVE`, zero
+     error frames. Or target a specific mode: `--target hold`.
+6. When a config wins: set `voltdmf/canio.py` `PRESS_BURST_FRAMES` /
+   `PRESS_FRAME_INTERVAL_S` to the winning values, flip
+   `drive_mode_button.confirmed = True`, and record the numbers here.
 7. OBD-II DTC scan; clear only DTCs we caused and understand.
 
 ### Still needs a real drive (deferred, not attempted)

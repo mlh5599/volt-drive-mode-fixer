@@ -135,21 +135,25 @@ jack stands; ventilate if the engine may start.
 
 Session 1 status: injected `0x1F4` frames reach the cluster (screen wakes) and
 one shot moved NORMAL→HOLD. Not yet one-step-per-press; `can0` degrades to
-BUS-OFF under sustained TX. Findings + next-session recipe:
-**`docs/field-session-log.md`**.
+BUS-OFF under sustained TX. The TX path is now **burst-and-release** (short
+byte5=0x80 burst, then silence = the real module's idle frames are the
+"button up") and `inject_test.py` is **closed-loop** (reads `0x1F4` back
+after each press). Findings + next-session recipe: **`docs/field-session-log.md`**.
 
 - [x] Terminal 2: `candump can0 | grep -iE 'err'` running (watch for error frames)
 - [x] `tools/inject_test.py --yes-stationary` — frames reach the cluster
-- [ ] Dash mode advances **exactly one step** per shot (tune `--down-ms` /
-      `--rate-hz`; start `--no-ramp --down-ms 450`)
-- [ ] Repeat for a full cycle (4 shots → back to start); each = one step
+- [ ] Dash mode advances **exactly one step** per press. Sweep:
+      `inject_test.py --yes-stationary --steps 1 --burst-ms 450`
+      (overshoot → lower `--burst-ms`; wake-only → raise it / `--rate-hz 150`)
+- [ ] Full lap: `--steps 4` returns to start in exactly 4 presses
 - [ ] `can0` stays `ERROR-ACTIVE` throughout; no new warning lights, chimes,
       drivetrain messages, or `candump` error frames
 - [ ] OBD-II scan for stored DTCs; clear only ones you caused and understand
 - [ ] **GATE:** do not run the daemon on a moving car unless every press =
       exactly one step and zero new DTCs
-- [ ] Bake the winning `--down-ms` / `--rate-hz` into `voltdmf/canio.py`;
-      flip `drive_mode_button.confirmed = True`
+- [ ] Bake the winning `--burst-ms` / `--rate-hz` into `voltdmf/canio.py`
+      (`PRESS_BURST_FRAMES` / `PRESS_FRAME_INTERVAL_S`); flip
+      `drive_mode_button.confirmed = True`
 
 ---
 

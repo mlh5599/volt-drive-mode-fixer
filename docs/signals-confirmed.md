@@ -47,16 +47,25 @@ a checked-in file.
   - The press is **duration-gated**: ~0.3 s of byte5=`0x80` only wakes the
     screen; ~1.2 s (with the byte4 ramp) counted as ~3 presses (NORMAL->HOLD
     in one shot). The byte4 release ramp **auto-repeats** when injected.
-  - Current approach (`voltdmf/canio.py`): mirror byte 1 from the live bus,
-    one solid byte 5 = `0x80` block of `PRESS_DOWN_FRAMES` (~0.45 s) at
-    `PRESS_FRAME_INTERVAL_S` (100 Hz), no ramp. `MODE_BUTTON_ADDR = 0x1F4`.
   - TX is hard on the MCP2515 here (RX stays clean): the controller walks
     ERROR-ACTIVE -> ERROR-PASSIVE -> BUS-OFF across a few shots. Suspect a
-    marginal CAN-H/L solder joint. Mitigations: `restart-ms 100`, keep the
-    frame count low, `inject_test.py` pre-flight + per-shot ERROR-ACTIVE guard.
-- **Open:** find a `--down-ms` / `--rate-hz` that advances **exactly one step
-  per shot** around the full cycle with `can0` staying ERROR-ACTIVE and zero
-  error frames / new DTCs. Then bake it into `canio.py` as the production press.
+    marginal CAN-H/L solder joint.
+- Approach (`voltdmf/canio.py`), aligned with the Gen 2 prior art
+  (`vix597/chevy-volt-trip-mode`) -- **burst-and-release**:
+  - Mirror byte 1 from the live bus. Send a short burst of
+    `PRESS_BURST_FRAMES` byte 5 = `0x80` frames at `PRESS_FRAME_INTERVAL_S`
+    (default 45 @ 100 Hz = 0.45 s), then **stop transmitting** -- no release
+    frame, no ramp. The body module's own ~40 Hz idle `0x1F4` is the
+    "button up".
+  - Callers leave `RELEASE_GAP_S` (0.75 s, the reference's
+    `BUTTON_PRESS_COOLDOWN`) of silence before the next press. That gap
+    separates one counted press from the next *and* lets the transmit-error
+    counter recover.
+  - `tools/inject_test.py` is closed-loop: it reads `0x1F4` back after every
+    press and stops when the dash reaches the goal -- no blind counting.
+- **Open:** sweep `--burst-ms` / `--rate-hz` for **exactly one step per
+  press** around the full cycle, `can0` staying ERROR-ACTIVE, zero error
+  frames / new DTCs. Then bake the winning values into `canio.py`.
 
 ## Current-mode status -- `0x1F4` byte 1  (CONFIRMED 2026-08-29)
 

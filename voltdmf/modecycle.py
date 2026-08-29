@@ -21,7 +21,10 @@ from .signals import MODE_CYCLE_ORDER, DriveMode
 #: more than this is a bug; the safety layer also enforces it.
 MAX_PRESSES_PER_BURST = 3
 
-#: Realistic spacing between individual presses (reference project value).
+#: Silence between individual presses (reference project's BUTTON_PRESS_COOLDOWN).
+#: Must be >= canio.RELEASE_GAP_S -- that gap is the burst-and-release "button
+#: up" and the CAN transmit-error-counter recovery window. Kept as a local
+#: constant so this pure-logic module doesn't import the CAN transport.
 BUTTON_PRESS_COOLDOWN_S = 0.75
 
 

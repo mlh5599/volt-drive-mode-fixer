@@ -24,34 +24,35 @@ log = logging.getLogger(__name__)
 # Confirmed 2026-08-29 on-vehicle: on the Gen 1 HS-CAN (500k) the drive-mode
 # button and the current-mode status share arbitration ID 0x1F4. The body
 # module streams `00 <mode> 00 00 00 00` at ~40 Hz (byte 1 = latched mode). A
-# physical tap drives byte 5 -> 0x80 ("button down") for ~0.3 s, byte 4 then
-# ramps 80->40->20 while held, and the mode latches ~2-3 s after release.
+# physical tap drives byte 5 -> 0x80 ("button down"), byte 4 then ramps
+# 80->40->20 while held, and the mode latches ~2-3 s after release.
 #
-# On-vehicle findings 2026-08-29:
-#  * The press is DURATION-gated: ~0.3 s of byte5=0x80 only wakes the drive-mode
-#    screen; ~1.2 s registered as ~3 presses (auto-repeat). One solid block of
-#    ~0.45 s = one press.
-#  * The byte4 decay ramp the real module emits on release (0x80->0x40->0x20)
-#    AUTO-REPEATS when injected -- each value counts as another press -- so we
-#    do NOT reproduce it. PRESS_RAMP_VALUES is kept (empty) as a tuning hook.
-#  * TX is hard on this controller (RX is clean; suspect a marginal CAN-H/L
-#    solder joint) -- keep the frame count low and pair with `restart-ms`.
-# We stuff frames at PRESS_FRAME_INTERVAL_S (above the module's native ~40 Hz)
-# so the consumer sees a continuous press. Byte 1 mirrors the live mode.
+# Injection model: BURST-AND-RELEASE (mirrors vix597/chevy-volt-trip-mode).
+# One logical press = a short burst of byte5=0x80 frames, then we STOP
+# transmitting -- the body module's own ~40 Hz idle 0x1F4 frames are the
+# "button up". We never send a release frame and never reproduce the byte 4
+# ramp (on-vehicle, an injected ramp AUTO-REPEATS -- each value lands as
+# another press). The caller must leave >= RELEASE_GAP_S of silence before
+# the next press; that gap both separates one counted press from the next and
+# gives the MCP2515's transmit-error counter room to recover (TX is hard on
+# this controller while RX stays clean -- suspect a marginal CAN-H/L joint).
+# Byte 1 mirrors the live bus so our frames never disagree on the mode.
+#
+# On-vehicle findings 2026-08-29: ~0.3 s burst only woke the drive-mode
+# screen; ~1.2 s continuous (with the ramp) counted as ~3 presses. Burst
+# length still needs a sweep (tools/inject_test.py --burst-ms); the
+# burst-then-release *structure* is the fix for the multi-step overshoot.
 #
 # INJECTION EFFICACY IS NOT YET CONFIRMED -- tools/inject_test.py (Phase C.5)
 # is the gate. Until it passes, the daemon must stay in --dry-run.
 MODE_BUTTON_ADDR = 0x1F4
-PRESS_FRAME_INTERVAL_S = 0.010   # 100 Hz
-PRESS_DOWN_FRAMES = 45           # 0.45 s of byte5 = 0x80 -> one press
-PRESS_RAMP_VALUES: tuple[int, ...] = ()   # byte4 ramp disabled (auto-repeats)
-PRESS_RAMP_FRAMES = 14
-PRESS_IDLE_FRAMES = 0
+PRESS_FRAME_INTERVAL_S = 0.010   # 100 Hz within a burst
+PRESS_BURST_FRAMES = 45          # 0.45 s burst of byte5 = 0x80 (sweep start)
+RELEASE_GAP_S = 0.75            # min silence after a burst = the "button up"
+                                # (reference project's BUTTON_PRESS_COOLDOWN)
 
-#: Frames per logical press (for callers/tests).
-SEND_CLUSTER_SIZE = (
-    PRESS_DOWN_FRAMES + PRESS_RAMP_FRAMES * len(PRESS_RAMP_VALUES) + PRESS_IDLE_FRAMES
-)
+#: Frames per logical press (compat alias for callers/tests).
+SEND_CLUSTER_SIZE = PRESS_BURST_FRAMES
 
 _MODE_TO_BYTE1 = {v: k for k, v in signals._DRIVE_MODE_BY_BYTE1.items()}
 
@@ -103,45 +104,44 @@ class CanInterface:
         return None
 
     # -- the only transmit path ----------------------------------------
-    def _frame(self, mode_byte1: int, byte4: int, byte5: int) -> can.Message:
+    def _press_frame(self, mode_byte1: int) -> can.Message:
+        """The 'button down' frame: byte 5 = 0x80, byte 1 mirrors the mode."""
         return can.Message(
             arbitration_id=MODE_BUTTON_ADDR,
-            data=bytes((0x00, mode_byte1, 0x00, 0x00, byte4, byte5)),
+            data=bytes((0x00, mode_byte1, 0x00, 0x00, 0x00, 0x80)),
             is_extended_id=False,
         )
 
-    def _stuff(self, frame: can.Message, count: int) -> None:
-        for _ in range(count):
-            self._bus.send(frame)
-            time.sleep(PRESS_FRAME_INTERVAL_S)
-
     def send_mode_button_press(self) -> None:
-        """Inject one logical button press on 0x1F4.
+        """Inject ONE logical button press on 0x1F4: burst-and-release.
 
-        One solid byte5=0x80 block (~0.45 s, PRESS_DOWN_FRAMES @
-        PRESS_FRAME_INTERVAL_S), no byte4 ramp -- the press is duration-gated
-        and the ramp auto-repeats (see the module comment). Byte 1 mirrors the
-        mode currently on the bus so the injected frames never disagree with
-        the real sender. The car commits the new mode ~2-3 s after this returns.
+        Sends a burst of PRESS_BURST_FRAMES 'button down' frames (byte5=0x80)
+        at PRESS_FRAME_INTERVAL_S, then returns without any release frame --
+        the body module's own ~40 Hz idle 0x1F4 stream is the "button up".
+        The caller MUST leave >= RELEASE_GAP_S of silence before the next
+        press (ModeCycleController and tools/inject_test.py both do). Byte 1
+        mirrors the mode currently on the bus. The car commits the new mode
+        ~2-3 s after this returns.
         """
         current = None if self._dry_run else self.read_drive_mode(timeout=0.5)
         mode_byte1 = _MODE_TO_BYTE1.get(current, 0x00)
+        burst_s = PRESS_BURST_FRAMES * PRESS_FRAME_INTERVAL_S
         if self._dry_run:
-            ramp = ("/".join(f"0x{v:02x}" for v in PRESS_RAMP_VALUES)
-                    + f" x{PRESS_RAMP_FRAMES} each" if PRESS_RAMP_VALUES else "none")
-            log.info("[dry-run] would inject 0x1F4 press: byte5=0x80 x%d, "
-                     "byte4 ramp %s, trailing idle x%d @ %.0f Hz (byte1=0x%02x)",
-                     PRESS_DOWN_FRAMES, ramp, PRESS_IDLE_FRAMES,
-                     1.0 / PRESS_FRAME_INTERVAL_S, mode_byte1)
+            log.info("[dry-run] would inject 0x1F4 press: byte5=0x80 x%d @ "
+                     "%.0f Hz (%.2fs burst), then release (stop TX) for "
+                     ">=%.2fs (byte1=0x%02x)",
+                     PRESS_BURST_FRAMES, 1.0 / PRESS_FRAME_INTERVAL_S, burst_s,
+                     RELEASE_GAP_S, mode_byte1)
             return
         if self._bus is None:
             raise RuntimeError("open() first")
         if current is None:
             log.warning("no 0x1F4 seen before inject; using byte1=0x00 (NORMAL)")
-        self._stuff(self._frame(mode_byte1, 0x00, 0x80), PRESS_DOWN_FRAMES)
-        for ramp in PRESS_RAMP_VALUES:
-            self._stuff(self._frame(mode_byte1, ramp, 0x00), PRESS_RAMP_FRAMES)
-        self._stuff(self._frame(mode_byte1, 0x00, 0x00), PRESS_IDLE_FRAMES)
+        frame = self._press_frame(mode_byte1)
+        for _ in range(PRESS_BURST_FRAMES):
+            self._bus.send(frame)
+            time.sleep(PRESS_FRAME_INTERVAL_S)
+        # No release frame on purpose -- see the docstring / module comment.
 
 
 class _DecodeListener(can.Listener):
