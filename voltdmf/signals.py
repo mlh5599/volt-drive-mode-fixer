@@ -76,15 +76,20 @@ SIGNAL_IDS: dict[str, SignalId] = {
     ),
     "drive_mode_button": SignalId(
         "Drive mode cycle button press (TX only)",
-        0x1E1,
+        0x1F4,
         confirmed=False,
-        note="bit 39; DriveModeButton in old gm_global_a_powertrain.dbc, Gen 2 only",
+        note="ADDRESS confirmed 2026-08-29 on-vehicle: same message as the "
+        "status. A physical tap drives byte 5 -> 0x80 (button down) for "
+        "~0.3s, byte 4 then ramps 80->40->20 while held; the mode latches "
+        "~2-3s after release. INJECTION efficacy is unproven -- Phase C.5.",
     ),
     "drive_mode_status": SignalId(
         "Current drive mode (status)",
-        0x000,
-        confirmed=False,
-        note="NOT FOUND YET -- hard requirement for modecycle; find in Phase C",
+        0x1F4,
+        confirmed=True,
+        note="Confirmed 2026-08-29 on-vehicle (Gen 1, HS-CAN 500k). byte 1 "
+        "latched mode: 0x00 NORMAL, 0x80 SPORT, 0x20 MOUNTAIN, 0x08 HOLD "
+        "(720/720 frames steady per mode across a full button walk).",
     ),
 }
 
@@ -130,6 +135,35 @@ def decode_speed_mph(data: bytes) -> float | None:
     if len(data) < 2:
         return None
     return struct.unpack_from(">H", data, 0)[0] / 100.0
+
+
+# --- Drive mode status (0x1F4) -----------------------------------------
+#
+# Confirmed 2026-08-29 on-vehicle (Gen 1, HS-CAN 500k). 6-byte message from a
+# body module at ~40 Hz: `00 <mode> 00 00 <btn_ramp> <btn_down>`.
+#   byte 1  latched current mode (values below)
+#   byte 4  button hold-time ramp (0x80 -> 0x40 -> 0x20 the longer it's held)
+#   byte 5  0x80 while the button is physically pressed, else 0x00
+# Every one of a 9-transition button walk (NORMAL/SPORT/MOUNTAIN/HOLD dwell +
+# 5 taps) matched this exactly, in cycle order.
+_DRIVE_MODE_BY_BYTE1: dict[int, DriveMode] = {
+    0x00: DriveMode.NORMAL,
+    0x80: DriveMode.SPORT,
+    0x20: DriveMode.MOUNTAIN,
+    0x08: DriveMode.HOLD,
+}
+
+
+def decode_drive_mode(data: bytes) -> DriveMode | None:
+    """Latched drive mode from byte 1 of frame 0x1F4.
+
+    Returns ``None`` for a short frame or an unrecognised byte-1 value.
+    Bytes 4-5 (momentary button activity) are intentionally ignored -- byte 1
+    holds the current mode steady even mid-press.
+    """
+    if len(data) < 2:
+        return None
+    return _DRIVE_MODE_BY_BYTE1.get(data[1])
 
 
 # --- Shift position (0x135 / 0x1F5) --------------------------------------

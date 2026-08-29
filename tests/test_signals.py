@@ -47,6 +47,25 @@ def test_decode_shift_is_unknown_stub():
     assert signals.decode_shift(bytes(8)) is ShiftPosition.UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "byte1, expected",
+    [
+        (0x00, DriveMode.NORMAL),
+        (0x80, DriveMode.SPORT),
+        (0x20, DriveMode.MOUNTAIN),
+        (0x08, DriveMode.HOLD),
+    ],
+)
+def test_decode_drive_mode(byte1, expected):
+    # 0x1F4 layout: 00 <mode> 00 00 <btn_ramp> <btn_down>
+    assert signals.decode_drive_mode(bytes([0x00, byte1, 0, 0, 0, 0x80])) is expected
+
+
+def test_decode_drive_mode_unknown_and_short():
+    assert signals.decode_drive_mode(bytes([0x00, 0x40, 0, 0, 0, 0])) is None
+    assert signals.decode_drive_mode(b"\x00") is None
+
+
 def test_mode_cycle_order():
     assert signals.MODE_CYCLE_ORDER == (
         DriveMode.NORMAL, DriveMode.SPORT, DriveMode.MOUNTAIN, DriveMode.HOLD,
@@ -61,6 +80,11 @@ def test_is_signal_frame():
     assert not signals.is_signal_frame(0x1E1)
 
 
-def test_nothing_is_confirmed_yet():
-    # Guard-rail: this test flips once Phase C confirms signals on the car.
-    assert all(not s.confirmed for s in signals.SIGNAL_IDS.values())
+def test_confirmed_signal_set():
+    # Phase C, 2026-08-29: the current-mode status signal is confirmed
+    # on-vehicle (0x1F4 byte 1). Everything else is still a candidate --
+    # SOC/speed/shift need a drive, and button *injection* needs Phase C.5.
+    confirmed = {name for name, s in signals.SIGNAL_IDS.items() if s.confirmed}
+    assert confirmed == {"drive_mode_status"}
+    assert signals.SIGNAL_IDS["drive_mode_status"].addr == 0x1F4
+    assert not signals.SIGNAL_IDS["drive_mode_button"].confirmed

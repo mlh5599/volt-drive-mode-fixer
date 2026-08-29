@@ -9,26 +9,51 @@ path anywhere (DESIGN.md "Safety model").
 from __future__ import annotations
 
 import logging
+import time
 
 import can
 
 from . import signals
-from .signals import SIGNAL_IDS
+from .signals import SIGNAL_IDS, DriveMode
 from .state import VehicleState
 
 log = logging.getLogger(__name__)
 
 # --- The one message this project is allowed to transmit -------------------
 #
-# UNCONFIRMED: these are the Gen 2 (2017) values from vix597/chevy-volt-trip-mode
-# (MSG_ID 0x1E1, payload 00 00 00 00 80 00 00 -- the 0x80 is bit 39). Phase C
-# (tools/mode_diff.py) confirms or replaces them for this Gen 1 car.
-MODE_BUTTON_ADDR_UNCONFIRMED = 0x1E1
-MODE_BUTTON_PAYLOAD_UNCONFIRMED = bytes.fromhex("00000000800000")
+# Confirmed 2026-08-29 on-vehicle: on the Gen 1 HS-CAN (500k) the drive-mode
+# button and the current-mode status share arbitration ID 0x1F4. The body
+# module streams `00 <mode> 00 00 00 00` at ~40 Hz (byte 1 = latched mode). A
+# physical tap drives byte 5 -> 0x80 ("button down") for ~0.3 s, byte 4 then
+# ramps 80->40->20 while held, and the mode latches ~2-3 s after release.
+#
+# On-vehicle findings 2026-08-29:
+#  * The press is DURATION-gated: ~0.3 s of byte5=0x80 only wakes the drive-mode
+#    screen; ~1.2 s registered as ~3 presses (auto-repeat). One solid block of
+#    ~0.45 s = one press.
+#  * The byte4 decay ramp the real module emits on release (0x80->0x40->0x20)
+#    AUTO-REPEATS when injected -- each value counts as another press -- so we
+#    do NOT reproduce it. PRESS_RAMP_VALUES is kept (empty) as a tuning hook.
+#  * TX is hard on this controller (RX is clean; suspect a marginal CAN-H/L
+#    solder joint) -- keep the frame count low and pair with `restart-ms`.
+# We stuff frames at PRESS_FRAME_INTERVAL_S (above the module's native ~40 Hz)
+# so the consumer sees a continuous press. Byte 1 mirrors the live mode.
+#
+# INJECTION EFFICACY IS NOT YET CONFIRMED -- tools/inject_test.py (Phase C.5)
+# is the gate. Until it passes, the daemon must stay in --dry-run.
+MODE_BUTTON_ADDR = 0x1F4
+PRESS_FRAME_INTERVAL_S = 0.010   # 100 Hz
+PRESS_DOWN_FRAMES = 45           # 0.45 s of byte5 = 0x80 -> one press
+PRESS_RAMP_VALUES: tuple[int, ...] = ()   # byte4 ramp disabled (auto-repeats)
+PRESS_RAMP_FRAMES = 14
+PRESS_IDLE_FRAMES = 0
 
-#: One logical "press" = this many identical frames back to back (reference
-#: project's SEND_CLUSTER_SIZE). Also UNCONFIRMED for Gen 1.
-SEND_CLUSTER_SIZE = 50
+#: Frames per logical press (for callers/tests).
+SEND_CLUSTER_SIZE = (
+    PRESS_DOWN_FRAMES + PRESS_RAMP_FRAMES * len(PRESS_RAMP_VALUES) + PRESS_IDLE_FRAMES
+)
+
+_MODE_TO_BYTE1 = {v: k for k, v in signals._DRIVE_MODE_BY_BYTE1.items()}
 
 
 class CanInterface:
@@ -37,11 +62,6 @@ class CanInterface:
         self._dry_run = dry_run
         self._bus: can.BusABC | None = None
         self._notifier: can.Notifier | None = None
-        self._tx_frame = can.Message(
-            arbitration_id=MODE_BUTTON_ADDR_UNCONFIRMED,
-            data=MODE_BUTTON_PAYLOAD_UNCONFIRMED,
-            is_extended_id=False,
-        )
 
     # -- lifecycle --------------------------------------------------------
     def open(self) -> None:
@@ -68,18 +88,60 @@ class CanInterface:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    # -- observation helper (used by the injection test) -----------------
+    def read_drive_mode(self, timeout: float = 1.0) -> DriveMode | None:
+        """Return the current drive mode from the next decodable 0x1F4 frame."""
+        if self._bus is None:
+            raise RuntimeError("open() first")
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self._bus.recv(timeout=max(0.0, end - time.time()))
+            if msg is not None and msg.arbitration_id == MODE_BUTTON_ADDR:
+                mode = signals.decode_drive_mode(bytes(msg.data))
+                if mode is not None:
+                    return mode
+        return None
+
     # -- the only transmit path ----------------------------------------
+    def _frame(self, mode_byte1: int, byte4: int, byte5: int) -> can.Message:
+        return can.Message(
+            arbitration_id=MODE_BUTTON_ADDR,
+            data=bytes((0x00, mode_byte1, 0x00, 0x00, byte4, byte5)),
+            is_extended_id=False,
+        )
+
+    def _stuff(self, frame: can.Message, count: int) -> None:
+        for _ in range(count):
+            self._bus.send(frame)
+            time.sleep(PRESS_FRAME_INTERVAL_S)
+
     def send_mode_button_press(self) -> None:
-        """Emit one logical button press (a burst of identical frames)."""
+        """Inject one logical button press on 0x1F4.
+
+        One solid byte5=0x80 block (~0.45 s, PRESS_DOWN_FRAMES @
+        PRESS_FRAME_INTERVAL_S), no byte4 ramp -- the press is duration-gated
+        and the ramp auto-repeats (see the module comment). Byte 1 mirrors the
+        mode currently on the bus so the injected frames never disagree with
+        the real sender. The car commits the new mode ~2-3 s after this returns.
+        """
+        current = None if self._dry_run else self.read_drive_mode(timeout=0.5)
+        mode_byte1 = _MODE_TO_BYTE1.get(current, 0x00)
         if self._dry_run:
-            log.info("[dry-run] would send %d x %s#%s", SEND_CLUSTER_SIZE,
-                     hex(self._tx_frame.arbitration_id),
-                     self._tx_frame.data.hex())
+            ramp = ("/".join(f"0x{v:02x}" for v in PRESS_RAMP_VALUES)
+                    + f" x{PRESS_RAMP_FRAMES} each" if PRESS_RAMP_VALUES else "none")
+            log.info("[dry-run] would inject 0x1F4 press: byte5=0x80 x%d, "
+                     "byte4 ramp %s, trailing idle x%d @ %.0f Hz (byte1=0x%02x)",
+                     PRESS_DOWN_FRAMES, ramp, PRESS_IDLE_FRAMES,
+                     1.0 / PRESS_FRAME_INTERVAL_S, mode_byte1)
             return
         if self._bus is None:
             raise RuntimeError("open() first")
-        for _ in range(SEND_CLUSTER_SIZE):
-            self._bus.send(self._tx_frame)
+        if current is None:
+            log.warning("no 0x1F4 seen before inject; using byte1=0x00 (NORMAL)")
+        self._stuff(self._frame(mode_byte1, 0x00, 0x80), PRESS_DOWN_FRAMES)
+        for ramp in PRESS_RAMP_VALUES:
+            self._stuff(self._frame(mode_byte1, ramp, 0x00), PRESS_RAMP_FRAMES)
+        self._stuff(self._frame(mode_byte1, 0x00, 0x00), PRESS_IDLE_FRAMES)
 
 
 class _DecodeListener(can.Listener):
