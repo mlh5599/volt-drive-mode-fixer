@@ -94,19 +94,37 @@ watch screen).
 | `tools/lcd.py`, `tools/drive_log.py`, `tools/soc_log.py` | Take the LCD hand-off lock while they own the panel. |
 | `tests/test_lcdlock.py`, `tests/test_lcddash.py` (new), `tests/test_canio.py`, `tests/test_signals.py` | Lock round-trip / stale-pid; watch-screen render + yield/resume + real-panel-by-default; `0x1F4` → `drive_mode`; `is_signal_frame(0x1F4)`. Full suite: 116 passed. |
 
+### Wrap-up (end of session 5)
+
+All Phase C work is now on `main`: `phase-c-soc-discovery` and
+`phase-c-lcd-watch` merged via `--no-ff` (`c858e6c`), pushed, and all three
+`phase-c-*` branches deleted local + remote. 116 tests green on `main`.
+
 ### Next session — pick up here
 
 1. **SOC discharge drive** with `tools/soc_log.py` — the real run: pack
    near-full → well down, `--buttons`, then `mine_capture.py --monotonic`
-   anchored to the `GAUGE-DOWN` timestamps.
+   anchored to the `GAUGE-DOWN` timestamps. This is the one remaining
+   unconfirmed signal (`soc`); everything else (`drive_mode_status`,
+   `drive_mode_button`, `shift`) is confirmed on-vehicle.
 2. **Move the daemon onto the `0x1F4` closed loop** — the RX decode is done;
    still need `daemon.py` to use it as `current_mode_source` /
    `menu_cursor_source` instead of the press-counting tracker. Consider
    `SafetyGate(allow_unknown_shift=False)` now that `0x1F5` decodes.
-3. Default detached `drive_log.py` / `soc_log.py` runs to `--no-bounce`, or
+3. **Make the installed daemon the idle display** (deferred this session —
+   picked "leave the service alone, run the dashboard by hand" for now). To
+   have `voltdmf.service` paint the watch screen at idle, three things need
+   fixing: (a) `/opt/voltdmf` has stale code — redeploy via Ansible;
+   (b) the `voltdmf` service user (uid 997, no supp. groups) can't open
+   `/dev/serial0` (`root:dialout`) — add it to `dialout` in the role;
+   (c) hand-off lock path: the daemon runs as `voltdmf` with
+   `ProtectHome=true`, so `~/.voltdmf-lcd.lock` resolves nowhere near
+   `mike`'s home — set `VOLTDMF_LCD_LOCK` to a shared path (e.g.
+   `/run/voltdmf/lcd.lock`) in both the unit and the tools' defaults.
+4. Default detached `drive_log.py` / `soc_log.py` runs to `--no-bounce`, or
    fix the `/etc/sudoers.d/50-voltdmf-canlink` match.
-4. OBD-II DTC scan.
-5. `rm /etc/sudoers.d/50-voltdmf-canlink` on the Pi once field work is done.
+5. OBD-II DTC scan.
+6. `rm /etc/sudoers.d/50-voltdmf-canlink` on the Pi once field work is done.
 
 ---
 
