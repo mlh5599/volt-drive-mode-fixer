@@ -30,6 +30,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import pathlib
 import re
@@ -40,6 +41,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from voltdmf.lcd import SerLcd  # noqa: E402
+from voltdmf import lcdlock  # noqa: E402
 
 _STATE_ABBR = {
     "ERROR-ACTIVE": "ACTIVE", "ERROR-WARNING": "WARN",
@@ -211,23 +213,32 @@ def main() -> None:
                     help="no serial port, no CAN: just print the screen image")
     args = ap.parse_args()
 
+    which = "selftest" if args.selftest else \
+            "message" if args.message is not None else "watch"
+
+    # Take the LCD away from the daemon's watch screen for the duration
+    # (no-op under --dry-run, which touches no hardware).
+    lock = lcdlock.hold(f"lcd.py --{which}") if not args.dry_run \
+        else contextlib.nullcontext()
+
     lcd = SerLcd(args.port, args.baud, backlight=args.backlight,
                  boot_wait=args.boot_wait, dry_run=args.dry_run)
-    try:
-        lcd.open()
-    except OSError as exc:
-        sys.exit(f"cannot open {args.port}: {exc}\n"
-                 f"(enable the UART, free it from the serial console, and "
-                 f"check wiring -- see voltdmf/lcd.py)")
-    try:
-        if args.selftest:
-            do_selftest(lcd, args.selftest_seconds)
-        elif args.message is not None:
-            do_message(lcd, args.message)
-        else:
-            do_watch(lcd, args)
-    finally:
-        lcd.close()
+    with lock:
+        try:
+            lcd.open()
+        except OSError as exc:
+            sys.exit(f"cannot open {args.port}: {exc}\n"
+                     f"(enable the UART, free it from the serial console, and "
+                     f"check wiring -- see voltdmf/lcd.py)")
+        try:
+            if args.selftest:
+                do_selftest(lcd, args.selftest_seconds)
+            elif args.message is not None:
+                do_message(lcd, args.message)
+            else:
+                do_watch(lcd, args)
+        finally:
+            lcd.close()
 
 
 if __name__ == "__main__":

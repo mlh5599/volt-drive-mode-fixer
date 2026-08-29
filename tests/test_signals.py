@@ -94,6 +94,7 @@ def test_is_signal_frame():
     assert signals.is_signal_frame(0x3E9)
     assert signals.is_signal_frame(0x135)
     assert signals.is_signal_frame(0x1F5)
+    assert signals.is_signal_frame(0x1F4)  # drive-mode status, ~40 Hz
     assert not signals.is_signal_frame(0x1E1)
 
 

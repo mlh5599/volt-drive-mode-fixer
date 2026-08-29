@@ -21,6 +21,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+
+    lcd = p.add_argument_group("LCD watch screen")
+    lcd.add_argument("--no-lcd", dest="lcd", action="store_false",
+                     help="do not drive the SparkFun LCD watch screen")
+    lcd.add_argument("--lcd-port", default="/dev/serial0",
+                     help="serial port for the LCD (default: /dev/serial0)")
+    lcd.add_argument("--lcd-baud", type=int, default=9600)
+    lcd.add_argument("--lcd-backlight", type=int, default=45, metavar="PCT",
+                     help="LCD backlight 0..100 (default 45; drop it if the "
+                          "panel resets under a sagging 5V feed)")
+    p.set_defaults(lcd=True)
     return p.parse_args(argv)
 
 
@@ -37,7 +48,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    daemon = Daemon(config, channel=args.channel, dry_run=args.dry_run)
+    daemon = Daemon(config, channel=args.channel, dry_run=args.dry_run,
+                    lcd=args.lcd, lcd_port=args.lcd_port, lcd_baud=args.lcd_baud,
+                    lcd_backlight=args.lcd_backlight)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: daemon.request_stop())
 

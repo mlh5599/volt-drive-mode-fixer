@@ -71,7 +71,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from voltdmf import canio, modecycle, signals  # noqa: E402
+from voltdmf import canio, lcdlock, modecycle, signals  # noqa: E402
 from voltdmf.canio import CanInterface  # noqa: E402
 from voltdmf.lcd import SerLcd  # noqa: E402
 from voltdmf.modecycle import (  # noqa: E402
@@ -531,6 +531,7 @@ def main() -> None:
     marks = Marks(args.mark_every)
     lcd = None
     if args.lcd:
+        lcdlock.claim("drive_log.py")  # daemon watch screen yields the panel
         try:
             lcd = SerLcd(args.lcd_port, args.lcd_baud,
                          backlight=args.lcd_backlight).open()
@@ -594,6 +595,8 @@ def main() -> None:
             dash.update("DONE -- review log",
                         f"{n_held}/{len(summaries)} held", "")
             lcd.close()
+        if args.lcd:
+            lcdlock.release()  # hand the panel back to the daemon watch screen
         log("")
         log("================ SUMMARY ================")
         for s in summaries:

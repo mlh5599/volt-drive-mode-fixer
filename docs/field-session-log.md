@@ -6,6 +6,110 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 5 — 2026-08-29 (keyboard + Pi bench — SOC-log tool; daemon LCD watch screen; 0x1F4 → VehicleState)
+
+No car, but the Pi (`voltpi`) was on the bench with `can0` up and the
+SparkFun 4x20 + the two PiCAN2 switches attached, so the buttons and the
+watch screen were both bench-tested for real. Work on branches
+`phase-c-soc-discovery` (the SOC tool, merged) and `phase-c-lcd-watch` (the
+watch screen).
+
+### Done
+
+1. **`tools/soc_log.py`** (new, on `phase-c-soc-discovery`, committed +
+   pushed). Passive SOC-discovery drive log — the session-4 next-step #1
+   tool. **Never transmits.** Start it parked, `--minutes N`, drive the pack
+   down; it spawns a full `candump -l` capture (the deliverable) and drops
+   `SOC-MARK` time anchors every `--mark-every` s. With `--buttons`, two
+   PiCAN2 switch pads SW1 / SW2 (`gpiozero`, BCM 24 / 23 to GND — the
+   board's own button option) track the 10-increment dash battery
+   gauge hands-free: **A = an increment just dropped, B = it climbed back
+   one**. The running level is clamped `[0, --bars]` and stamped absolute on
+   every log line (`gauge=7/10`), so no parallel voice memo is needed. Hold
+   **both** buttons `--stop-hold` s for a clean stop without SSH. `--lcd`
+   mirrors the `t+<s>` clock + live gauge level.
+
+2. **Daemon LCD watch screen** (`phase-c-lcd-watch`, not yet committed).
+   `python -m voltdmf` now brings the SparkFun 4x20 up itself in a
+   background thread and paints an idle status screen whenever nothing else
+   wants the panel:
+
+   ```
+   DMF     39s 21:02:54    row 0  uptime + wall clock (proof it's alive)
+   mode   NORMAL           row 1  committed mode, 0x1F4 byte 1
+   gear P    bus ACTIVE    row 2  PRNDL gear + can0 error state
+   DRY on_start MOUNTAIN   row 3  what the fixer is armed to do / last did
+   ```
+
+   - `voltdmf/lcddash.py` (new) — `LcdDashboard` thread + a pure
+     `render_screen()`. Fail-soft: never raises into the daemon loop, a
+     missing/unusable serial port is just a dark screen with one warning.
+   - `voltdmf/lcdlock.py` (new) — advisory hand-off lock at
+     `~/.voltdmf-lcd.lock` (`VOLTDMF_LCD_LOCK` override), `"<pid>: <what>"`.
+     `tools/lcd.py`, `drive_log.py --lcd`, `soc_log.py --lcd` take it; the
+     watch thread sees it, closes its port, idles, and resumes on release.
+     A lock left by a dead pid is ignored.
+   - `python -m voltdmf` gets `--no-lcd` / `--lcd-port` / `--lcd-baud` /
+     `--lcd-backlight`; watch mode is the default.
+
+3. **`0x1F4` byte 1 → `VehicleState.drive_mode`** — session-4 next-step #2,
+   the `_DecodeListener` half. `0x1F4` added to `signals.is_signal_frame()`
+   (also sharpens bus-liveness detection — it streams ~40 Hz) and decoded
+   into `state.drive_mode` in the RX loop, so the watch screen shows the
+   live committed mode. Wiring `0x1F4` in as `daemon.py`'s
+   `current_mode_source` / `menu_cursor_source` for the closed loop is still
+   open.
+
+### Bench test on the Pi — both PASS
+
+- **SOC-log buttons.** New `tools/button_check.py` (press/release events,
+  hold-both stop gesture, `--scan` to find miswired pins). First runs found
+  nothing on the old BCM 5/6 default — the buttons are soldered to the
+  **PiCAN2 switch pads: SW1 = BCM 24, SW2 = BCM 23**. Repointed the defaults
+  (`--button-a-gpio 24` / `--button-b-gpio 23`, A = gauge-down = SW1) in
+  `soc_log.py` + `button_check.py`. Re-test: 6 A-presses / 7 B-presses all
+  clean and debounced, both-held stop fired at exactly 3 s, pins read `up`
+  at rest.
+- **Watch screen.** First bench run painted a **blank panel** — the daemon
+  runs `--dry-run` on the Pi (the installed `voltdmf.service` does), and
+  that was being passed straight into `SerLcd(dry_run=True)`, so the thread
+  only ever built an in-memory image. Fixed: `--dry-run` gates CAN TX only;
+  `daemon.py` no longer hands its dry-run flag to `LcdDashboard`, so the
+  watch screen always drives the real panel (the dry-run state still shows
+  as the `DRY ` tag on row 3). Re-run: all four rows rendered correctly on
+  the SparkFun 4x20, `0x1F5` decoded `gear P`, no LCD warnings, clean
+  thread start + stop.
+
+### Code / tooling this session
+
+| File | Change |
+|---|---|
+| `tools/soc_log.py` (new) | Passive SOC drive log: `candump -l` capture spawn, `SOC-MARK` anchors, 2-button 10-increment gauge tracker (BCM 24/23 = PiCAN2 SW1/SW2), both-held stop, optional `--lcd`. Never transmits. |
+| `tools/button_check.py` (new) | Bench check for the SOC-log buttons: press/release events, hold-both stop test, `--scan` mode. No CAN, no LCD. |
+| `voltdmf/lcddash.py` (new) | `LcdDashboard` background thread + pure `render_screen()` — the daemon's idle watch screen. Fail-soft. Always drives the real panel (not gated by daemon `--dry-run`). |
+| `voltdmf/lcdlock.py` (new) | Advisory single-writer LCD hand-off lock (pid file, stale-pid aware, `hold()` context manager). |
+| `voltdmf/daemon.py` | Starts/stops `LcdDashboard` by default; `_lcd_status()` callback for row 3 (`DRY ` tag under `--dry-run`); `--no-lcd` and `--lcd-*` knobs via `__main__.py`. Does **not** pass `--dry-run` to the LCD — that flag is CAN-TX only. |
+| `voltdmf/canio.py` | `_DecodeListener` decodes `0x1F4` byte 1 into `state.drive_mode`. |
+| `voltdmf/signals.py` | `0x1F4` added to `is_signal_frame()`. |
+| `tools/lcd.py`, `tools/drive_log.py`, `tools/soc_log.py` | Take the LCD hand-off lock while they own the panel. |
+| `tests/test_lcdlock.py`, `tests/test_lcddash.py` (new), `tests/test_canio.py`, `tests/test_signals.py` | Lock round-trip / stale-pid; watch-screen render + yield/resume + real-panel-by-default; `0x1F4` → `drive_mode`; `is_signal_frame(0x1F4)`. Full suite: 116 passed. |
+
+### Next session — pick up here
+
+1. **SOC discharge drive** with `tools/soc_log.py` — the real run: pack
+   near-full → well down, `--buttons`, then `mine_capture.py --monotonic`
+   anchored to the `GAUGE-DOWN` timestamps.
+2. **Move the daemon onto the `0x1F4` closed loop** — the RX decode is done;
+   still need `daemon.py` to use it as `current_mode_source` /
+   `menu_cursor_source` instead of the press-counting tracker. Consider
+   `SafetyGate(allow_unknown_shift=False)` now that `0x1F5` decodes.
+3. Default detached `drive_log.py` / `soc_log.py` runs to `--no-bounce`, or
+   fix the `/etc/sudoers.d/50-voltdmf-canlink` match.
+4. OBD-II DTC scan.
+5. `rm /etc/sudoers.d/50-voltdmf-canlink` on the Pi once field work is done.
+
+---
+
 ## Session 4 — 2026-08-29 (first drive — mode-hold PASS on the road; PRNDL decoded)
 
 **Major milestone.** `tools/drive_log.py` ran unattended through a ~9-minute
@@ -80,10 +184,16 @@ Output pulled home: `vdmf-drivelog-20260829-185232.log` (event log),
 
 ### Next session — pick up here
 
-1. **SOC discharge drive** with `tools/soc_log.py` (the SOC-focused rewrite):
-   longer run, pack near-full → well down, `SOC-MARK` + voice memo, then
-   `mine_capture.py --monotonic` and anchor the top field to the narrated
-   EV-range / battery-bar readings.
+1. **SOC discharge drive** with `tools/soc_log.py` (the SOC-focused rewrite —
+   passive, no TX): longer run, pack near-full → well down. Spawns the raw
+   `candump -l` capture and, with `--buttons`, tracks the 10-increment dash
+   battery gauge from the two PiCAN2 switch pads SW1 / SW2 (BCM 24 / 23 to
+   GND, `gpiozero`): **A = an increment just dropped, B = it climbed back one**.
+   The tool keeps the running level so every log line has the absolute
+   reading (`gauge=7/10`) — no voice memo. `SOC-MARK` anchors every
+   `--mark-every` s are the backstop; hold both buttons to stop. Afterward
+   `mine_capture.py --monotonic` and anchor the top field to the
+   `GAUGE-DOWN` timestamps.
 2. **Move the daemon onto the closed loop** (still open from session 3):
    wire `0x1F4` into `daemon.py` RX as `current_mode_source` /
    `menu_cursor_source`; add `0x1F4` to `_DecodeListener`. Consider
