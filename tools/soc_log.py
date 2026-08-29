@@ -2,11 +2,12 @@
 """Unattended SOC-discovery drive log. PASSIVE -- never transmits.
 
 The Gen 1 dash shows no state-of-charge percentage, only EV range (miles)
-and a coarse battery bar, so SOC cannot be read off one frame directly.
-This tool does the only thing that works: capture the whole bus for a long
-drive that takes the pack from near-full to well down, drop timestamped
-anchors you can narrate against, then find the monotonically-falling field
-offline with ``tools/mine_capture.py --monotonic``.
+and a 10-increment battery gauge, so SOC cannot be read off one frame
+directly. This tool does the only thing that works: capture the whole bus
+for a long drive that takes the pack from full to well down, record when
+each gauge increment drops, then find the monotonically-falling field
+offline with ``tools/mine_capture.py --monotonic`` and anchor it to those
+drops.
 
 What it does, all read-only:
 
@@ -14,20 +15,24 @@ What it does, all read-only:
     (this is the actual data; everything else just helps you align it)
   * writes its own event log -> ``~/vdmf-soclog-<ts>.log`` on a shared
     ``t+<seconds>`` clock
-  * every ``--mark-every`` s logs a ``SOC-MARK`` line -- say your EV range +
-    battery-bar count out loud into a voice memo when you see it / hear the
-    LCD prompt
-  * optional: two panel buttons wired to the Pi's GPIO (``--buttons``) for
-    dropping a mark by hand the instant the range ticks down a mile or a
-    bar drops -- more precise than the periodic anchors. Hold BOTH for
-    ``--stop-hold`` s to end the session cleanly without SSH.
-  * optional: ``--lcd`` mirrors the ``t+<s>`` clock, marks-so-far and the
-    SAY prompt to a SparkFun serial 4x20 (see ``tools/lcd.py``)
+  * two panel buttons on the Pi's GPIO (``--buttons``) track the battery
+    gauge hands-free -- no voice memo needed:
+        A  = gauge just dropped one increment   (10 -> 9 -> 8 ...)
+        B  = gauge went back up one             (regen bump, or undo an
+             accidental A press)
+    the tool keeps the running level, so every log line carries the
+    absolute reading (``level=7/10``). Hold BOTH for ``--stop-hold`` s to
+    end the session cleanly without SSH.
+  * every ``--mark-every`` s also logs a plain ``SOC-MARK`` time anchor
+    (with the current gauge level) as a backstop between increment drops
+  * optional: ``--lcd`` mirrors the ``t+<s>`` clock and the live gauge
+    level to a SparkFun serial 4x20 (see ``tools/lcd.py``)
 
 Runs for ``--minutes`` then stops itself; Ctrl-C (parked) also stops it
 cleanly and closes the capture.
 
-  DO NOT touch the Pi while driving. Start it before you pull away.
+  DO NOT touch the Pi while driving -- use the panel buttons. Start it
+  before you pull away.
 
 Afterwards:
   tools/mine_capture.py ~/candump-<ts>.log --ids
@@ -35,10 +40,10 @@ Afterwards:
   tools/mine_capture.py ~/candump-<ts>.log --series <ID>:<OFF>:<W>[:le] --every 20
 
 Usage:
-  # 90 min capture, periodic marks every 2 min, two GPIO buttons, LCD
-  ./soc_log.py --yes --minutes 90 --mark-every 120 --buttons --lcd
+  # 90 min capture, gauge buttons, LCD, SOC-MARK backstop every 2 min
+  ./soc_log.py --yes --minutes 90 --buttons --lcd
 
-  # minimal: just capture + periodic marks
+  # capture + periodic anchors only, no buttons wired
   ./soc_log.py --yes --minutes 60
 
   # show the plan, touch no hardware
@@ -145,14 +150,15 @@ class SpeedProbe:
 
 # -- LCD mirror (optional; no-ops when lcd is None) ---------------------
 class Dash:
-    def __init__(self, lcd, t0: float, labels: tuple[str, str]) -> None:
+    def __init__(self, lcd, t0: float, level: int, total: int) -> None:
         self.lcd = lcd
         self.t0 = t0
-        self.labels = labels
+        self.level = level
+        self.total = total
         self.marks = 0
         self.last_mark_s = None
         self.phase = "starting"
-        self.say_until = 0.0
+        self.flash_until = 0.0
         self._paints = 0
         if lcd is not None:
             self.paint()
@@ -164,7 +170,13 @@ class Dash:
     def note_mark(self, n: int, t_s: float) -> None:
         self.marks = n
         self.last_mark_s = t_s
-        self.say_until = time.time() + 8.0
+        self.paint()
+
+    def note_gauge(self, level: int, total: int, t_s: float) -> None:
+        self.level = level
+        self.total = total
+        self.last_mark_s = t_s
+        self.flash_until = time.time() + 5.0
         self.paint()
 
     def paint(self) -> None:
@@ -174,9 +186,10 @@ class Dash:
         last = "--" if self.last_mark_s is None else f"+{self.last_mark_s:.0f}s"
         self.lcd.line(0, f"t+{el:>5}s  {_dt.datetime.now():%H:%M:%S}")
         self.lcd.line(1, self.phase[:20])
-        self.lcd.line(2, f"marks {self.marks:<3} last {last}")
-        self.lcd.line(3, ">> SAY: range + bars" if time.time() < self.say_until
-                      else f"A={self.labels[0][:6]}  B={self.labels[1][:7]}")
+        self.lcd.line(2, f"GAUGE {self.level:>2}/{self.total:<2}  "
+                      f"mk {self.marks:<2} {last}")
+        self.lcd.line(3, ">> gauge logged" if time.time() < self.flash_until
+                      else "A=down  B=up  (2x=stop)")
         self._paints += 1
         if self._paints % 20 == 0:
             self.lcd.refresh()  # recover a browned-out panel
@@ -184,41 +197,61 @@ class Dash:
 
 # -- the session ------------------------------------------------------
 class Session:
-    """Shared clock + mark recorder. Thread-safe: GPIO button callbacks and
-    the main loop both call :meth:`mark`."""
+    """Shared clock, gauge tracker and mark recorder. Thread-safe: GPIO
+    button callbacks and the main loop all land here."""
 
-    def __init__(self, log, speed: "SpeedProbe", dash: "Dash",
-                 channel: str) -> None:
+    def __init__(self, log, speed: "SpeedProbe", dash: "Dash", channel: str,
+                 level: int, total: int) -> None:
         self.log = log
         self.speed = speed
         self.dash = dash
         self.channel = channel
+        self.level = level
+        self.total = total
         self.t0 = time.time()
         self.n = 0
         self._lock = threading.Lock()
 
+    def _prefix(self, dt: float) -> str:
+        sp = self.speed.mph()
+        spd = "n/a" if sp is None else f"{sp:.0f}?"
+        return (f"+{dt:7.1f}s  spd~{spd:<5} gauge={self.level}/{self.total}"
+                f"  can0={can_state(self.channel)}")
+
     def mark(self, kind: str, note: str = "") -> None:
+        """A plain time anchor: START / END / periodic SOC-MARK."""
         with self._lock:
             self.n += 1
             dt = time.time() - self.t0
-            sp = self.speed.mph()
-            spd = "n/a" if sp is None else f"{sp:.0f}?"
-            st = can_state(self.channel)
             tail = f"  {note}" if note else ""
-            self.log(f"  {kind:<11} +{dt:7.1f}s  spd~{spd:<5} can0={st}"
-                     f"  (#{self.n}){tail}")
+            self.log(f"  {kind:<11} {self._prefix(dt)}  (#{self.n}){tail}")
             self.dash.note_mark(self.n, dt)
+
+    def gauge(self, delta: int) -> None:
+        """Button A/B: the dash battery gauge moved one increment."""
+        with self._lock:
+            new = max(0, min(self.total, self.level + delta))
+            dt = time.time() - self.t0
+            if new == self.level:
+                self.log(f"  GAUGE-EDGE   {self._prefix(dt)}  "
+                         f"(ignored: already {self.level}/{self.total})")
+                return
+            self.level = new
+            self.n += 1
+            kind = "GAUGE-DOWN" if delta < 0 else "GAUGE-UP"
+            self.log(f"  {kind:<11} {self._prefix(dt)}  (#{self.n})")
+            self.dash.note_gauge(new, self.total, dt)
 
 
 # -- GPIO buttons (optional; lazy import so this runs on any box) -------
 class Buttons:
     """Two momentary buttons to GND on the Pi header, internal pull-ups.
-    ``gpiozero`` only; if it is missing the tool runs without them."""
+    A = gauge dropped one increment, B = gauge went up one. ``gpiozero``
+    only; if it is missing the tool runs without them."""
 
     def __init__(self, session: "Session", gpio_a: int, gpio_b: int,
-                 labels: tuple[str, str], stop_hold: float, log) -> None:
+                 stop_hold: float, log) -> None:
         self._session = session
-        self._labels = labels
         self._stop_hold = stop_hold
         self._both_since: float | None = None
         self.stop_requested = False
@@ -234,14 +267,11 @@ class Buttons:
         except Exception as exc:  # noqa: BLE001
             log(f"  buttons off (GPIO {gpio_a}/{gpio_b} unavailable: {exc})")
             return
-        a.when_pressed = lambda: self._press(0)
-        b.when_pressed = lambda: self._press(1)
+        a.when_pressed = lambda: self._session.gauge(-1)
+        b.when_pressed = lambda: self._session.gauge(+1)
         self._btns = (a, b)
-        log(f"  buttons: GPIO{gpio_a}=A ({labels[0]})  GPIO{gpio_b}=B "
-            f"({labels[1]})  hold both {stop_hold:.0f}s = stop")
-
-    def _press(self, idx: int) -> None:
-        self._session.mark(f"BTN-{self._labels[idx]}")
+        log(f"  buttons: GPIO{gpio_a}=A gauge-down  GPIO{gpio_b}=B gauge-up  "
+            f"hold both {stop_hold:.0f}s = stop")
 
     def poll_stop(self) -> bool:
         """Call from the main loop. True once both buttons have been held
@@ -286,25 +316,28 @@ def main() -> None:
     ap.add_argument("--minutes", type=float, default=60.0,
                     help="session length before it stops itself (default 60)")
     ap.add_argument("--mark-every", type=float, default=120.0, metavar="SECS",
-                    help="seconds between periodic SOC-MARK anchors "
-                         "(0 = only button marks; default 120)")
+                    help="seconds between periodic SOC-MARK time anchors, a "
+                         "backstop between gauge drops (0 = off; default 120)")
     ap.add_argument("--capture-dir", default="~",
                     help="where candump -l writes its log (default ~)")
     ap.add_argument("--buttons", action="store_true",
-                    help="enable two GPIO panel buttons for manual marks")
+                    help="wire two GPIO panel buttons: A = gauge dropped one "
+                         "increment, B = gauge went up one")
     ap.add_argument("--button-a-gpio", type=int, default=5, metavar="BCM",
-                    help="BCM pin for button A (default 5 = header pin 29)")
+                    help="BCM pin for button A / gauge-down (default 5 = "
+                         "header pin 29)")
     ap.add_argument("--button-b-gpio", type=int, default=6, metavar="BCM",
-                    help="BCM pin for button B (default 6 = header pin 31)")
-    ap.add_argument("--button-a-label", default="RANGE",
-                    help="tag button A marks with this (default RANGE)")
-    ap.add_argument("--button-b-label", default="BAR",
-                    help="tag button B marks with this (default BAR)")
+                    help="BCM pin for button B / gauge-up (default 6 = "
+                         "header pin 31)")
+    ap.add_argument("--bars", type=int, default=10, metavar="N",
+                    help="increments in the dash battery gauge (default 10)")
+    ap.add_argument("--bars-start", type=int, default=None, metavar="N",
+                    help="gauge level at kickoff if not full (default --bars)")
     ap.add_argument("--stop-hold", type=float, default=3.0, metavar="SECS",
                     help="hold BOTH buttons this long to end the session "
                          "(0 = disable; default 3)")
     ap.add_argument("--lcd", action="store_true",
-                    help="mirror the clock / marks / SAY prompt to a "
+                    help="mirror the clock and live gauge level to a "
                          "SparkFun serial 4x20 LCD (see tools/lcd.py)")
     ap.add_argument("--lcd-port", default="/dev/serial0")
     ap.add_argument("--lcd-baud", type=int, default=9600)
@@ -317,16 +350,18 @@ def main() -> None:
                     help="print the plan and exit; no hardware touched")
     args = ap.parse_args()
 
-    labels = (args.button_a_label, args.button_b_label)
+    total = max(1, args.bars)
+    start_level = total if args.bars_start is None else args.bars_start
+    start_level = max(0, min(total, start_level))
     mark_desc = (f"every {args.mark_every:.0f}s"
-                 if args.mark_every > 0 else "button marks only")
-    btn_desc = (f"GPIO{args.button_a_gpio}/{args.button_b_gpio} "
-                f"({labels[0]}/{labels[1]})" if args.buttons else "OFF")
+                 if args.mark_every > 0 else "off (buttons only)")
+    btn_desc = (f"GPIO{args.button_a_gpio} down / GPIO{args.button_b_gpio} up"
+                if args.buttons else "OFF")
 
     print("SOC-discovery drive log (PASSIVE -- no TX)")
     print(f"plan: {args.minutes:.0f} min capture on {args.channel}")
-    print(f"  SOC-MARK: {mark_desc}   buttons: {btn_desc}   "
-          f"LCD: {'on' if args.lcd else 'off'}")
+    print(f"  gauge: {start_level}/{total} at start   buttons: {btn_desc}")
+    print(f"  SOC-MARK backstop: {mark_desc}   LCD: {'on' if args.lcd else 'off'}")
     print(f"  raw capture -> {args.capture_dir}/candump-<ts>.log "
           f"(mine with tools/mine_capture.py)")
 
@@ -367,17 +402,18 @@ def main() -> None:
             log(f"LCD open failed ({exc}); continuing without the mirror")
 
     t0 = time.time()
-    dash = Dash(lcd, t0, labels)
+    dash = Dash(lcd, t0, start_level, total)
     speed = SpeedProbe(args.channel, log)
-    session = Session(log, speed, dash, args.channel)
+    session = Session(log, speed, dash, args.channel, start_level, total)
     session.t0 = t0  # share the exact origin with the Dash
 
     buttons = Buttons(session, args.button_a_gpio, args.button_b_gpio,
-                      labels, args.stop_hold, log) if args.buttons else None
+                      args.stop_hold, log) if args.buttons else None
 
     log("")
-    log("logging -- drive the pack down. Say EV range + battery bars on every "
-        "SOC-MARK / LCD prompt. Ctrl-C (parked) or hold both buttons to stop.")
+    log(f"logging -- drive the pack down from gauge {start_level}/{total}. "
+        "Tap A each time an increment drops (B if it climbs back). "
+        "Ctrl-C (parked) or hold both buttons to stop.")
     session.mark("START")
 
     end = t0 + args.minutes * 60
@@ -415,6 +451,8 @@ def main() -> None:
     log("")
     log(f"================ SUMMARY  (stopped: {stopped_by}) ================")
     log(f"  {session.n} marks over {(time.time() - t0) / 60:.1f} min")
+    log(f"  gauge {start_level}/{total} -> {session.level}/{total}  "
+        f"({start_level - session.level} increment(s) dropped)")
     stop_capture(cap_proc, cap_path, log)
     speed.close()
     if buttons is not None:

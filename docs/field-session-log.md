@@ -82,12 +82,14 @@ Output pulled home: `vdmf-drivelog-20260829-185232.log` (event log),
 
 1. **SOC discharge drive** with `tools/soc_log.py` (the SOC-focused rewrite —
    passive, no TX): longer run, pack near-full → well down. Spawns the raw
-   `candump -l` capture, drops `SOC-MARK` anchors every `--mark-every` s, and
-   with `--buttons` takes two panel buttons on the Pi header (GPIO 5 / 6 to
-   GND, `gpiozero`) for hand marks the instant the EV range or a bar ticks
-   (`BTN-RANGE` / `BTN-BAR`); hold both to stop. Narrate EV-range /
-   battery-bar into a voice memo on every mark, then `mine_capture.py
-   --monotonic` and anchor the top field to the readings.
+   `candump -l` capture and, with `--buttons`, tracks the 10-increment dash
+   battery gauge from two panel buttons on the Pi header (GPIO 5 / 6 to GND,
+   `gpiozero`): **A = an increment just dropped, B = it climbed back one**.
+   The tool keeps the running level so every log line has the absolute
+   reading (`gauge=7/10`) — no voice memo. `SOC-MARK` anchors every
+   `--mark-every` s are the backstop; hold both buttons to stop. Afterward
+   `mine_capture.py --monotonic` and anchor the top field to the
+   `GAUGE-DOWN` timestamps.
 2. **Move the daemon onto the closed loop** (still open from session 3):
    wire `0x1F4` into `daemon.py` RX as `current_mode_source` /
    `menu_cursor_source`; add `0x1F4` to `_DecodeListener`. Consider
