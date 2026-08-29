@@ -20,7 +20,7 @@ a checked-in file.
 
 | Field | Value |
 |---|---|
-| Vehicle | 2014–2015 Chevy Volt (Gen 1), Premier/Premium trim (exact year 2014 or 2015, owner unsure — both are late Gen 1, identical powertrain) |
+| Vehicle | 2014 Chevy Volt (Gen 1), Premier/Premium trim |
 | Bus | OBD-II pins 6/14, HS-CAN, **500** kbit/s (Phase A: ERROR-ACTIVE, zero error counters, no fallback) |
 | Date tested | 2026-08-29 |
 | Tool used | `candump -l` + `tools/analyze` offline scan; `tools/mode_diff.py` / `cycle_modes.py` earlier (inconclusive on a running car) |
