@@ -1,0 +1,28 @@
+[Unit]
+Description=Volt Drive Mode Fixer
+# See DESIGN.md and host/README.md in the source tree for setup and rationale.
+Documentation=file:///usr/share/doc/voltdmf/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+# fail-passive: if it keeps dying, stop rather than thrash the bus
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Refuse to start until can0 exists (its own bring-up is systemd-networkd's job).
+ExecStartPre=/sbin/ip link show can0
+ExecStart=/usr/bin/python3 -m voltdmf --config /etc/voltdmf/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# SocketCAN raw sockets need CAP_NET_RAW. Simplest on a single-purpose
+# appliance is to run as root; to drop privileges instead, create a user and
+# swap the two blocks:
+User=root
+# User=voltdmf
+# AmbientCapabilities=CAP_NET_RAW
+# NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

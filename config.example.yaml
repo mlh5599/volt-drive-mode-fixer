@@ -1,0 +1,19 @@
+# Volt Drive Mode Fixer -- example config.
+# Schema and rationale: see DESIGN.md "Trigger strategies".
+#
+# Strategies 1 and 2 are meant to run together: Mountain conserves the pack
+# from the start of every drive, and the SOC-threshold trigger is the backstop
+# that engages Hold if the pack still gets low.
+
+on_start:
+  enabled: true
+  target_mode: mountain
+
+soc_threshold:
+  enabled: true
+  target_mode: hold
+  threshold_percent: 25       # calibrate against dash % -- see DESIGN.md "Open items"
+  reset_percent: 40           # SOC must rise back above this to re-arm
+
+trip_mode:
+  enabled: false              # DR5, roadmap -- not implemented; must stay false

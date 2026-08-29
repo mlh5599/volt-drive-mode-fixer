@@ -1,0 +1,9 @@
+# Bring can0 up at boot at the GM Global A HS powertrain bus rate.
+# Install to /etc/systemd/network/ and `systemctl enable --now systemd-networkd`.
+[Match]
+Name=can0
+
+[CAN]
+BitRate=500000
+# RestartSec lets the interface recover if it drops to BUS-OFF.
+RestartSec=100ms

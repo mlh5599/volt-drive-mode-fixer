@@ -1,0 +1,66 @@
+import pytest
+
+from voltdmf import signals
+from voltdmf.signals import DriveMode, ShiftPosition
+
+
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        (bytes([0x13, 0x88]), 50.0),          # 5000 / 100
+        (bytes([0x00, 0x00]), 0.0),
+        (bytes([0xFF, 0xFF, 0x00]), 655.35),  # extra bytes ignored
+    ],
+)
+def test_decode_speed_mph(data, expected):
+    assert signals.decode_speed_mph(data) == pytest.approx(expected)
+
+
+def test_decode_speed_mph_short_frame():
+    assert signals.decode_speed_mph(b"\x01") is None
+
+
+@pytest.mark.parametrize(
+    "data, expected_raw",
+    [
+        (bytes([0x00, 0x27, 0x10]), 0x2710),        # bytes 1-2 big-endian
+        (bytes([0xAA, 0x00, 0x00, 0xFF]), 0x0000),   # byte 0 is not part of it
+        (bytes([0x00, 0x12, 0x34, 0x56]), 0x1234),
+    ],
+)
+def test_decode_soc_raw(data, expected_raw):
+    assert signals.decode_soc_raw(data) == expected_raw
+
+
+def test_decode_soc_raw_short_frame():
+    assert signals.decode_soc_raw(b"\x00\x01") is None
+
+
+def test_soc_percent_is_clamped():
+    assert signals.soc_percent_from_raw(0) == 0.0
+    assert signals.soc_percent_from_raw(10**9) == 100.0
+    mid = signals.soc_percent_from_raw(20)
+    assert 0.0 <= mid <= 100.0
+
+
+def test_decode_shift_is_unknown_stub():
+    assert signals.decode_shift(bytes(8)) is ShiftPosition.UNKNOWN
+
+
+def test_mode_cycle_order():
+    assert signals.MODE_CYCLE_ORDER == (
+        DriveMode.NORMAL, DriveMode.SPORT, DriveMode.MOUNTAIN, DriveMode.HOLD,
+    )
+
+
+def test_is_signal_frame():
+    assert signals.is_signal_frame(0x206)
+    assert signals.is_signal_frame(0x3E9)
+    assert signals.is_signal_frame(0x135)
+    assert signals.is_signal_frame(0x1F5)
+    assert not signals.is_signal_frame(0x1E1)
+
+
+def test_nothing_is_confirmed_yet():
+    # Guard-rail: this test flips once Phase C confirms signals on the car.
+    assert all(not s.confirmed for s in signals.SIGNAL_IDS.values())

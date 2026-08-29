@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voltdmf"
+version = "0.1.0"
+description = "CAN-bus drive-mode automation for a Gen 1 Chevy Volt (see DESIGN.md)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-can>=4.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+voltdmf = "voltdmf.__main__:main"
+
+[tool.setuptools]
+packages = ["voltdmf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

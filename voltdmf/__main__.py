@@ -1,0 +1,53 @@
+"""``python -m voltdmf`` entrypoint."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+
+from .config import ConfigError, load_config
+from .daemon import Daemon
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="voltdmf", description=__doc__)
+    p.add_argument("--config", required=True, help="path to config YAML")
+    p.add_argument("--channel", default="can0", help="SocketCAN channel (default: can0)")
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="read and evaluate against the live bus but transmit nothing",
+    )
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    try:
+        config = load_config(args.config)
+    except (OSError, ConfigError) as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+
+    daemon = Daemon(config, channel=args.channel, dry_run=args.dry_run)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: daemon.request_stop())
+
+    try:
+        daemon.run()
+    except OSError as exc:
+        print(f"CAN interface '{args.channel}' unavailable: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

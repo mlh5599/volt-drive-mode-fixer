@@ -1,0 +1,4 @@
+# --- Volt Drive Mode Fixer: PiCAN2 (MCP2515) on a Pi 3B ---
+# Append to /boot/firmware/config.txt on Raspberry Pi OS Lite (Bookworm), reboot.
+dtparam=spi=on
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
