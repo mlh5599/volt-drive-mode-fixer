@@ -1,20 +1,23 @@
 # Confirmed CAN signals (Gen 1 Chevy Volt, this vehicle)
 
-**Status (2026-08-29, session 3): the drive-mode menu now has a LIVE cursor
-readback — `0x1F4` byte 4 (`00` N / `80` S / `40` M / `20` H) steps ~40 ms
-after every button edge, distinct from byte 1 (the committed mode, which
-only moves on the ~3 s commit). `voltdmf/modecycle.py` closes the loop on
-it: tap, read the cursor, stop when it is on the target. The old
-"steps too far" overshoot was `WALK_GAP_S` at 0.75 s — on-car sweeps showed
-taps closer than ~1.2 s coalesce into extra cursor steps; frame count
-(1..16) did not matter. `WALK_GAP_S` is now 1.4 s. A second bug: the cursor
-read returned the OLDEST queued `0x1F4`, not the newest — fixed
-(`_latest_status` drains the RX queue). With both fixes the closed loop
-**selected and committed all four modes correctly on the parked car**
-(sport/mountain/hold/normal, `can0` ERROR-ACTIVE throughout). Still parked:
-MOUNTAIN and HOLD (battery modes) reverted toward NORMAL after the commit —
-a drive is needed to prove they *hold*, not to select them. SPORT held.
-SOC, shift, ignition still need a drive.**
+**Status (2026-08-29, session 4 — first drive): the drive-mode fix is
+validated on-road.** `tools/drive_log.py` ran unattended through a 9-minute
+drive: the closed-loop injection (`0x1E1` tracking echo) walked to all four
+modes, each **committed in 2.8 s and held the full 90 s while moving**
+(21–51 mph), `can0` ERROR-ACTIVE throughout. Confirmed twice over — the
+daemon's own `0x1F4` byte-1 readback and an independent mine of the raw
+`candump` capture both show byte 1 latched at N/S/M/H for each 90 s block.
+This closes the open question from session 3: MOUNTAIN and HOLD, which drift
+toward NORMAL within ~1 min *parked*, do **not** revert while moving. The
+parked reversion is a stationary-only behaviour.
+
+`drive_mode_button` (`0x1E1`), `drive_mode_status` (`0x1F4` byte 1) and
+`shift`/PRNDL (`0x1F5` byte 3, new this session — `1`P `2`R `3`N `4`D `5`L)
+are now `confirmed=True` in `voltdmf/signals.py`. **SOC is still open** — the
+monotonic-frame scan over this capture found only mux-blend / 2-state-flag
+artefacts; the dash shows no %, and 9 minutes is too short to move the
+coarse battery bar. Needs a longer discharge drive. Ignition behaviour is
+still unobservable (key-off kills Pi power).
 
 This file is the Phase C deliverable (DESIGN.md). Fill it in from the
 `tools/` output, then update `voltdmf/signals.py` / `voltdmf/canio.py` and
@@ -32,18 +35,32 @@ a checked-in file.
 | Tool used | `candump -l` + `tools/analyze` offline scan; `tools/mode_diff.py` / `cycle_modes.py` earlier (inconclusive on a running car) |
 | Method | 20 s stationary dwell per mode (Park, brake set) + 5 timestamped taps, one candump log, per-byte "steady within a mode / differs across modes" scan |
 
-## SOC -- `0x206`  (NOT CONFIRMED)
+## SOC -- `0x206`  (NOT CONFIRMED — still open after session 4)
 
 - `0x206` **never appears** on this bus. The Gen-2 SOC ID is wrong for Gen 1.
-- Needs a real discharge (a drive) with `tools/watch_soc.py` to find the
-  actual ID and scaling.
+- Session 4 drive: `tools/mine_capture.py --monotonic` over the full 66 MB
+  capture surfaced no credible battery-energy field. Top hits were all
+  artefacts:
+  - `0x97` — a **multiplexed** frame; the scanner blended muxes into a
+    fake "flat then ramp to exactly 0 at capture end" shape.
+  - `0x4C5` byte 2 — a **2-state flag** (`0xDD`/`0x49`), not a gauge; bucket
+    averaging made it look monotonic.
+  - `0xB9` — a rolling mux counter.
+- Why nothing stuck: this dash has **no SOC %**, only EV-range miles + a
+  coarse battery bar, and a 9-minute drive barely moves one bar. The
+  `SOC-MARK` timeline anchors fired at +60.7, +126, +181, +240, +302, +362,
+  +421, +480, +542 s; the owner's voice memo of range/bars at those marks
+  was not yet transcribed.
+- Next: a **longer discharge drive** (take the pack from near-full to well
+  down) with `tools/soc_log.py`, then re-run `mine_capture.py --monotonic`
+  and anchor the top field against the narrated range/bar readings.
 - Byte layout: `______` (offset, width, endianness)
 - Raw -> value: `______` (scale / offset)
-- Calibration points (raw value : dash % : dash kWh):
+- Calibration points (raw value : dash EV range mi : battery bars):
   - `______`
 - => `voltdmf/signals.py`: `SOC_KWH_PER_COUNT = ___`, `GEN1_PACK_USABLE_KWH = ___`
 
-## Drive-mode button press (TX) -- `0x1E1` byte 4 bit 7  (ADDRESS confirmed; injection efficacy not yet a clean PASS)
+## Drive-mode button press (TX) -- `0x1E1` byte 4 bit 7  (CONFIRMED 2026-08-29, session 4 — injection PASS on the road)
 
 - **`0x1E1` "ASCMSteeringButton"** -- 7-byte frame, streamed by a module at
   ~40 Hz. This is the button INPUT; `0x1F4` (above) is only the status echo.
@@ -125,32 +142,37 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
 - New decoders: `signals.decode_menu_cursor()`, `signals.menu_is_open()`;
   new reader `CanInterface.read_menu_cursor()`.
 
-### What the parked car still can't tell us
+### On-road validation (2026-08-29, session 4 — `tools/drive_log.py`)
 
-- **Selection: PASSES.** The closed loop selected and committed all four
-  modes on the parked car (see field log). `can0` stayed ERROR-ACTIVE.
-- **Mode hold: unproven for MOUNTAIN / HOLD.** `0x1F4` byte 1 lags the
-  commit ~3 s, and in Park the cluster reverts MOUNTAIN and HOLD toward
-  NORMAL within a minute or so (battery-management modes with engagement
-  conditions). SPORT held. Whether MOUNTAIN / HOLD *keep* needs a drive.
-- **Cluster rate-limit / TEC** (from the earlier sweep, not the validation
-  runs): ~90 taps over ~12 min drove `can0` ERROR-ACTIVE → PASSIVE →
-  WARNING and commits stopped landing. Keep runs short, bounce `can0`
-  between them, wait for `0x1F4` to rest at `00 00 00 00 00 00`. The
-  five short validation runs showed none of this.
+- **Mode hold: PASSES for all four modes.** `sequence = sport, mountain,
+  hold, normal`, `--hold 90`. Every mode walked through the production
+  closed loop, committed at **+2.8 s**, and `0x1F4` byte 1 stayed on it for
+  the full 90 s while driving (SPORT ~21–31 mph, MOUNTAIN ~31, HOLD ~21,
+  NORMAL ~51). Independent cross-check: mining the raw capture, `0x1F4`
+  byte 1 = `00`/`80`/`20`/`08` for each block, in order.
+- **This settles the session-3 open item.** MOUNTAIN and HOLD hold while
+  moving; their parked drift toward NORMAL is stationary-only.
+- **Walk tap counts on the road:** SPORT 1, MOUNTAIN 1, HOLD 4, NORMAL 1.
+  The HOLD walk took the full cold-menu count (`index+1 = 4`) while the
+  other three behaved warm (1 tap) at near-identical idle gaps — menu-open
+  state is *not* fully predictable on the road, but the closed loop landed
+  every time. Keep the closed loop; `presses_to_reach` stays a dry-run
+  planner only.
+- **No bus degradation.** `can0` ERROR-ACTIVE start to finish; no BUS-OFF /
+  PASSIVE / WARNING over the full 9-minute session (4 walks + holds). The
+  session-2 rate-limit was ~90 taps over ~12 min — this run sent ~7.
+- **`can0` bounce under `setsid` failed** (`sudo: a terminal is required`;
+  the NOPASSWD sudoers rule didn't match). Harmless here — `can0` was
+  already up from boot — but detached runs should default to `--no-bounce`.
 
 ### Next
 
-1. **On a drive**: `tools/set_mode.py --yes-stationary --target <mode>` for
-   each mode, confirm on the dash, re-check MOUNTAIN / HOLD ~30 s later,
-   OBD-II DTC scan.
-2. If every mode holds on a drive: flip `drive_mode_button.confirmed = True`
-   (`WALK_GAP_S` / cursor codes are already baked into `signals.py` /
-   `modecycle.py`).
-3. Wire `0x1F4` into the daemon RX path so `daemon.py` uses `read_drive_mode`
+1. ~~Flip `drive_mode_button.confirmed = True`~~ — **done** (session 4).
+2. Wire `0x1F4` into the daemon RX path so `daemon.py` uses `read_drive_mode`
    as `current_mode_source` and `read_menu_cursor` as `menu_cursor_source`
    (the closed loop) — the open-loop count is only right from a cold NORMAL.
-   Currently only `set_mode.py` runs the closed loop.
+   Currently only `set_mode.py` / `drive_log.py` run the closed loop.
+3. OBD-II DTC scan (still owed — no scan tool on the drive).
 
 ### `voltdmf/modecycle.py` state (session 3)
 
@@ -185,15 +207,37 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
 - TODO: wire it as `current_mode_source` in `voltdmf/daemon.py` (replacing the
   press-counting tracker) and add `0x1F4` to `is_signal_frame` / the RX listener.
 
-## Shift / PRNDL -- `0x135` / `0x1F5`  (NOT CONFIRMED)
+## Shift / PRNDL -- `0x1F5` byte 3  (CONFIRMED 2026-08-29, session 4)
 
-- In Park, `0x135` bytes 0-6 are constant (`00 00 1c 76 8a 0c 1a`); byte 7 is
-  a free-running counter. `0x1F5` is static. Nothing to decode without moving
-  the shifter.
-- Needs a drive: `candump 'can0,135:7FF' 'can0,1F5:7FF'` while moving P-R-N-D-L.
-- Address / byte / values: `______`
-- => implement `voltdmf/signals.decode_shift()`; then set
-  `SafetyGate(allow_unknown_shift=False)` in `voltdmf/daemon.py`
+- Frame **`0x1F5`**, ~40 Hz. **Byte 3 = PRNDL detent**, a small enum:
+
+  | byte 3 | position |
+  |---|---|
+  | `0x01` | PARK |
+  | `0x02` | REVERSE |
+  | `0x03` | NEUTRAL |
+  | `0x04` | DRIVE |
+  | `0x05` | LOW |
+
+- Evidence: in the parked `--shift-routine` phase byte 3 stepped
+  `1 → 2 → 3 → 4 → 5` in order, ~4–5 s apart (a deliberate slow P-R-N-D-L
+  walk), then returned to `1` (Park). For the **entire 9-minute moving
+  portion** of the drive byte 3 held `4` (DRIVE), independent of speed. It
+  also caught a brief `2` (REVERSE) during pull-away — backed out before
+  going forward.
+- Rest-of-frame: bytes 0–1 co-vary with the detent but look like a
+  counter/checksum (`0f 0d` / `0e 0a` / `0d 0d` / `0a 0a`), not decoded;
+  bytes 4–7 idle (`00 00 08 00`, byte 6 wobbles `08`/`09`/`0a`).
+- `0x135` byte 0 *also* tracks the shifter (`0/3/1/2` over the walk) but the
+  encoding is non-sequential and noisier — `0x1F5` byte 3 is the clean one.
+  `0x135` is kept in `is_signal_frame` (RX liveness) but not decoded.
+- Implemented: `voltdmf/signals.decode_shift()` (byte-3 lookup),
+  `_SHIFT_BY_BYTE3`; `SIGNAL_IDS["shift"]` → `0x1F5`, `confirmed=True`;
+  `_ALT_SHIFT_ADDR` → `0x135`. `_DecodeListener` decodes only `0x1F5`.
+- Follow-up: `voltdmf/daemon.py` can now construct
+  `SafetyGate(allow_unknown_shift=False)` once `0x1F5` is confirmed live on
+  the daemon's RX path (it already is in `is_signal_frame`). Left as a
+  deliberate daemon change, not done here.
 
 ## Ignition behaviour (from `ignition_check.py`)  (NOT CONFIRMED)
 

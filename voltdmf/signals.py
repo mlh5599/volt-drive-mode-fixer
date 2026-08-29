@@ -70,21 +70,30 @@ SIGNAL_IDS: dict[str, SignalId] = {
     ),
     "shift": SignalId(
         "Shift / PRNDL position",
-        0x135,
-        confirmed=False,
-        note="also seen as 0x1F5; byte layout undocumented, discover in Phase C",
+        0x1F5,
+        confirmed=True,
+        note="Confirmed 2026-08-29 on-vehicle (session 4, drive). byte 3 = "
+        "PRNDL detent: 1 PARK, 2 REVERSE, 3 NEUTRAL, 4 DRIVE, 5 LOW. Stepped "
+        "1->2->3->4->5 in order during a parked P-R-N-D-L walk and held 4 "
+        "(DRIVE) rock-steady for the entire 9-minute drive. bytes 0-1 co-vary "
+        "but look like a counter/checksum. 0x135 byte 0 also tracks the "
+        "shifter but with a messier non-sequential encoding -- 0x1F5 byte 3 "
+        "is the clean signal.",
     ),
     "drive_mode_button": SignalId(
         "Drive mode cycle button press (TX only)",
         0x1E1,
-        confirmed=False,
-        note="ADDRESS confirmed 2026-08-29 on-vehicle (session 2): 0x1E1 "
+        confirmed=True,
+        note="Confirmed 2026-08-29 on-vehicle (session 4, drive). 0x1E1 "
         "\"ASCMSteeringButton\", byte 4 bit 7 = drive-mode button pressed "
         "(byte 4 goes 00/01/02/03 -> 80/81/82/83 during a physical press; low "
         "bits are a rolling counter). Same ID/bit the Gen 2 prior art injects. "
-        "The receiver counts button edges, not hold time. INJECTION efficacy "
-        "is unproven -- Phase C.5 (a module also streams 0x1E1 at ~40 Hz, so "
-        "the injected burst must go out back-to-back at line rate).",
+        "The receiver counts button edges, not hold time. The tracking-echo "
+        "injection (voltdmf/canio.send_mode_button_press) drove a closed-loop "
+        "walk to all four modes on the road -- each committed in 2.8 s and "
+        "held the full 90 s while moving (21-51 mph), can0 ERROR-ACTIVE "
+        "throughout. Verified independently in the raw capture: 0x1F4 byte 1 "
+        "held N/S/M/H for each 90 s block.",
     ),
     "drive_mode_status": SignalId(
         "Current drive mode (status)",
@@ -96,7 +105,10 @@ SIGNAL_IDS: dict[str, SignalId] = {
     ),
 }
 
-_ALT_SHIFT_ADDR = 0x1F5
+#: 0x135 also moves with the shifter (byte 0: 0/1/2/3, non-sequential) but
+#: 0x1F5 byte 3 is the clean PRNDL enum. Kept known so the RX path still
+#: counts it as a signal frame; not decoded.
+_ALT_SHIFT_ADDR = 0x135
 
 
 # --- SOC (0x206) -------------------------------------------------------------
@@ -212,14 +224,32 @@ def menu_is_open(data: bytes) -> bool:
     return len(data) >= 6 and bool(data[5] & MENU_OPEN_BIT)
 
 
-# --- Shift position (0x135 / 0x1F5) --------------------------------------
-def decode_shift(data: bytes) -> ShiftPosition:  # noqa: ARG001
-    """Not decodable yet -- byte layout is undocumented for this car.
+# --- Shift position (0x1F5 byte 3) -------------------------------------
+#
+# Confirmed 2026-08-29 on-vehicle (session 4). Frame 0x1F5, ~40 Hz. Byte 3 is
+# the PRNDL detent as a small enum; it stepped 1..5 in order through a parked
+# P-R-N-D-L walk and then sat on 4 (DRIVE) for the whole 9-minute drive
+# regardless of speed. Bytes 0-1 co-vary (counter/checksum), bytes 4-7 idle.
+_SHIFT_BY_BYTE3: dict[int, ShiftPosition] = {
+    0x01: ShiftPosition.PARK,
+    0x02: ShiftPosition.REVERSE,
+    0x03: ShiftPosition.NEUTRAL,
+    0x04: ShiftPosition.DRIVE,
+    0x05: ShiftPosition.LOW,
+}
 
-    Kept as a typed stub so callers can already depend on the interface;
-    fill in once cycle_modes.py / mode_diff.py reveal the layout in Phase C.
+
+def decode_shift(data: bytes) -> ShiftPosition:
+    """PRNDL detent from byte 3 of frame 0x1F5.
+
+    Returns :data:`ShiftPosition.UNKNOWN` for a short frame or a byte-3 value
+    outside 1..5 (never observed on this car, but stay defensive -- the
+    daemon's SafetyGate treats UNKNOWN as non-blocking only while
+    ``allow_unknown_shift`` is set).
     """
-    return ShiftPosition.UNKNOWN
+    if len(data) < 4:
+        return ShiftPosition.UNKNOWN
+    return _SHIFT_BY_BYTE3.get(data[3], ShiftPosition.UNKNOWN)
 
 
 def is_signal_frame(addr: int) -> bool:

@@ -248,6 +248,7 @@ class _DecodeListener(can.Listener):
         self._state = state
         self._soc_addr = SIGNAL_IDS["soc"].addr
         self._speed_addr = SIGNAL_IDS["speed"].addr
+        self._shift_addr = SIGNAL_IDS["shift"].addr  # 0x1F5 (0x135 not decoded)
 
     def on_message_received(self, msg: can.Message) -> None:
         addr = msg.arbitration_id
@@ -263,6 +264,8 @@ class _DecodeListener(can.Listener):
             mph = signals.decode_speed_mph(data)
             if mph is not None:
                 self._state.speed_mph = mph
-        else:  # a shift-position frame (0x135 / 0x1F5)
+        elif addr == self._shift_addr:  # 0x1F5 byte 3 = PRNDL
             self._state.shift = signals.decode_shift(data)
+        # 0x135 is a known signal frame (keeps mark_signal_seen fresh) but its
+        # shifter encoding is messier than 0x1F5 -- not decoded.
         self._state.mark_signal_seen()

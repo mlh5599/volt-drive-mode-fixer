@@ -6,6 +6,95 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 4 — 2026-08-29 (first drive — mode-hold PASS on the road; PRNDL decoded)
+
+**Major milestone.** `tools/drive_log.py` ran unattended through a ~9-minute
+drive (owner driving, no live SSH). Battery not full (rehearsal run to shake
+out the routine), but enough for the mode work.
+
+Setup on the Pi: `~/vdmf` clone + scp'd `voltdmf/{canio,lcd}.py`,
+`tools/{drive_log,lcd,mine_capture}.py`. Launched detached with
+`setsid nohup … &`. A SparkFun serial 4x20 LCD on the Pi UART
+(`/dev/serial0`, `--lcd-backlight 35`) mirrored the shared `t+<s>` clock /
+phase / mode / `can0` state and flashed a "SAY" prompt on each SOC-MARK, so
+a voice memo of the dash lines up with the log and the capture.
+
+Output pulled home: `vdmf-drivelog-20260829-185232.log` (event log),
+`candump-2026-08-29_185234.log` (66.8 MB raw `candump -l`).
+
+### Results
+
+1. **Mode hold — PASS, all four modes, while moving.** `sequence = sport,
+   mountain, hold, normal`, `--hold 90`. Each walked through the production
+   closed loop, `0x1F4` byte 1 committed at **+2.8 s**, and held the full
+   90 s while driving:
+
+   | slot | mode | walk | committed | held 90 s | speed during hold |
+   |---|---|---|---|---|---|
+   | 1/4 | SPORT | 1 tap | +2.8 s | ✅ | ~21–31 mph |
+   | 2/4 | MOUNTAIN | 1 tap | +2.8 s | ✅ | ~31 mph |
+   | 3/4 | HOLD | 4 taps | +2.8 s | ✅ | ~21 mph |
+   | 4/4 | NORMAL | 1 tap | +2.8 s | ✅ | ~51 mph |
+
+   Confirmed independently by mining the raw capture: `0x1F4` byte 1 =
+   `00`/`80`/`20`/`08` for each block, in order, for the whole 90 s.
+   **This answers session 3's open question** — MOUNTAIN and HOLD (which
+   drift toward NORMAL within ~1 min parked) hold fine while moving.
+
+2. **The HOLD walk needed 4 taps** (cold-menu `index+1`) while SPORT /
+   MOUNTAIN / NORMAL took 1 (warm behaviour) at near-identical idle gaps.
+   Menu-open state isn't fully predictable on the road; the closed loop
+   absorbed it every time. `presses_to_reach` stays a dry-run planner only.
+
+3. **PRNDL — decoded.** `0x1F5` byte 3: `1`P `2`R `3`N `4`D `5`L. Parked
+   shift routine stepped byte 3 `1→2→3→4→5` in order; the entire moving
+   portion held `4` (DRIVE) regardless of speed; a brief `2` (REVERSE)
+   during pull-away. `0x135` byte 0 also moves with the shifter but with a
+   messier non-sequential encoding — `0x1F5` byte 3 is the clean signal.
+   Wrote `decode_shift()`, flipped `shift` → `0x1F5` / `confirmed=True`.
+
+4. **SOC — still open.** `tools/mine_capture.py --monotonic` over the full
+   capture found only artefacts: `0x97` (multiplexed frame, mux-blend),
+   `0x4C5` byte 2 (2-state flag `0xDD`/`0x49`), `0xB9` (mux counter). The
+   dash has no % and 9 minutes barely moves the coarse battery bar. Needs a
+   longer discharge drive; the SOC-focused rewrite of `drive_log.py`
+   (`tools/soc_log.py`) is the next tool.
+
+5. **No bus degradation.** `can0` ERROR-ACTIVE start to finish. The
+   `sudo ip link` bounce at startup failed under `setsid` (no tty for a
+   password prompt; the NOPASSWD sudoers rule didn't match) — harmless, the
+   bus was already up from boot, but detached runs should default to
+   `--no-bounce`.
+
+### Code / tooling this session
+
+| File | Change |
+|---|---|
+| `voltdmf/lcd.py` (new) | `SerLcd` driver for the SparkFun serial 4x20 on the Pi UART. stdlib `termios`, no pyserial. In-memory screen image; `dry_run` keeps only the image. Backlight control (dimming is the brown-out fix), boot-splash wait, skip-unchanged-row writes, periodic `refresh()`. |
+| `tools/lcd.py` (new) | CLI: `--selftest` / `--message` / `--watch` ride-along dashboard. |
+| `tools/mine_capture.py` (new) | Offline `candump -l` miner, stdlib, read-only: `--ids`, `--monotonic` (SOC hunt), `--shift-window`, `--series`. |
+| `tools/drive_log.py` | Added the parked `--shift-routine` phase, `SOC-MARK` timeline anchors, a full `candump -l` capture spawn, and the `--lcd` mirror. |
+| `voltdmf/signals.py` | `decode_shift()` on `0x1F5` byte 3 + `_SHIFT_BY_BYTE3`; `shift` → `0x1F5` `confirmed=True`; `_ALT_SHIFT_ADDR` → `0x135`; `drive_mode_button` → `confirmed=True` (on-road injection PASS). |
+| `voltdmf/canio.py` | `_DecodeListener` decodes shift only from `0x1F5` (`0x135` stays a liveness-only signal frame). |
+| `tests/test_lcd.py` (new), `tests/test_signals.py` | LCD screen-image tests; real PRNDL decode tests; `test_confirmed_signal_set` now expects `{drive_mode_status, drive_mode_button, shift}`. Full suite: 93 passed. |
+
+### Next session — pick up here
+
+1. **SOC discharge drive** with `tools/soc_log.py` (the SOC-focused rewrite):
+   longer run, pack near-full → well down, `SOC-MARK` + voice memo, then
+   `mine_capture.py --monotonic` and anchor the top field to the narrated
+   EV-range / battery-bar readings.
+2. **Move the daemon onto the closed loop** (still open from session 3):
+   wire `0x1F4` into `daemon.py` RX as `current_mode_source` /
+   `menu_cursor_source`; add `0x1F4` to `_DecodeListener`. Consider
+   `SafetyGate(allow_unknown_shift=False)` now that `0x1F5` decodes.
+3. Default detached `drive_log.py` / `soc_log.py` runs to `--no-bounce`, or
+   fix the `/etc/sudoers.d/50-voltdmf-canlink` match.
+4. OBD-II DTC scan.
+5. `rm /etc/sudoers.d/50-voltdmf-canlink` on the Pi once field work is done.
+
+---
+
 ## Session 3 — 2026-08-29 (Phase C.5 — found a live cursor; fixed the overshoot; closed the loop)
 
 Autonomous troubleshooting from the Pi, car in Park / READY, owner not
