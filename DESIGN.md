@@ -91,8 +91,9 @@ Normal → Sport → Mountain → Hold, "switch to Hold" actually means "press t
 button N times," where N depends on the *current* mode (e.g. 3 presses from
 Normal, 1 press from Mountain). This makes reading back the current mode a
 requirement, not a nice-to-have — without it, the device can't know how many
-presses to send. See "Open items" for whether a current-mode status signal
-exists; if not, a fallback is discussed there too.
+presses to send. The current-mode status signal has since been confirmed
+(`0x1F4` byte 1 — see "Known CAN signals" / "Open items"), so the daemon reads
+it directly rather than blind-counting presses.
 
 Strategies 1 and 2 are meant to run **together** as the recommended default:
 Mountain Mode conserves the pack proactively from the start of every drive,
@@ -142,14 +143,14 @@ layer of defense.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | `0x206` | Bytes 1–2, ~0.25 kWh/count granularity per OVMS notes. **Needs calibration** against the vehicle's dash %/kWh readings — treat the raw value as relative until the scaling for this pack is confirmed. |
-| Drive mode cycle button press | `0x1E1`, bit 39 (candidate) | `DriveModeButton` signal in `gm_global_a_powertrain.dbc`, documented on a 2017 (Gen 2) car. Gen 1 (this vehicle) uses the same style of cycling button (Normal→Sport→Mountain→Hold), so this is the first thing to test on the actual vehicle — **not yet confirmed on Gen 1**, but a strong candidate rather than an unknown. |
+| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus (2026-08-29).** The real EV-SOC message ID is still unknown; `~0.25` kWh/count from OVMS is unverified for this pack. Needs a discharge drive (`tools/soc_log.py` / `tools/watch_soc.py`) to find the ID and calibrate raw→% against the dash. Until then the SOC-threshold trigger cannot fire. |
+| Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. This is the one frame the project transmits — `voltdmf/canio.send_mode_button_press()` (tracking-echo press). |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on — its own process start *is* the on-start trigger, no separate ignition-sense signal required. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
-| Shift/PRNDL position | `0x135` / `0x1F5` | Useful as a safety precondition (e.g., don't inject while not in Drive). |
-| EV range remaining | — | **Not documented anywhere found.** Use SOC (`0x206`) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
+| Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Used as a safety precondition — `SafetyGate` blocks injection unless in DRIVE (and blocks on UNKNOWN / short frame). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
+| EV range remaining | — | **Not documented anywhere found.** Use SOC (message ID still to be found on this bus) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
-| Current drive mode (status, not button-press) | — | **Not documented, and now required rather than optional** — because mode selection is a 4-way cycle, the daemon needs to know the current mode to compute how many button presses reach the target (see "Trigger strategies"). Also lets the device avoid overriding a mode the driver deliberately chose. See "Open items" for a fallback if no such signal exists. |
+| Current drive mode (status, not button-press) | `0x1F4`, byte 1 | **CONFIRMED on Gen 1 (2026-08-29).** Latched mode: `0x00` NORMAL, `0x80` SPORT, `0x20` MOUNTAIN, `0x08` HOLD. byte 4 = live drive-mode menu cursor (steps ~40 ms after each tap; distinct byte codes), byte 5 bit 7 = menu-open hint. The daemon reads byte 1 as its current-mode source — the press-counting fallback is retired. |
 
 ## Hardware design
 
@@ -265,22 +266,21 @@ The custom code needed is small and specific to this project:
      `threshold_percent` (latch), and re-arms once SOC rises back above
      `reset_percent` (e.g. after charging) — this avoids repeatedly firing
      if SOC hovers near the threshold.
-4. **Mode-cycle controller** — reads current mode (from the status signal,
-   if one is found — see "Open items"), computes the number of button
-   presses needed to reach a trigger's requested `target_mode` given the
-   fixed Normal→Sport→Mountain→Hold cycle order, and sends that many
-   presses (with realistic inter-press timing) through the safety wrapper
-   below. This is the one place that needs the actual button-press CAN
-   frame; every trigger just asks it for a `target_mode` and it doesn't
-   care which trigger asked.
+4. **Mode-cycle controller** — reads current mode from the status signal
+   (`0x1F4` byte 1, confirmed), walks the drive-mode menu to a trigger's
+   requested `target_mode` along the fixed Normal→Sport→Mountain→Hold cycle
+   order — closing the loop on the live menu cursor (`0x1F4` byte 4) — and
+   sends the taps through the safety wrapper below. This is the one place
+   that needs the actual button-press CAN frame; every trigger just asks it
+   for a `target_mode` and it doesn't care which trigger asked.
 5. **Safety wrapper** (see next section) — the only code path allowed to
    transmit.
 
-Don't write this until step 1 in "Phased plan" below has confirmed the
-actual button-press signal and a way to read current mode (or the fallback
-in "Open items" if no status signal exists) — a controller built against a
-guessed CAN ID, or one that can't tell what mode it's starting from, is
-worse than not having one.
+The button-press signal (`0x1E1`) and the current-mode readback (`0x1F4`)
+are both confirmed on-vehicle, so this controller now exists
+(`voltdmf/modecycle.py`). The original caution still holds as a principle: a
+controller built against a guessed CAN ID, or one that can't tell what mode
+it's starting from, is worse than not having one.
 
 ## Safety model
 
@@ -392,26 +392,39 @@ invocations. State changes come in over an `AF_UNIX` stream socket
    SOC threshold based on how early the switch needs to happen to reliably
    avoid reduced-propulsion mode.
 
-## Open items (pending on-vehicle verification)
+## Open items
 
-- Whether the mode-cycle button press is `0x1E1` bit 39 (as on the Gen 2
-  reference car) or a different message on this Gen 1 car — requires step 1
-  above.
-- Whether a "current drive mode" status signal exists on the bus. This is
-  now a hard requirement for the mode-cycle controller to work correctly,
-  not a nice-to-have. **Fallback if none is found**: infer mode from
-  indirect evidence instead of a single dedicated signal — e.g., correlate
-  known Mountain/Hold behavior (gas engine engaging at a specific SOC
-  pattern) with other already-documented signals, or as a last resort,
-  track mode in software by counting presses from a known reset point (e.g.
-  right after confirming a fresh Normal-on-start) and accept that state can
-  drift if the driver also uses the physical button — which is also a
-  reason to prefer finding a real status signal over this fallback.
-- Whether the car resets to Normal on every ignition cycle or remembers the
-  last-used mode — affects whether the on-start trigger needs the status
-  signal too, or can assume a fixed starting mode.
-- The SOC (`0x206`) raw-value-to-percentage scaling for this specific
-  pack/model year — calibrate against the dash reading.
+### Resolved on-vehicle (2026-08-29, Gen 1, HS-CAN 500k)
+
+Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
+
+- **Mode-cycle button press → `0x1E1` byte 4 bit 7.** Same ID/bit as the Gen 2
+  prior art. The tracking-echo injection (`voltdmf/canio.send_mode_button_press`)
+  drove a closed-loop walk to all four modes on the road, each holding while
+  moving. (Bench re-validation of the later burst-and-release refactor is the
+  one remaining injection check — see `docs/field-session-log.md`.)
+- **Current drive mode → `0x1F4` byte 1** (`0x00`/`0x80`/`0x20`/`0x08` =
+  N/S/M/H). The mode-cycle controller reads this directly as its
+  current-mode source; the press-counting fallback is retired, and no
+  indirect-inference fallback is needed. byte 4 gives a live menu cursor used
+  to close the loop on a walk.
+- **Ignition/drive-cycle start** — no dedicated signal needed: the Pi is on
+  the switched accessory socket, so process start *is* the on-start event.
+- **Shift/PRNDL → `0x1F5` byte 3** (`1`–`5` = P/R/N/D/L). `SafetyGate` blocks
+  injection unless in DRIVE and blocks on UNKNOWN.
+
+### Still open (need a real discharge drive)
+
+- **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) never appears on
+  this Gen 1 bus. The real EV-SOC message ID is unknown; raw→percent
+  (`SOC_KWH_PER_COUNT`, `GEN1_PACK_USABLE_KWH`) is uncalibrated. Needs a
+  discharge drive with `tools/soc_log.py` / `tools/watch_soc.py` against the
+  dash reading. The SOC-threshold trigger cannot fire until this lands.
+- **Drive-mode persistence across ignition cycles.** Whether the car resets to
+  NORMAL on every start or remembers the last-used mode — affects only whether
+  the on-start trigger can assume a starting mode (it currently reads `0x1F4`
+  either way). Also: how long after key-off the HS-CAN goes quiet. Run
+  `tools/ignition_check.py`.
 
 ## Sources
 
