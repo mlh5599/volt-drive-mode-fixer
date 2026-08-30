@@ -1,7 +1,8 @@
 # On-Vehicle Field Checklist
 
 Covers DESIGN.md **Phase A** (CAN bring-up) → **Phase C** (signal discovery) →
-**Phase C.5** (injection gate).
+**Phase C.5** (injection gate), plus a stretch-goal capture (§2e — force 12 A
+Level 1 charging).
 
 > **Car in Park with the parking brake set for every step. Never run discovery
 > or injection while the vehicle can move.** Physical abort = unplug the OBD
@@ -126,8 +127,9 @@ drive".
 - [ ] The drive: park with a near-full gauge, **hold SW1+SW2 ~5 s** to start
       the 90-min capture (or, from a laptop, `systemctl start
       voltdmf-soclog.service` / `soc_log.py --yes --minutes 90 --buttons
-      --lcd`). Discharge ≥4–5 increments, tapping A on each drop (B if it
-      climbs back), then hold both buttons 3 s to stop.
+      --lcd`). **Before pulling out, still in Park, run the §2e charge-mode
+      prelude.** Then discharge ≥4–5 increments, tapping A on each drop (B if
+      it climbs back), then hold both buttons 3 s to stop.
 - [ ] `mine_capture.py <capture> --ids` / `--monotonic --top 25` /
       `--series ID:OFF:W[:le] --every 20`; cross the top monotonic field
       against the button/`SOC-MARK` timestamps (steps with the gauge, flat
@@ -153,6 +155,42 @@ P-R-N-D-L.
 
 - [ ] With `candump can0,135:7FF` (then `1F5:7FF`) running, move P → R → N → D →
       L and record the byte/value per position
+
+### 2e · Charge-current setpoint — force 12 A Level 1  🎯 stretch goal, piggybacks on the SOC drive
+
+Why: the center-stack 8 A → 12 A charge-rate setting reverts to 8 A every time
+the car leaves Park. The owner only ever charges on a known-good home circuit,
+so holding 12 A is a safe convenience win — `DESIGN.md` → "Stretch goal —
+force 12 A Level 1 charging". **This session only captures the setpoint frame;
+no injection.** Costs ~2 min and does not touch the gauge-marking workflow.
+
+Prelude — **in Park, before pulling out**, with `soc_log.py` already running
+(its `candump -l` grabs the whole bus):
+
+- [ ] Note wall-clock time, toggle **8 → 12 A** in the menu, hold ~20 s
+- [ ] Time, toggle **12 → 8 A**, hold ~20 s
+- [ ] Time, toggle **8 → 12 A**, hold ~20 s
+- [ ] Time, toggle **12 → 8 A**, hold ~20 s
+- [ ] Shift to **Drive** and pull out — 5th transition, the forced revert to
+      8 A; `0x1F5` byte 3 leaving `0x01` (Park) timestamps it for free
+- [ ] *(optional, only if convenient at a stop — do not let it compete with
+      tapping A on gauge drops)* toggle once or twice more mid-drive, call out
+      the time
+
+Analysis (back at a keyboard):
+
+- [ ] `mine_capture.py <capture> --shift-window <prelude-start> <prelude-end>`
+      — lists IDs that took discrete states in the window and prints every
+      transition
+- [ ] Cross those against the `0x1F5` byte 3 Park-exit timestamp: the setpoint
+      frame is the one that changes at your toggles **and** snaps to the 8 A
+      value exactly at Park-exit
+- [ ] Expect a byte flipping `0x08`↔`0x0C` (amps) or `0x28`↔`0x3C` (40↔60 in
+      0.2 A units); note ID / offset / encoding and whether a rolling counter
+      or checksum rides along
+- [ ] Record in `docs/signals-confirmed.md` → "Charge current setpoint"
+      (stays NOT CONFIRMED until an injection test); leave injection +
+      Park-exit re-assert for a later dedicated session
 
 ### Phase C deliverable (back at a keyboard)
 

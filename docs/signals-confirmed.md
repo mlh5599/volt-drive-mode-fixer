@@ -245,3 +245,25 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
 - Mode resets to NORMAL on ignition, or remembered? `______`
 - Seconds from "on" to first frames: `______`
 - => sets `ASSUMED_START_MODE` validity in `voltdmf/daemon.py`
+
+## Charge current setpoint — 8 A / 12 A Level 1  (stretch goal — NOT CONFIRMED)
+
+Goal: force 12 A 120 V charging (`DESIGN.md` → "Stretch goal — force 12 A
+Level 1 charging"). The center-stack setting reverts to 8 A on every Park
+exit; the owner always charges at home on a known-good circuit.
+
+- Capture method: charge-mode prelude on the SOC drive — see
+  `docs/phase-c-field-checklist.md` §2e. Toggle 8↔12 A a few times in Park,
+  then shift to Drive (forced revert). Correlate the offline
+  `mine_capture.py --shift-window` transitions against `0x1F5` byte 3 leaving
+  `0x01` (Park).
+- Setpoint frame ID: `______`
+- Byte / offset / encoding: `______` (expected `0x08`↔`0x0C` A, or
+  `0x28`↔`0x3C` in 0.2 A units)
+- Rolling counter / checksum in the frame? `______`
+- HMI re-assert cadence (→ single post-revert TX vs continuous): `______`
+- OVMS reference: charger *telemetry* (read-only) is `0x5EC` B2 charging
+  current @ 0.2 A, B3 charging voltage @ 2 V, via a `0x7E4` diag request; no
+  published *command* for the user 8/12 A selection.
+- => injection lives in `voltdmf/canio.py` behind the same `--dry-run` gate;
+  not started.

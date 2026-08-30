@@ -450,6 +450,37 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   along with how long after key-off the HS-CAN goes quiet — `tools/ignition_check.py`,
   whenever it's convenient.
 
+### Stretch goal — force 12 A Level 1 charging
+
+Not part of the drive-mode mission; a low-risk add-on that would reuse the
+same bus tap and the same `--dry-run`-gated injector safety wrapper.
+
+The center-stack setting that raises 120 V charging from **8 A to 12 A** can
+be changed at any time (even while driving), but **reverts to 8 A every time
+the car leaves Park** — GM's guard against an unknown / marginal wall circuit.
+The owner only ever charges on a known-good home circuit, so the revert is
+pure friction; the goal is to make the car *always* Level-1-charge at 12 A.
+
+Approach: detect the Park-exit revert (or just assert continuously) and
+re-send the "12 A" setpoint frame so the faster rate always sticks.
+
+Unknowns, all answerable from **one capture**: the setpoint frame ID / byte /
+encoding (likely `0x08`↔`0x0C` amps, or `0x28`↔`0x3C` in the 0.2 A units OVMS
+documents for charger telemetry on `0x5EC`), whether it carries a rolling
+counter / checksum, and whether the HMI re-asserts fast enough to need
+continuous TX vs a single post-revert shot. Discovery piggybacks on the SOC
+discharge drive — see the charge-mode prelude in
+`docs/phase-c-field-checklist.md` §2e. The forced 8 A revert lands on the
+same timestamp as `0x1F5` byte 3 leaving `0x01` (Park), which hands the
+offline analysis a free labelled edge to correlate against.
+
+Safety: 12 A at 120 V is 1.44 kW — within the car's own menu option and the
+Lear charger's ~12.7 A ceiling. The only real-world caveat (the wall circuit
+being rated for 12 A continuous) is one the owner controls by only ever
+plugging in at home. No safety-of-motion dimension. It is still a bus TX, so
+it goes through the same dry-run gate, error-frame watch, and DTC scan as
+mode injection.
+
 ## Sources
 
 - [vix597/chevy-volt-trip-mode](https://github.com/vix597/chevy-volt-trip-mode)
