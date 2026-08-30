@@ -614,7 +614,62 @@ is the fix for both our symptoms:
   `--target <mode>`. Knobs: `--burst-ms`, `--rate-hz`, `--gap` (floored at
   `RELEASE_GAP_S`), `--settle`, `--step-confirm`.
 
-### Next session — pick up here
+### Next session — pick up here — SOC discovery drive
+
+Goal: find the message ID + byte offset that carries pack state-of-charge on
+this Gen 1 bus, and enough points to calibrate `SOC_KWH_PER_COUNT` /
+`GEN1_PACK_USABLE_KWH` in `voltdmf/signals.py`. `0x206` (the Gen 2 candidate)
+is absent here, so this is a from-scratch hunt and it needs a real discharge:
+start the drive with a high battery gauge and run it down several increments.
+
+The Gen 1 dash shows **no SOC %** — only EV range (miles) and a 10-increment
+battery gauge. `tools/soc_log.py` is the capture tool: it's **passive** (never
+transmits), spawns `candump -l` for the raw log, and takes two panel buttons
+so the driver can mark each gauge-increment change without looking away.
+
+1. `can0` is already up from boot (500k, `restart-ms 100`) — nothing to bring
+   up. Quick check over SSH before pulling away: `ip -br link show can0` = UP.
+2. Start the logger from the bench copy, using the **system** Python (it has
+   `gpiozero`; the venv doesn't):
+   ```
+   cd ~/vdmf && /usr/bin/python3 tools/soc_log.py --yes --minutes 90 --buttons --lcd
+   ```
+   - `--buttons`: SW1 (BCM 24) = gauge dropped one increment, SW2 (BCM 23) =
+     gauge rose one. Press the moment the dash gauge ticks.
+   - `--lcd`: mirrors status to the 4x20 so the driver can confirm it's
+     logging without a laptop. Add `--bars-start N` if the gauge isn't full
+     at key-on.
+   - `--mark-every` drops a periodic SOC-MARK anchor (default 120 s) even
+     when the gauge is steady — leave it on.
+   - It self-stops after `--minutes`; or hold BOTH buttons `--stop-hold` s
+     when parked at the end.
+3. Drive to discharge: get the gauge down by at least 4–5 increments (charge-
+   sustaining hills or a longer flat run both work). Don't touch the Pi while
+   moving — the buttons and the periodic marks are the whole interface.
+4. Back at a keyboard, pull the logs (`~/candump-<ts>.log` and the
+   `~/vdmf-soclog-<ts>.log` event log) and mine them:
+   ```
+   tools/mine_capture.py ~/candump-<ts>.log --ids
+   tools/mine_capture.py ~/candump-<ts>.log --monotonic --top 25
+   tools/mine_capture.py ~/candump-<ts>.log --series <ID>:<OFF>:<W>[:le] --every 20
+   ```
+   Cross the `--monotonic` candidates against the button/MARK timestamps in
+   the event log: the SOC field should step down in step with the gauge
+   presses and hold flat between them. Confirm the raw→kWh (or raw→%) scale
+   from two well-separated marks.
+5. Set `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH` (or a direct percent
+   decode) in `voltdmf/signals.py`, flip `soc.confirmed = True`, add a
+   `decode_soc` + wire it into `_DecodeListener` / `is_signal_frame`, and
+   record the ID/offset/scale here.
+6. Same drive, spare time: run `tools/ignition_check.py` at engine-off to
+   settle the ignition-behaviour question (bus-quiet delay, mode persistence
+   across a key cycle).
+
+### Deferred — stationary injection validation (burst-and-release)
+
+Can run as a ~10 min warm-up in Park at the **start** of the SOC drive (it
+clears the last injection gate), or stay its own session. Not blocking the
+SOC hunt either way.
 
 1. **Car in full READY**, foot on brake, Park. Confirm `candump can0` streams
    steadily *before* touching anything.
@@ -625,13 +680,13 @@ is the fix for both our symptoms:
    ```
    (`~/vdmf` on the Pi is a plain clone with our files scp'd over; the systemd
    daemon at `/opt/voltdmf/repo` is untouched and still dry-run.)
-3. Bring the bus up **with** auto-recovery — do **not** use
-   `systemctl restart voltdmf-can0-up` (that unit sets `restart-ms 0`):
+3. `can0` now comes up from boot at 500k **with `restart-ms 100`** (ansible
+   converge 2026-08-29, `665ed5d`) — no manual `ip link` needed. Confirm:
    ```
-   sudo ip link set can0 down
-   sudo ip link set can0 up type can bitrate 500000 restart-ms 100
-   ip -details link show can0     # expect: can state ERROR-ACTIVE
+   ip -details link show can0     # expect: can state ERROR-ACTIVE, restart-ms 100
    ```
+   If you *do* bounce it, re-add `restart-ms 100` by hand; a plain
+   `systemctl restart voltdmf-can0-up` is now fine too (the unit carries it).
 4. Second shell: `candump can0 | grep -iE 'err'`.
 5. Closed-loop sweep — one step at a time, watching the dash and `can0`:
    ```
@@ -651,8 +706,8 @@ is the fix for both our symptoms:
 ### Still needs a real drive (deferred, not attempted)
 
 - **SOC signal** — `0x206` never appears on this bus (Gen-2 ID is wrong for
-  Gen 1). Needs a discharge drive with `tools/watch_soc.py` to find the real
-  ID + scaling for `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH`.
+  Gen 1). This is now the headline next session — see "SOC discovery drive"
+  above (`tools/soc_log.py` capture → `tools/mine_capture.py --monotonic`).
 - **Shift / PRNDL** — ✅ RESOLVED on the road (session 4). `0x1F5` byte 3 is
   the PRNDL detent (1 PARK … 5 LOW): stepped 1→5 in order through a parked
   P-R-N-D-L walk, then held 4 (DRIVE) for the whole 9-minute drive.
@@ -681,9 +736,9 @@ is the fix for both our symptoms:
 - ✅ **DONE — homelab-ansible `onboard-voltpi` @ `665ed5d`.**
   `voltdmf-can0-up.service.j2` now sets `restart-ms {{ voltdmf_can_restart_ms }}`
   on the `type can` line; new `voltdmf_can_restart_ms: 100` default. Applies
-  on the next `make voltpi` converge (the template task already notifies
-  "Restart voltdmf can0-up"). Until then, bring the bus up by hand with
-  `restart-ms 100` as in the road-test steps above.
+  Converged onto voltpi 2026-08-29 with
+  `ansible-playbook playbooks/voltpi.yml --tags voltdmf`; `can0` now boots
+  `ERROR-ACTIVE restart-ms 100`, no hand `ip link` needed.
 - ⬜ Once injection passes: bump `voltdmf_version` in
   `inventories/production/host_vars/voltpi.haguehome.lan/vars.yml` to the
   confirmed-signals commit. Keep `voltdmf_dry_run: true`.
