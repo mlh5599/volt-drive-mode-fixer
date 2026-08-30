@@ -1,0 +1,35 @@
+// Let the unprivileged button-helper account start / stop the SOC-capture
+// oneshot without sudo.
+//
+// ONLY needed if voltdmf-btn.service drops privileges (User=voltdmf-btn).
+// Redundant -- and harmless -- when the helper runs as root.
+//
+// Install as /etc/polkit-1/rules.d/10-voltdmf-btn.rules (polkit >= 0.106,
+// the JS rules engine; Raspberry Pi OS Bookworm ships 0.105 with the older
+// .pkla format, see the pkla fallback below).
+
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        subject.user === "voltdmf-btn") {
+        var unit = action.lookup("unit");
+        if (unit === "voltdmf-soclog.service") {
+            return polkit.Result.YES;
+        }
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+
+// ---------------------------------------------------------------------------
+// polkit 0.105 (.pkla) fallback -- install as
+//   /etc/polkit-1/localauthority/50-local.d/10-voltdmf-btn.pkla
+// and drop this JS file:
+//
+//   [voltdmf-btn may manage the SOC-capture oneshot]
+//   Identity=unix-user:voltdmf-btn
+//   Action=org.freedesktop.systemd1.manage-units
+//   ResultActive=yes
+//   ResultInactive=yes
+//   ResultAny=yes
+//
+// .pkla cannot scope to a single unit; if that matters, keep the helper as
+// root instead.

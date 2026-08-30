@@ -1,0 +1,70 @@
+[Unit]
+Description=Volt Drive Mode Fixer -- panel button helper (gesture dispatch)
+# See DESIGN.md "Button helper" (design item 4) for why this is a separate
+# process and not part of voltdmf.service: the passive safety daemon gains no
+# gpiozero/lgpio dependency and no extra privilege, and reaches nothing the
+# helper does except through the existing control socket.
+Documentation=file:///usr/share/doc/voltdmf/DESIGN.md
+After=voltdmf.socket
+Wants=voltdmf.socket
+# The helper tolerates the daemon being down: `setpoint` calls just fail until
+# voltdmf-ctl can reach the socket again, and launching a capture does not
+# touch the daemon at all.
+
+# fail-soft: a crash loop should back off, not thrash the two GPIO lines.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# System interpreter on purpose: /usr/bin/python3 (3.13) is the one with
+# gpiozero + lgpio on this Pi. The daemon venv has python-can and NO gpiozero.
+# (pi-deploy notes, "Python split on the Pi".)
+#
+# Contract the helper script is expected to honour:
+#   * owns SW1 (BCM 24) + SW2 (BCM 23), internal pull-ups, ~50 ms debounce,
+#     whenever no capture is running
+#   * gesture map:
+#       SW1 short press          -> `voltdmf-ctl setpoint` toggle HOLD<->MOUNTAIN
+#                                   (no-op until `setpoint` lands; DESIGN.md 4)
+#       SW1+SW2 held >= 5 s      -> LAUNCH capture:
+#                                     1. paint "starting SOC capture" (LCD lock)
+#                                     2. close() both Button objects
+#                                     3. systemctl start --wait voltdmf-soclog.service
+#                                     4. re-acquire SW1/SW2, resume
+#   * on its own startup, if voltdmf-soclog.service is already active, wait for
+#     it instead of grabbing the GPIO lines (survives a helper restart mid-run)
+#   * during a capture the helper is dormant and soc_log.py owns the buttons
+#     (A = gauge-down, B = gauge-up, hold BOTH 3 s = stop)
+ExecStart=/usr/bin/python3 /opt/voltdmf/repo/tools/button_helper.py \
+    --sw1-gpio 24 --sw2-gpio 23 \
+    --launch-hold-secs 5 \
+    --soclog-unit voltdmf-soclog.service \
+    --ctl /usr/local/bin/voltdmf-ctl
+Restart=on-failure
+RestartSec=5
+
+# --- privileges ---------------------------------------------------------------
+# Simplest on a single-purpose appliance: run as root (can read the GPIO chip,
+# reach the 0660 control socket, and `systemctl start` the oneshot with no
+# polkit rule). To drop privileges instead, comment out User=root, uncomment
+# the block below, create the account
+#   useradd --system --no-create-home --shell /usr/sbin/nologin \
+#           -G gpio,voltdmf voltdmf-btn
+# and install systemd/polkit/10-voltdmf-btn.rules so it may start the oneshot.
+User=root
+
+# User=voltdmf-btn
+# SupplementaryGroups=gpio voltdmf
+#   gpio    -> /dev/gpiochip* for gpiozero/lgpio
+#   voltdmf -> /run/voltdmf/control.sock (0660 root:voltdmf) for voltdmf-ctl
+# NoNewPrivileges=true
+
+# Share the LCD hand-off lock with the daemon watch screen and the by-hand
+# tools. The lockfile lives in /run/lock (1777) so every writer -- daemon
+# (user voltdmf), helper, and soc_log.py (user mike) -- can drop it there.
+Environment=VOLTDMF_LCD_LOCK=/run/lock/voltdmf-lcd.lock
+
+[Install]
+WantedBy=multi-user.target
