@@ -284,10 +284,24 @@ The custom code needed is small and specific to this project:
    `desired` is not `None` and differs from `state.drive_mode`, hands
    `desired` to the safety gate. No per-drive edge state, no once-only latch.
 4. **Button helper** — a tiny separate process (system Python, `gpiozero`)
-   that watches `mountain_button_gpio` and calls `voltdmf-ctl setpoint …` on
-   each press to toggle HOLD ⇄ MOUNTAIN. Kept out of the daemon so the
-   daemon's venv gains no GPIO dependency and its privilege set is unchanged;
-   it reaches the daemon only through the existing control socket. Its own
+   that owns the two PiCAN2 pads (SW1 = BCM 24, SW2 = BCM 23) and dispatches
+   by gesture:
+   - **SW1 tap** → `voltdmf-ctl setpoint …` to toggle HOLD ⇄ MOUNTAIN.
+   - **SW2 held ~5 s alone, then released** → launch the charge-current
+     setpoint capture (`voltdmf-chargelog.service`; checklist §2e). Fires on
+     release with SW1 never joined, so a hand travelling toward the combo
+     below can't trip it.
+   - **SW1 + SW2 held ~5 s** → launch the SOC-discovery capture
+     (`voltdmf-soclog.service`).
+
+   Both launches free the GPIO lines, claim the LCD hand-off lock, `systemctl
+   start` the oneshot and block until it exits (polling `is-active`, never
+   trusting the queued `start`), then re-acquire — and wait for both pads to
+   be released before reading gestures again so the capture's hold-BOTH stop
+   can't roll into a fresh launch. The gesture rules live in a side-effect-free
+   `_Gestures` state machine (unit-tested off-Pi). Kept out of the daemon so
+   its venv gains no GPIO dependency and its privilege set is unchanged; it
+   reaches the daemon only through the existing control socket. Its own
    systemd unit in `roles/voltdmf`.
 5. **Mode-cycle controller** — reads current mode from the status signal
    (`0x1F4` byte 1, confirmed), walks the drive-mode menu to the requested
@@ -486,11 +500,12 @@ Unknowns, all answerable from **one capture**: the setpoint frame ID / byte /
 encoding (likely `0x08`↔`0x0C` amps, or `0x28`↔`0x3C` in the 0.2 A units OVMS
 documents for charger telemetry on `0x5EC`), whether it carries a rolling
 counter / checksum, and whether the HMI re-asserts fast enough to need
-continuous TX vs a single post-revert shot. Discovery piggybacks on the SOC
-discharge drive — see the charge-mode prelude in
-`docs/phase-c-field-checklist.md` §2e. The forced 8 A revert lands on the
-same timestamp as `0x1F5` byte 3 leaving `0x01` (Park), which hands the
-offline analysis a free labeled edge to correlate against.
+continuous TX vs a single post-revert shot. Discovery is a **standalone
+garage session** — car in READY and Park, toggle the menu setting while
+capturing, no drive and no discharged pack needed — see
+`docs/phase-c-field-checklist.md` §2e. A P→R→P shift in the garage exercises
+the forced 8 A revert; it lands on the same timestamp as `0x1F5` byte 3
+leaving `0x01` (Park), a free labeled edge for the offline analysis.
 
 Safety: 12 A at 120 V is 1.44 kW — within the car's own menu option and the
 Lear charger's ~12.7 A ceiling. The only real-world caveat (the wall circuit

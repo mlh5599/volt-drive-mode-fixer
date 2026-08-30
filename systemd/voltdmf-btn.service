@@ -28,15 +28,23 @@ Type=simple
 #   * gesture map:
 #       SW1 short press          -> `voltdmf-ctl setpoint` toggle HOLD<->MOUNTAIN
 #                                   (no-op until `setpoint` lands; DESIGN.md 4)
-#       SW1+SW2 held >= 5 s      -> LAUNCH capture:
+#       SW2 held alone >= 5 s,   -> LAUNCH the charge-current-setpoint capture
+#         then released             (voltdmf-chargelog.service). SW1 must never
+#                                   join; fires on release so a hand reaching
+#                                   for the SW1+SW2 combo can't trip it.
+#       SW1+SW2 held >= 5 s      -> LAUNCH the SOC-discovery capture:
 #                                     1. paint "starting SOC capture" (LCD lock)
 #                                     2. close() both Button objects
 #                                     3. systemctl start --wait voltdmf-soclog.service
 #                                     4. re-acquire SW1/SW2, resume
-#   * on its own startup, if voltdmf-soclog.service is already active, wait for
-#     it instead of grabbing the GPIO lines (survives a helper restart mid-run)
+#   * either LAUNCH follows the same LCD-lock / GPIO-handoff / poll-is-active
+#     dance; only the unit name differs
+#   * on its own startup, if either capture unit is already active, wait for it
+#     instead of grabbing the GPIO lines (survives a helper restart mid-run)
 #   * during a capture the helper is dormant and soc_log.py owns the buttons
-#     (A = gauge-down, B = gauge-up, hold BOTH 3 s = stop)
+#     (A = gauge-down, B = gauge-up, hold BOTH 3 s = stop); when a capture ends
+#     the helper waits for both pads to be released before reading gestures
+#     again, so the stop-hold can't roll into a fresh launch
 # lgpio's alert thread writes its notify FIFO (.lgd-nfy*) into $HOME / the CWD
 # on the first Button() callback. A service inherits CWD=/ and, under User= +
 # ProtectSystem=strict, a read-only home -- lgpio's FIFO create then fails and
@@ -49,8 +57,9 @@ Environment=HOME=%t/voltdmf-btn
 Environment=LG_WD=%t/voltdmf-btn
 ExecStart=/usr/bin/python3 /opt/voltdmf/repo/tools/button_helper.py \
     --sw1-gpio 24 --sw2-gpio 23 \
-    --launch-hold-secs 5 \
+    --launch-hold-secs 5 --single-hold-secs 5 \
     --soclog-unit voltdmf-soclog.service \
+    --chargelog-unit voltdmf-chargelog.service \
     --ctl /usr/local/bin/voltdmf-ctl
 Restart=on-failure
 RestartSec=5

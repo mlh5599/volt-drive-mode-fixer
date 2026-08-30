@@ -44,7 +44,7 @@ implemented, blocked on the same SOC calibration. Progress and next steps:
 | `voltdmf/` | The daemon: `config`, `signals`, `state`, `triggers`, `modecycle`, `safety`, `canio`, `daemon`, `control`/`ctl`. `python -m voltdmf --config ... [--dry-run]`. |
 | `tools/` | Phase C signal-discovery scripts (see `tools/README.md`), incl. `soc_log.py` (drive capture) and `soc_report.py` (analysis → `docs/analysis/`). |
 | `host/` | Pi `config.txt` snippet + `systemd-networkd` unit to bring up `can0`. |
-| `systemd/` | `voltdmf.service` + `voltdmf.socket` (control socket); `voltdmf-soclog.service` + `voltdmf-btn.service` (panel-launched SOC capture). |
+| `systemd/` | `voltdmf.service` + `voltdmf.socket` (control socket); `voltdmf-btn.service` (panel gestures) launching `voltdmf-soclog.service` (SW1+SW2 → SOC capture) / `voltdmf-chargelog.service` (SW2 solo-hold → charge-mode capture). |
 | `docs/signals-confirmed.md` | Phase C deliverable — the verified signal table. |
 | `docs/field-session-log.md` | Running narrative of the on-vehicle sessions. |
 | `docs/phase-c-field-checklist.md` | Phase C progress tracker and per-drive procedures. |

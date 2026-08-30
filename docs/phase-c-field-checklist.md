@@ -42,6 +42,15 @@ Level 1 charging).
 > per-line candidate raw stamps + an opt-in `--diag-soc` (`22 005B`) poll.
 > §2b below now describes the **Session-9 anchor drive** — that plus the
 > stationary injection sweep and `ignition_check.py` are what's left.
+>
+> **Update (session 9 prep, 2026-08-30):** `--diag-soc` is now armed on the
+> SW1+SW2 panel-launched capture (host_vars `voltdmf_soclog_extra_args`) for
+> the anchor drive. §2e (**charge-current setpoint**) is promoted from
+> deferred to an **active standalone garage session** — no drive or full
+> charge needed — so it can run while the pack charges for Session 9, and it
+> gets its own panel gesture: **hold SW2 alone ~5 s** launches
+> `voltdmf-chargelog.service` (a passive `soc_log.py`, no `--diag-soc`),
+> leaving the SW1+SW2 SOC combo untouched.
 
 ---
 
@@ -199,41 +208,100 @@ P-R-N-D-L.
 - [ ] With `candump can0,135:7FF` (then `1F5:7FF`) running, move P → R → N → D →
       L and record the byte/value per position
 
-### 2e · Charge-current setpoint — force 12 A Level 1  💤 deferred (owner deprioritized 2026-08-30) — kept for a later dedicated capture
+### 2e · Charge-current setpoint — force 12 A Level 1  🟢 ACTIVE — standalone garage session (no drive, no full charge)
 
-Why: the center-stack 8 A → 12 A charge-rate setting reverts to 8 A every time
-the car leaves Park. The owner only ever charges on a known-good home circuit,
-so holding 12 A is a safe convenience win — `DESIGN.md` → "Stretch goal —
-force 12 A Level 1 charging". **This session only captures the setpoint frame;
-no injection.** Costs ~2 min and does not touch the gauge-marking workflow.
+Why: the center-stack **8 A → 12 A** Level-1 charge-rate setting reverts to
+8 A every time the car leaves Park. The owner only ever charges on a
+known-good home circuit, so holding 12 A is a safe convenience win —
+`DESIGN.md` → "Stretch goal — force 12 A Level 1 charging". **Capture only —
+no injection this session.**
 
-Prelude — **in Park, before pulling out**, with `soc_log.py` already running
-(its `candump -l` grabs the whole bus):
+Independent of the Session-9 SOC drive: this runs in the garage in ~15 min
+and needs neither a discharged pack nor a real charging session. Being
+plugged in adds the live charger-negotiation frames (§ "If plugged in"
+below). **Check first:** if the 8 A/12 A rate selector is greyed out or
+unresponsive with the car unplugged, plug into the home EVSE — a near-full
+pack just trickles or idles, but the charge screen becomes fully live. If it
+*is* reachable unplugged, skip the cable.
 
-- [ ] Note wall-clock time, toggle **8 → 12 A** in the menu, hold ~20 s
-- [ ] Time, toggle **12 → 8 A**, hold ~20 s
-- [ ] Time, toggle **8 → 12 A**, hold ~20 s
-- [ ] Time, toggle **12 → 8 A**, hold ~20 s
-- [ ] Shift to **Drive** and pull out — 5th transition, the forced revert to
-      8 A; `0x1F5` byte 3 leaving `0x01` (Park) timestamps it for free
-- [ ] *(optional, only if convenient at a stop — do not let it compete with
-      tapping A on gauge drops)* toggle once or twice more mid-drive, call out
-      the time
+**Safety / setup**
 
-Analysis (back at a keyboard):
+- [ ] Garage door open, engine may start (near-full pack → unlikely, but
+      ventilate). Parking brake set, wheels chocked. Car in **Park** the
+      whole session except the one deliberate shift test.
+- [ ] Physical abort = unplug the OBD cable.
 
-- [ ] `mine_capture.py <capture> --shift-window <prelude-start> <prelude-end>`
-      — lists IDs that took discrete states in the window and prints every
-      transition
-- [ ] Cross those against the `0x1F5` byte 3 Park-exit timestamp: the setpoint
-      frame is the one that changes at your toggles **and** snaps to the 8 A
-      value exactly at Park-exit
-- [ ] Expect a byte flipping `0x08`↔`0x0C` (amps) or `0x28`↔`0x3C` (40↔60 in
-      0.2 A units); note ID / offset / encoding and whether a rolling counter
-      or checksum rides along
+**Capture — launch it from the watch screen (SW2 solo-hold)**
+
+There is a dedicated panel gesture for this session, separate from the
+SW1+SW2 SOC launch (which is armed with `soc_log.py --diag-soc` for
+Session 9). From the daemon watch screen:
+
+- [ ] **Hold SW2 alone for ~5 s, then let go** (SW1 untouched). The helper
+      paints `CHARGE CAPTURE` on the LCD and starts
+      `voltdmf-chargelog.service` — `soc_log.py --yes --minutes 20 --buttons
+      --lcd`, **fully passive, no `--diag-soc`**. It fires on release, so a
+      hand sliding over toward the SW1+SW2 combo won't trip it.
+- [ ] `--buttons` is now only for timestamping: **tap A** at each step below
+      (B still moves the gauge but is unused here). The LCD hand-off with the
+      daemon works via `/run/lock/voltdmf-lcd.lock` as usual.
+- [ ] Confirm the LCD left the watch screen and `~/candump-<ts>.log` on voltpi
+      is growing before the first toggle. (Peek over SSH:
+      `ls -la ~mike/candump-*.log` — no need to stop `voltdmf-btn`.)
+- [ ] *Fallback if the SW2 launch misbehaves:* `ssh voltpi`, `sudo systemctl
+      stop voltdmf-btn.service` to free the pads, then `cd ~/vdmf &&
+      ./tools/soc_log.py --yes --minutes 20 --buttons --lcd` by hand (or drop
+      `--buttons`, add `--mark-every 15`, and keep wall-clock notes — toggles
+      are 30 s apart). `sudo systemctl start voltdmf-btn.service` after.
+
+**Toggle sequence** (car in READY, Park; `candump -l` has the whole bus):
+
+- [ ] Tap **A**, note wall-clock. Set the menu to **8 A**, hold 30 s.
+- [ ] Tap **A**, toggle **8 → 12 A**, hold 30 s.
+- [ ] Tap **A**, toggle **12 → 8 A**, hold 30 s.
+- [ ] Tap **A**, toggle **8 → 12 A**, hold 30 s.
+- [ ] Tap **A**, toggle **12 → 8 A**, hold 30 s.
+- [ ] Tap **A**, toggle **8 → 12 A**, hold 30 s. **Leave it at 12 A** for the
+      revert test.
+
+**Park-exit revert test** (foot on brake, parking brake still set):
+
+- [ ] Tap **A**, shift **P → R**, hold 5 s, shift **R → P**. Read the
+      center stack: did the rate drop to **8 A**?
+- [ ] Tap **A**. If it reverted, set **12 A** again, then shift **P → D**,
+      hold 5 s, **D → P**. Note whether D behaves like R.
+- [ ] Tap **A** twice to bracket the end, then stop the capture (Ctrl-C, or
+      hold **both** buttons 3 s).
+
+**If plugged in** (only if the pack still accepts a trickle):
+
+- [ ] Before stopping, with the EVSE energized: tap **A**, toggle **8 ↔ 12 A**
+      once each way holding 60 s, and note the EVSE's displayed current — this
+      catches the live charge-current *command* frames (LBC ↔ EVSE), separate
+      from the HMI setpoint.
+
+**Analysis** (back at a keyboard):
+
+- [ ] `./tools/mine_capture.py <capture> --shift-window <first A tap>
+      <last A tap>` — lists IDs that took a small number of discrete payloads
+      in the window and prints every transition.
+- [ ] The **setpoint frame** is the ID that changes at *every* A-tap toggle
+      and *only* at toggles. Expect a byte flipping `0x08`↔`0x0C` (amps) or
+      `0x28`↔`0x3C` (40↔60 in 0.2 A units). Note ID / offset / encoding and
+      whether a rolling counter or checksum byte moves with it.
+- [ ] **Park-exit test:** did that frame snap to the 8 A value exactly when
+      `0x1F5` byte 3 left `0x01` (Park)? If yes → the revert is bus-visible
+      and Park-gated (good — a single post-revert re-assert will hold 12 A).
+      If it did **not** revert while unplugged → the revert may only fire
+      with a charge active; record that as a caveat for the injector design.
 - [ ] Record in `docs/signals-confirmed.md` → "Charge current setpoint"
-      (stays NOT CONFIRMED until an injection test); leave injection +
-      Park-exit re-assert for a later dedicated session
+      (ID / byte / encoding / counter). Stays **NOT CONFIRMED** until an
+      injection test.
+
+**Next (a later Phase C.5-style session):** inject the 12 A value in Park,
+measure how fast the HMI re-asserts (single shot vs continuous TX), then add
+the Park-exit re-assert. Same `--dry-run` gate, error-frame watch and DTC
+scan as mode injection.
 
 ### Phase C deliverable (back at a keyboard)
 
