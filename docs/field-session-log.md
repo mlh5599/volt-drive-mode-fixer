@@ -6,7 +6,7 @@ decoded-signal reference). Newest session first.
 
 ---
 
-## Session 8 — 2026-08-30 (in-car — full-drain SOC drive captured + analysed; SOC narrowed to 3 candidates, still no scale; speed/accel logging fixed; wiki cross-check)
+## Session 8 — 2026-08-30 (in-car — full-drain SOC drive captured + analyzed; SOC narrowed to 3 candidates, still no scale; speed/accel logging fixed; wiki cross-check)
 
 The SOC discharge drive finally happened. One continuous highway run took
 the gauge from **10/10 → 0/10**; all ten bar-drops were hand-marked on the
@@ -41,14 +41,14 @@ barely moves.
 - **No absolute scale.** No reading at a known SOC was logged, so none of
   these can be turned into `SOC_KWH_PER_COUNT` yet.
 - **Charge-mode 8/12 A toggles not captured** — the car left Park at +15.7 s,
-  before any toggling. Deprioritised (owner's call).
+  before any toggling. Deprioritized (owner's call).
 
-Visual write-up — normalised overlay, per-bar table, timer-rejection
+Visual write-up — normalized overlay, per-bar table, timer-rejection
 scorecard, native-scale shapes, speed trace — is in the repo at
 [`analysis/session8-soc-candidates.md`](analysis/session8-soc-candidates.md)
 (charts regenerable from the capture via `tools/soc_report.py`):
 
-![Session-8 SOC candidates: normalised completion of every candidate and
+![Session-8 SOC candidates: normalized completion of every candidate and
 rejected timer on one axis, with speed and the ten gauge-bar drops](analysis/img/session8-overlay.svg)
 
 ### GM Volt reverse-engineering wiki cross-check
@@ -63,7 +63,7 @@ IDs against the capture (`tools/` scratch script `wikichk.py`):
   literal `0x1580` for 90 km/h is a typo — 90 km/h is 5760 counts). Verified
   against the capture: ~0 at rest, ~63 mph highway cruise, dip to ~8 mph at
   the turnaround (**+1240 s** — this is the real turnaround; an earlier
-  analysis draft had mislabelled it +830–990 s). Bytes 2 & 6 are a
+  analysis draft had mislabeled it +830–990 s). Bytes 2 & 6 are a
   mux/rolling counter; bytes 0–1 hold the speed word regardless.
 - **Diagnostic SOC exists as a poll, not a broadcast:** `22 005B`
   "Hybrid/EV Battery Pack Remaining Charge", `X·100/255` %, 1 byte, mode-22
@@ -188,7 +188,7 @@ worked in the car.**
 **Round 3 — `55fe176` (stop gesture no longer leaks a gauge move).** You
 can't press both pads on the same millisecond, so whichever landed first
 fired its `when_pressed` (`GAUGE-UP`/`DOWN`) before the hold-both stop was
-recognised — every stop left a stray gauge line just before `END`. Dropped
+recognized — every stop left a stray gauge line just before `END`. Dropped
 the callbacks: the main loop's `tick()` (~5 Hz) reads both pads by
 `is_pressed` edge and commits a tap only on *release*, and only if the other
 pad was never down during that press. A staggered two-button hold now
@@ -421,7 +421,7 @@ Output pulled home: `vdmf-drivelog-20260829-185232.log` (event log),
    drift toward NORMAL within ~1 min parked) hold fine while moving.
 
 2. **The HOLD walk needed 4 taps** (cold-menu `index+1`) while SPORT /
-   MOUNTAIN / NORMAL took 1 (warm behaviour) at near-identical idle gaps.
+   MOUNTAIN / NORMAL took 1 (warm behavior) at near-identical idle gaps.
    Menu-open state isn't fully predictable on the road; the closed loop
    absorbed it every time. `presses_to_reach` stays a dry-run planner only.
 
@@ -433,7 +433,7 @@ Output pulled home: `vdmf-drivelog-20260829-185232.log` (event log),
    Wrote `decode_shift()`, flipped `shift` → `0x1F5` / `confirmed=True`.
 
 4. **SOC — still open.** `tools/mine_capture.py --monotonic` over the full
-   capture found only artefacts: `0x97` (multiplexed frame, mux-blend),
+   capture found only artifacts: `0x97` (multiplexed frame, mux-blend),
    `0x4C5` byte 2 (2-state flag `0xDD`/`0x49`), `0xB9` (mux counter). The
    dash has no % and 9 minutes barely moves the coarse battery bar. Needs a
    longer discharge drive; the SOC-focused rewrite of `drive_log.py`
@@ -683,7 +683,7 @@ also means "reset to NORMAL" for the daemon is a *single* isolated press.
 | `voltdmf/signals.py` | `drive_mode_button` addr `0x1F4` → `0x1E1`, `confirmed=False`, note rewritten (address confirmed, injection efficacy still unproven). `drive_mode_status` `0x1F4` `confirmed=True` unchanged. |
 | `tools/inject_test.py` | Rebuilt around the menu-walk model: `--target <mode>` / `--cycle`, `--walk-gap`, `--commit` (polls `0x1F4`), `--frames`, `--repeat`. Old `--steps` / `--rate-hz` / `--burst-ms` removed. |
 
-Local `pytest`: **59 passed**. No signal-decode behaviour changed, so no test
+Local `pytest`: **59 passed**. No signal-decode behavior changed, so no test
 edits were needed.
 
 ### Next session — pick up here
@@ -960,7 +960,7 @@ So on the drive itself, only steps 1 and 3–6 remain.
    `decode_soc` + wire it into `_DecodeListener` / `is_signal_frame`, and
    record the ID/offset/scale here.
 6. Same drive, spare time: run `tools/ignition_check.py` at engine-off to
-   settle the ignition-behaviour question (bus-quiet delay, mode persistence
+   settle the ignition-behavior question (bus-quiet delay, mode persistence
    across a key cycle).
 
 ### Deferred — stationary injection validation (burst-and-release)
@@ -1013,7 +1013,7 @@ SOC hunt either way.
   default (`allow_unknown_shift=False`, commit `4013ea3`). `0x135` byte 0
   also tracks the shifter but with a messier non-sequential encoding — left
   undecoded.
-- **Ignition behaviour** — does the bus go quiet with the car off and how
+- **Ignition behavior** — does the bus go quiet with the car off and how
   long after; is the drive mode remembered or reset to NORMAL on restart.
   Run `tools/ignition_check.py`.
 

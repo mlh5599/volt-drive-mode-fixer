@@ -75,7 +75,7 @@ def main() -> None:
     ap.add_argument("--stop-hold", type=float, default=3.0, metavar="SECS",
                     help="report when BOTH are held this long (0 = off)")
     ap.add_argument("--seconds", type=float, default=30.0,
-                    help="run this long then summarise (default 30)")
+                    help="run this long then summarize (default 30)")
     ap.add_argument("--scan", action="store_true",
                     help="ignore --button-*-gpio: watch every free BCM line "
                          "and report any that change (finds miswired pins)")

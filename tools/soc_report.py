@@ -3,7 +3,7 @@
 
 Read-only, stdlib only, no CAN hardware. Turns a discharge-drive capture
 (``candump -l`` log + the matching ``soc_log.py`` event log) into committable
-artefacts under ``docs/analysis/`` -- so the visual write-up lives in the
+artifacts under ``docs/analysis/`` -- so the visual write-up lives in the
 repo as Markdown + images, not as a hosted link.
 
 Two phases, run together or apart:
@@ -14,7 +14,7 @@ Two phases, run together or apart:
                the timer-rejection correlation, write --data <json>.
 
   render    --data <json> --out-dir <dir>
-            -> write overlay.svg (normalised completion of every field on
+            -> write overlay.svg (normalized completion of every field on
                one axis, speed + gauge-drops + turnaround for context) and
                native.svg (each candidate on its own raw scale).
 
@@ -332,7 +332,7 @@ def svg_overlay(d: dict, W: int = 920, H: int = 470) -> str:
         ly += 34
 
     out.append(f'<text x="{x0}" y="{y1 - 6}" fill="{INK}" font-size="11">'
-               f'Every field normalised to its own full-drive travel '
+               f'Every field normalized to its own full-drive travel '
                f'(0 % start &#8594; 100 % end)</text>')
     out.append("</svg>")
     return "\n".join(out)
@@ -351,7 +351,7 @@ def svg_native(d: dict, W: int = 920) -> str:
            f'<rect width="{W}" height="{H}" fill="{BG}"/>',
            f'<text x="{x0}" y="15" fill="{INK}" font-size="11">'
            f'Each candidate on its own raw scale &#8212; the actual shape, '
-           f'not normalised</text>']
+           f'not normalized</text>']
     for i, s in enumerate(cands):
         top = mT + i * (rowH + gap)
         bot = top + rowH

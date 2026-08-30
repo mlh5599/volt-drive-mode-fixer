@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 516" font-family="IBM Plex Sans, -apple-system, Segoe UI, sans-serif" font-size="12">
 <rect width="920" height="516" fill="#12151b"/>
-<text x="58" y="15" fill="#c9d3e0" font-size="11">Each candidate on its own raw scale &#8212; the actual shape, not normalised</text>
+<text x="58" y="15" fill="#c9d3e0" font-size="11">Each candidate on its own raw scale &#8212; the actual shape, not normalized</text>
 <rect x="58" y="24" width="842" height="96" fill="#171b22"/>
 <line x1="198.4" y1="24" x2="198.4" y2="120" stroke="#c9d3e0" stroke-opacity="0.22" stroke-dasharray="2 3"/>
 <line x1="291.5" y1="24" x2="291.5" y2="120" stroke="#c9d3e0" stroke-opacity="0.22" stroke-dasharray="2 3"/>

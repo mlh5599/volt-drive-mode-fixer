@@ -130,7 +130,7 @@ elapsed-time counters (`0x4CB`/`0x3DD`/`0x137`/`0x4E9`). **No scaling anchor
 was logged** (no reading at a known SOC), so `signals.py` is untouched. GM
 Volt RE wiki carries battery charge % only as diagnostic PID `22 005B`
 (`X·100/255`). Detail: `docs/field-session-log.md` Session 8 + the visual
-write-up (normalised overlay, per-bar table, timer-rejection scorecard,
+write-up (normalized overlay, per-bar table, timer-rejection scorecard,
 native-scale shapes) in [`analysis/session8-soc-candidates.md`](analysis/session8-soc-candidates.md)
 — charts regenerable from the capture via `tools/soc_report.py`.
 
@@ -182,7 +182,7 @@ native-scale shapes) in [`analysis/session8-soc-candidates.md`](analysis/session
       from the raw value at the 2-bar / 3-bar crossings; record
       ID/offset/scale in `signals-confirmed.md`.
 
-### 2c · Ignition behaviour  ⚠️ not started — needs a drive/ignition cycle
+### 2c · Ignition behavior  ⚠️ not started — needs a drive/ignition cycle
 
 - [ ] `tools/ignition_check.py` across: on → set drive mode to something
       non-default → off → wait 2 min → on
@@ -199,7 +199,7 @@ P-R-N-D-L.
 - [ ] With `candump can0,135:7FF` (then `1F5:7FF`) running, move P → R → N → D →
       L and record the byte/value per position
 
-### 2e · Charge-current setpoint — force 12 A Level 1  💤 deferred (owner deprioritised 2026-08-30) — kept for a later dedicated capture
+### 2e · Charge-current setpoint — force 12 A Level 1  💤 deferred (owner deprioritized 2026-08-30) — kept for a later dedicated capture
 
 Why: the center-stack 8 A → 12 A charge-rate setting reverts to 8 A every time
 the car leaves Park. The owner only ever charges on a known-good home circuit,

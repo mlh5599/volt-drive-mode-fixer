@@ -10,7 +10,7 @@ it to three energy-linked broadcast candidates — `0x3E3` b0/b1/b6, `0x228`
 b2, `0x186` b6 — and excluded four elapsed-time counters, but logged no
 reading at a known SOC, so none can be scaled yet. See the "SOC" section
 below, `docs/field-session-log.md` Session 8, and
-`docs/analysis/session8-soc-candidates.md`. Ignition behaviour is still
+`docs/analysis/session8-soc-candidates.md`. Ignition behavior is still
 unobservable (key-off kills Pi power).
 
 **Session-4 milestone (2026-08-29, first drive):** `tools/drive_log.py` ran
@@ -43,7 +43,7 @@ a checked-in file.
 - `0x206` **never appears** on this bus (re-confirmed 0 frames in the
   Session-8 213 MB capture). The Gen-2 SOC ID is wrong for Gen 1.
 - **Session 4** (9-minute drive): `mine_capture.py --monotonic` surfaced only
-  artefacts (`0x97` mux blend, `0x4C5` b2 2-state flag, `0xB9` mux counter) —
+  artifacts (`0x97` mux blend, `0x4C5` b2 2-state flag, `0xB9` mux counter) —
   too short to move the coarse battery bar.
 - **Session 8** (full-drain drive, 10/10 → 0/10, all ten bar-drops
   hand-marked): a **timer-rejection test** (per-segment value-delta vs
@@ -264,7 +264,7 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
   default and the daemon takes it, so injection is blocked on UNKNOWN / short
   `0x1F5` as well as on any non-DRIVE detent.
 
-## Ignition behaviour (from `ignition_check.py`)  (NOT CONFIRMED)
+## Ignition behavior (from `ignition_check.py`)  (NOT CONFIRMED)
 
 - Bus goes quiet with car off? `yes / no`
 - Mode resets to NORMAL on ignition, or remembered? `______`

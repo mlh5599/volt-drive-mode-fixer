@@ -31,7 +31,7 @@ Three things it gathers:
    as you drive, and align it to the capture offline. Take the battery from
    near full to well down so the SOC frame has a clear trend to find.
 
-NOT covered: ignition behaviour. Key-off kills power to the Pi, so it can't
+NOT covered: ignition behavior. Key-off kills power to the Pi, so it can't
 observe an ignition cycle -- that stays a separate manual check.
 
 Mine the capture afterward with tools/mine_capture.py (monotonic-frame scan

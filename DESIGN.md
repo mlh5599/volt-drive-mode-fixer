@@ -1,14 +1,15 @@
 # Volt Drive Mode Fixer — Design
 
-**Status (2026-08-30):** built and deployed on the Pi (`voltpi`); field
-testing (Phase C). Mode-button input (`0x1E1`), current-mode status
-(`0x1F4` byte 1) and shift/PRNDL (`0x1F5` byte 3) are all confirmed on-road,
-and the closed-loop menu walk has an owner-confirmed on-road PASS. **SOC is
-the one signal still open** (Session-8 drive narrowed it to three broadcast
-candidates, no scaling anchor yet — see "Open items") and the last blocker on
-a non-dry-run daemon; the level-triggered reconciler in "Mode policy" is
-designed but not yet implemented, blocked on the same calibration. Next field
-test: the Session-9 SOC anchor drive (`docs/phase-c-field-checklist.md` §2b).
+**Status (2026-08-30):** deployed on the Pi (`voltpi`), field testing (Phase
+C), `--dry-run`. Mode-button input (`0x1E1`), current-mode status (`0x1F4`
+byte 1) and shift/PRNDL (`0x1F5` byte 3) are confirmed on-road; the
+closed-loop menu walk has an on-road PASS. **SOC is the one open signal** and
+the last blocker on a non-dry-run daemon — narrowed to three broadcast
+candidates, not yet scaled to a percentage. The level-triggered reconciler in
+"Mode policy" is designed but not yet implemented, blocked on the same
+calibration. Progress and per-drive procedures live in
+`docs/phase-c-field-checklist.md`; the on-vehicle narrative in
+`docs/field-session-log.md`.
 
 ## Problem
 
@@ -28,11 +29,10 @@ low enough to cause the problem.
   reduced-propulsion mode.
 - **DR2 — Drive toward a chosen mode each drive cycle.** On every drive cycle
   (ignition on) hold a selected mode (MOUNTAIN or, by default, the SOC-HOLD
-  floor). Originally framed as a one-shot "on-start trigger"; now the
-  reconciler's setpoint — see "Mode policy".
+  floor). Realized as the reconciler's setpoint — see "Mode policy".
 - **DR3 — SOC floor.** When SOC drops to a configurable percentage, switch to
-  Hold Mode and keep it there until the pack recovers. Originally a separate
-  "SOC-threshold trigger"; now the always-on floor in "Mode policy".
+  Hold Mode and keep it there until the pack recovers. Realized as the
+  always-on floor in "Mode policy".
 - **DR4 — Off-the-shelf hardware preferred.** Favor a proven, reusable CAN
   interface over custom PCB/firmware design; hobbyist-level electronics
   work (soldering, wiring, light scripting) is acceptable where needed.
@@ -72,15 +72,13 @@ per mode. See "Mode policy" and "Software architecture" below.
 
 ## Mode policy — continuous reconciler
 
-> **Model change (2026-08-30).** The original two edge-triggered strategies
-> (*on-start → Mountain*, *SOC-threshold → Hold*) are replaced by a single
-> **level-triggered reconciler**. Rationale: ignition is effectively always
-> on (the Pi only has power while the car runs), so there is no ignition edge
-> to trigger on, and an edge-triggered switch does nothing if the driver
-> later bumps the mode by hand or a switch doesn't take. A reconciler that
-> continuously drives the car toward a *desired* mode is simpler and
-> self-healing. DR2/DR3 still hold — the reconciler satisfies both — but they
-> are no longer separate configurable triggers.
+> **Why a reconciler, not edge triggers.** Ignition is effectively always on
+> (the Pi only has power while the car runs), so there is no ignition edge to
+> trigger on, and an edge-triggered switch does nothing if the driver later
+> bumps the mode by hand or a switch doesn't take. A single
+> **level-triggered reconciler** that continuously drives the car toward a
+> *desired* mode is simpler and self-healing, and satisfies both DR2 and DR3
+> without separate configurable triggers.
 
 **Desired mode = f(setpoint, SOC).** One loop pass computes the mode the car
 *should* be in; if `state.drive_mode` (read from `0x1F4` byte 1) differs, it
@@ -164,10 +162,10 @@ layer of defense.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus** (2026-08-29; re-confirmed 0 frames in the Session-8 213 MB full-drain capture). Session-8 analysis narrowed it to three energy-linked broadcast candidates (`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6) and excluded four elapsed-time counters. No raw→% anchor yet. The GM Volt RE wiki carries battery charge % only as diagnostic PID `22 005B` (`X·100/255`); the Session-9 anchor drive polls it (`soc_log.py --diag-soc`) for continuous ground-truth to scale the candidates against. See "Open items", `docs/field-session-log.md` Session 8, and `docs/analysis/session8-soc-candidates.md`. Until a candidate is calibrated the reconciler's SOC-HOLD floor cannot engage. |
+| EV battery SOC | open | **`0x206` (the Gen 2 candidate) is not on this bus.** Narrowed to three energy-linked broadcast candidates (`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6); no raw→% scaling anchor yet. Battery charge *percent* is available only as diagnostic PID `22 005B` (`X·100/255`), not a broadcast field. Until a candidate is calibrated the reconciler's SOC-HOLD floor cannot engage — see "Open items" and `docs/phase-c-field-checklist.md` §2b. |
 | Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. This is the one frame the project transmits — `voltdmf/canio.send_mode_button_press()` (tracking-echo press). |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
-| Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki and cross-checked against the Session-8 full-drain capture (~0 at rest, ~63 mph cruise, ~8 mph at the turnaround); not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` now logs it plus a derived accel). |
+| Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki, cross-checked against a full-drain capture; not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` logs it plus a derived accel). |
 | Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Used as a safety precondition — `SafetyGate` blocks injection unless in DRIVE (and blocks on UNKNOWN / short frame). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** Use SOC (message ID still to be found on this bus) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
@@ -431,50 +429,36 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 
 ## Open items
 
-### Resolved on-vehicle (2026-08-29, Gen 1, HS-CAN 500k)
+### Resolved on-vehicle (Gen 1, HS-CAN 500k)
 
 Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 
-- **Mode-cycle button press → `0x1E1` byte 4 bit 7.** Same ID/bit as the Gen 2
-  prior art. The tracking-echo injection (`voltdmf/canio.send_mode_button_press`)
-  drove a closed-loop walk to all four modes on the road, each holding while
-  moving. (Bench re-validation of the later burst-and-release refactor is the
-  one remaining injection check — see `docs/field-session-log.md`.)
+- **Mode-cycle button press → `0x1E1` byte 4 bit 7** — same ID/bit as the Gen
+  2 prior art; the one frame the daemon transmits. Drove a closed-loop walk
+  to all four modes on the road.
 - **Current drive mode → `0x1F4` byte 1** (`0x00`/`0x80`/`0x20`/`0x08` =
-  N/S/M/H). The mode-cycle controller reads this directly as its
-  current-mode source; the press-counting fallback is retired, and no
-  indirect-inference fallback is needed. byte 4 gives a live menu cursor used
-  to close the loop on a walk.
-- **Ignition/drive-cycle start** — no dedicated signal needed, and no longer
-  used as a trigger. The Pi is powered whenever the car is usable, and the
-  reconciler is level-triggered, so there is no ignition edge to catch.
+  N/S/M/H) — the daemon's current-mode source. byte 4 is a live menu cursor
+  used to close the loop on a walk.
 - **Shift/PRNDL → `0x1F5` byte 3** (`1`–`5` = P/R/N/D/L). `SafetyGate` blocks
-  injection unless in DRIVE and blocks on UNKNOWN.
+  injection unless in DRIVE, and blocks on UNKNOWN.
+- **Ignition/drive-cycle start** — no dedicated signal needed. The Pi is
+  powered only while the car is usable and the reconciler is level-triggered,
+  so there is no ignition edge to catch.
 
-### Still open (need a real discharge drive)
+### Still open (needs a discharge drive)
 
-- **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) never appears on
-  this Gen 1 bus — re-confirmed absent (0 frames) in the Session-8 213 MB
-  full-drain capture. That drive (`docs/field-session-log.md` Session 8;
-  visual analysis in `docs/analysis/session8-soc-candidates.md`, charts
-  regenerable from the capture via `tools/soc_report.py`)
-  narrowed it to three energy-linked broadcast candidates — `0x3E3` bytes
+- **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) is not on this
+  bus. Narrowed to three energy-linked broadcast candidates — `0x3E3` bytes
   0/1/6 (triple-redundant, best timer rejection), `0x228` byte 2 (cleanest
-  but coarse ≈ 1.5 counts/bar), `0x186` byte 6 (fine but noisy) — and
-  positively excluded four elapsed-time counters (`0x4CB`, `0x3DD`, `0x137`,
-  `0x4E9`) that had fooled earlier `--monotonic` runs. **No absolute scaling
-  anchor yet:** no reading at a known SOC was logged. The GM Volt
-  reverse-engineering wiki lists battery charge *percent* only as a
-  diagnostic PID (`22 005B`, `X·100/255`), not a broadcast field, so a clean
-  filtered SOC may be poll-only. Next drive (see `docs/phase-c-field-checklist.md`
-  §2b) starts at a full charge + ~2 min idle to pin the "100 %" raw value,
-  then holds a steady pace to the 2-bar mark and runs ~10 min in HOLD for a
-  charge-sustaining second anchor — with `soc_log.py --diag-soc` polling
-  `22 005B` throughout for a continuous known-SOC reference to fit the
-  broadcast candidates against (that poll is now part of the run, not
-  optional; it is the tool's one transmit path). Each capture line also
-  carries every candidate's raw byte. The reconciler's SOC-HOLD floor cannot
-  engage until this lands — it is the last blocker on a non-dry-run daemon.
+  but coarse ≈ 1.5 counts/bar), `0x186` byte 6 (fine but noisy) — with four
+  elapsed-time counters positively excluded. **No raw→% scaling anchor yet:**
+  no reading at a known SOC has been logged, and battery charge *percent* is
+  available only as diagnostic PID `22 005B` (`X·100/255`), not a broadcast
+  field. The calibration drive (`docs/phase-c-field-checklist.md` §2b) pins
+  the endpoints from a full-charge idle and a charge-sustaining HOLD segment,
+  with `soc_log.py --diag-soc` polling `22 005B` throughout as a continuous
+  known-SOC reference. The reconciler's SOC-HOLD floor cannot engage until
+  this lands — it is the last blocker on a non-dry-run daemon.
 
 ### Deferred (not blocking)
 
@@ -506,7 +490,7 @@ continuous TX vs a single post-revert shot. Discovery piggybacks on the SOC
 discharge drive — see the charge-mode prelude in
 `docs/phase-c-field-checklist.md` §2e. The forced 8 A revert lands on the
 same timestamp as `0x1F5` byte 3 leaving `0x01` (Park), which hands the
-offline analysis a free labelled edge to correlate against.
+offline analysis a free labeled edge to correlate against.
 
 Safety: 12 A at 120 V is 1.44 kW — within the car's own menu option and the
 Lear charger's ~12.7 A ceiling. The only real-world caveat (the wall circuit

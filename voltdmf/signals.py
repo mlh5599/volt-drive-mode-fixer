@@ -216,7 +216,7 @@ MENU_OPEN_BIT = 0x80
 def decode_drive_mode(data: bytes) -> DriveMode | None:
     """Latched drive mode from byte 1 of frame 0x1F4.
 
-    Returns ``None`` for a short frame or an unrecognised byte-1 value.
+    Returns ``None`` for a short frame or an unrecognized byte-1 value.
     Bytes 4-5 (menu cursor / open flag) are intentionally ignored -- byte 1
     holds the *committed* mode steady even mid-walk.
     """
@@ -232,7 +232,7 @@ def decode_menu_cursor(data: bytes) -> DriveMode | None:
     ~40 ms behind the tap -- unlike :func:`decode_drive_mode`, which only
     moves on the commit ~3 s later. Use it to close the loop on a menu walk.
 
-    Returns ``None`` for a short frame or an unrecognised value. A ``0x00``
+    Returns ``None`` for a short frame or an unrecognized value. A ``0x00``
     result is ``NORMAL`` but is also what an idle/closed frame carries, so
     only trust it in the window just after a tap.
     """

@@ -22,7 +22,7 @@ Type=simple
 # gpiozero + lgpio on this Pi. The daemon venv has python-can and NO gpiozero.
 # (pi-deploy notes, "Python split on the Pi".)
 #
-# Contract the helper script is expected to honour:
+# Contract the helper script is expected to honor:
 #   * owns SW1 (BCM 24) + SW2 (BCM 23), internal pull-ups, ~50 ms debounce,
 #     whenever no capture is running
 #   * gesture map:

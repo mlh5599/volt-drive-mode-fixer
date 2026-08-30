@@ -73,7 +73,7 @@ class Command:
 def inherited_listener() -> socket.socket | None:
     """Return the systemd-passed listening socket (fd 3), or ``None``.
 
-    Follows the ``sd_listen_fds`` contract: honour the handoff only when
+    Follows the ``sd_listen_fds`` contract: honor the handoff only when
     ``$LISTEN_PID`` names *this* process, take the first fd, and clear the
     environment so a fork/exec child cannot re-inherit the claim.
     """

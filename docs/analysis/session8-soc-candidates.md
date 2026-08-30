@@ -49,7 +49,7 @@ axis, with vehicle speed and the ten gauge-bar drops for
 context](img/session8-overlay.svg)
 
 Every candidate visibly **flattens through the mid-drive turnaround**
-(≈ +1240 s, where the car slowed to ~8 mph to reverse direction — grey band)
+(≈ +1240 s, where the car slowed to ~8 mph to reverse direction — gray band)
 and **steepens again afterward**. The two timers march straight through it at
 a constant slope. The faint stepped dots are the "equal energy per bar"
 expectation — a true SOC trace should pass close to them.
@@ -92,7 +92,7 @@ amount (`0x3E3` −4, `0x228` −2, `0x186` −5).
 
 ## Native scale — the actual shapes
 
-![Each candidate drawn on its own raw-value scale, unnormalised, with the
+![Each candidate drawn on its own raw-value scale, unnormalized, with the
 gauge-bar drops marked](img/session8-native.svg)
 
 `0x3E3` b0/b1/b6 carry the **same value** frame to frame (a built-in
