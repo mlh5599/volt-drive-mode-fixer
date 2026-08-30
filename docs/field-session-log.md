@@ -678,10 +678,12 @@ is the fix for both our symptoms:
   flipped `True` → `False`. `decode_shift` (`0x1F5` byte 3) is confirmed, so
   an `UNKNOWN` shift now means a short/garbled frame and blocks injection.
   Bench rigs without a `0x1F5` stream pass `allow_unknown_shift=True`.
-- ⬜ homelab-ansible `roles/voltdmf`: change
-  `templates/voltdmf-can0-up.service.j2` to `restart-ms 100` and add a
-  `voltdmf_can_restart_ms` default — an in-car CAN device must self-recover
-  from BUS-OFF.
+- ✅ **DONE — homelab-ansible `onboard-voltpi` @ `665ed5d`.**
+  `voltdmf-can0-up.service.j2` now sets `restart-ms {{ voltdmf_can_restart_ms }}`
+  on the `type can` line; new `voltdmf_can_restart_ms: 100` default. Applies
+  on the next `make voltpi` converge (the template task already notifies
+  "Restart voltdmf can0-up"). Until then, bring the bus up by hand with
+  `restart-ms 100` as in the road-test steps above.
 - ⬜ Once injection passes: bump `voltdmf_version` in
   `inventories/production/host_vars/voltpi.haguehome.lan/vars.yml` to the
   confirmed-signals commit. Keep `voltdmf_dry_run: true`.
