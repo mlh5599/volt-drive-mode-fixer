@@ -1,23 +1,26 @@
 # Confirmed CAN signals (Gen 1 Chevy Volt, this vehicle)
 
-**Status (2026-08-29, session 4 — first drive): the drive-mode fix is
-validated on-road.** `tools/drive_log.py` ran unattended through a 9-minute
-drive: the closed-loop injection (`0x1E1` tracking echo) walked to all four
-modes, each **committed in 2.8 s and held the full 90 s while moving**
-(21–51 mph), `can0` ERROR-ACTIVE throughout. Confirmed twice over — the
-daemon's own `0x1F4` byte-1 readback and an independent mine of the raw
-`candump` capture both show byte 1 latched at N/S/M/H for each 90 s block.
-This closes the open question from session 3: MOUNTAIN and HOLD, which drift
-toward NORMAL within ~1 min *parked*, do **not** revert while moving. The
-parked reversion is a stationary-only behaviour.
+**Status (2026-08-30, through session 8):** `drive_mode_button` (`0x1E1`),
+`drive_mode_status` (`0x1F4` byte 1) and `shift`/PRNDL (`0x1F5` byte 3) are
+`confirmed=True` in `voltdmf/signals.py` and validated on-road; `0x1F4` byte 1
+is the daemon's current-mode source and `SafetyGate` runs with
+`allow_unknown_shift=False`. **SOC is the one signal still open.** The
+Session-8 full-drain drive (10/10 → 0/10, all bar-drops hand-marked) narrowed
+it to three energy-linked broadcast candidates — `0x3E3` b0/b1/b6, `0x228`
+b2, `0x186` b6 — and excluded four elapsed-time counters, but logged no
+reading at a known SOC, so none can be scaled yet. See the "SOC" section
+below, `docs/field-session-log.md` Session 8, and
+`docs/analysis/session8-soc-candidates.md`. Ignition behaviour is still
+unobservable (key-off kills Pi power).
 
-`drive_mode_button` (`0x1E1`), `drive_mode_status` (`0x1F4` byte 1) and
-`shift`/PRNDL (`0x1F5` byte 3, new this session — `1`P `2`R `3`N `4`D `5`L)
-are now `confirmed=True` in `voltdmf/signals.py`. **SOC is still open** — the
-monotonic-frame scan over this capture found only mux-blend / 2-state-flag
-artefacts; the dash shows no %, and 9 minutes is too short to move the
-coarse battery bar. Needs a longer discharge drive. Ignition behaviour is
-still unobservable (key-off kills Pi power).
+**Session-4 milestone (2026-08-29, first drive):** `tools/drive_log.py` ran
+unattended through a 9-minute drive: the closed-loop injection (`0x1E1`
+tracking echo) walked to all four modes, each **committed in 2.8 s and held
+the full 90 s while moving** (21–51 mph), `can0` ERROR-ACTIVE throughout.
+Confirmed twice over — the daemon's own `0x1F4` byte-1 readback and an
+independent mine of the raw `candump` capture. This closed the session-3 open
+question: MOUNTAIN and HOLD, which drift toward NORMAL within ~1 min *parked*,
+do **not** revert while moving.
 
 This file is the Phase C deliverable (DESIGN.md). Fill it in from the
 `tools/` output, then update `voltdmf/signals.py` / `voltdmf/canio.py` and
@@ -35,30 +38,47 @@ a checked-in file.
 | Tool used | `candump -l` + `tools/analyze` offline scan; `tools/mode_diff.py` / `cycle_modes.py` earlier (inconclusive on a running car) |
 | Method | 20 s stationary dwell per mode (Park, brake set) + 5 timestamped taps, one candump log, per-byte "steady within a mode / differs across modes" scan |
 
-## SOC -- `0x206`  (NOT CONFIRMED — still open after session 4)
+## SOC  (NOT CONFIRMED — narrowed to 3 candidates in session 8; still needs a scaling anchor)
 
-- `0x206` **never appears** on this bus. The Gen-2 SOC ID is wrong for Gen 1.
-- Session 4 drive: `tools/mine_capture.py --monotonic` over the full 66 MB
-  capture surfaced no credible battery-energy field. Top hits were all
-  artefacts:
-  - `0x97` — a **multiplexed** frame; the scanner blended muxes into a
-    fake "flat then ramp to exactly 0 at capture end" shape.
-  - `0x4C5` byte 2 — a **2-state flag** (`0xDD`/`0x49`), not a gauge; bucket
-    averaging made it look monotonic.
-  - `0xB9` — a rolling mux counter.
-- Why nothing stuck: this dash has **no SOC %**, only EV-range miles + a
-  coarse battery bar, and a 9-minute drive barely moves one bar. The
-  `SOC-MARK` timeline anchors fired at +60.7, +126, +181, +240, +302, +362,
-  +421, +480, +542 s; the owner's voice memo of range/bars at those marks
-  was not yet transcribed.
-- Next: a **longer discharge drive** (take the pack from near-full to well
-  down) with `tools/soc_log.py`, then re-run `mine_capture.py --monotonic`
-  and anchor the top field against the narrated range/bar readings.
-- Byte layout: `______` (offset, width, endianness)
-- Raw -> value: `______` (scale / offset)
-- Calibration points (raw value : dash EV range mi : battery bars):
+- `0x206` **never appears** on this bus (re-confirmed 0 frames in the
+  Session-8 213 MB capture). The Gen-2 SOC ID is wrong for Gen 1.
+- **Session 4** (9-minute drive): `mine_capture.py --monotonic` surfaced only
+  artefacts (`0x97` mux blend, `0x4C5` b2 2-state flag, `0xB9` mux counter) —
+  too short to move the coarse battery bar.
+- **Session 8** (full-drain drive, 10/10 → 0/10, all ten bar-drops
+  hand-marked): a **timer-rejection test** (per-segment value-delta vs
+  wall-clock duration, over the nine segments between consecutive drops)
+  separated energy-paced fields from elapsed-time counters. Full write-up +
+  regenerable charts: `docs/analysis/session8-soc-candidates.md`.
+  - **Excluded — elapsed-time counters** (`r ≈ 0.85–0.97`): `0x4CB`, `0x3DD`,
+    `0x137`, `0x4E9`. These fooled the earlier `--monotonic` runs.
+  - **SOC candidates** (`r ≈ 0`; all flatten through the mid-drive
+    turnaround):
+    - `0x3E3` **bytes 0/1/6** — triple-redundant 8-bit, 201 → 161 over the
+      drain, `r ≈ 0.00`. Strongest. (`0x3E3` b2 & b4 rise-then-fall →
+      probably pack temperature.)
+    - `0x228` **byte 2** — 96 → 79, `r ≈ −0.14`, cleanest monotonicity but
+      coarse (≈ 1.5 counts/bar).
+    - `0x186` **byte 6** @ 80 Hz — 130 → 63, finest resolution but noisy
+      (±8); briefly regen-ticked *up* at the turnaround.
+    - `0x2C7` b1–2 — V-shaped (sags **and** recovers): pack voltage under
+      load, not a charge count. Excluded.
+- **No scaling anchor yet.** No reading at a known SOC was logged. The GM
+  Volt RE wiki carries battery charge % only as **diagnostic PID `22 005B`**
+  (`raw · 100/255`), not a broadcast field.
+- **Next — the Session-9 anchor drive** (`docs/phase-c-field-checklist.md`
+  §2b): start at a full charge, engine-on Park idle ~2 min (pins the "100 %"
+  raw value), drive a steady pace, then ~10 min in HOLD from the 2-bar mark
+  (charge-sustaining second anchor). `soc_log.py` now stamps every
+  candidate's raw byte on each line and, with `--diag-soc` (its one transmit
+  path, now part of the run), polls `22 005B` every ~10 s for a continuous
+  known-SOC reference to fit against.
+- Chosen candidate: `______`  ·  Byte layout: `______` (offset, width, endianness)
+- Raw -> percent: `______` (scale / offset)  ·  Calibration points (raw : `22 005B` % : bars):
   - `______`
-- => `voltdmf/signals.py`: `SOC_KWH_PER_COUNT = ___`, `GEN1_PACK_USABLE_KWH = ___`
+- => `voltdmf/signals.py`: SOC decode + `soc.confirmed = True`;
+  `hold_threshold_percent` / `hold_reset_percent` from the raw value at the
+  2-bar / 3-bar crossings.
 
 ## Drive-mode button press (TX) -- `0x1E1` byte 4 bit 7  (CONFIRMED 2026-08-29, session 4 — injection PASS on the road)
 
@@ -168,11 +188,16 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
 ### Next
 
 1. ~~Flip `drive_mode_button.confirmed = True`~~ — **done** (session 4).
-2. Wire `0x1F4` into the daemon RX path so `daemon.py` uses `read_drive_mode`
-   as `current_mode_source` and `read_menu_cursor` as `menu_cursor_source`
-   (the closed loop) — the open-loop count is only right from a cold NORMAL.
-   Currently only `set_mode.py` / `drive_log.py` run the closed loop.
-3. OBD-II DTC scan (still owed — no scan tool on the drive).
+2. ~~Wire `0x1F4` into the daemon RX path as the current-mode source~~ —
+   **done** (`4013ea3`): `_DecodeListener` decodes `0x1F4` byte 1 into
+   `state.drive_mode`, the daemon's `current_mode_source` is
+   `lambda: state.drive_mode`, and `PressCountingModeTracker` was removed.
+3. ~~`SafetyGate(allow_unknown_shift=False)` in the daemon~~ — **done**
+   (`4013ea3`): that is now the `SafetyGate` default and the daemon takes it.
+4. OBD-II DTC scan (still owed — no scan tool on the drive).
+5. **SOC** — the Session-9 anchor drive (see the "SOC" section above), then
+   set the decode + thresholds in `voltdmf/signals.py`. Last blocker on a
+   non-dry-run daemon.
 
 ### `voltdmf/modecycle.py` state (session 3)
 
@@ -204,8 +229,9 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
 - Secondary cross-check: `0x287` byte 1 also tracks mode (`00`/`80`/`08`/`10`).
   `0x3D1` byte 0 only separates SPORT (`0x41`) / MOUNTAIN (`0x21`) -- ignore.
 - Implemented: `voltdmf/signals.decode_drive_mode()` (byte 1 lookup).
-- TODO: wire it as `current_mode_source` in `voltdmf/daemon.py` (replacing the
-  press-counting tracker) and add `0x1F4` to `is_signal_frame` / the RX listener.
+- **Wired into the daemon** (`4013ea3`): `_DecodeListener` decodes `0x1F4`
+  byte 1 into `state.drive_mode`; the daemon's `current_mode_source` reads
+  that; `PressCountingModeTracker` is gone.
 
 ## Shift / PRNDL -- `0x1F5` byte 3  (CONFIRMED 2026-08-29, session 4)
 
@@ -234,10 +260,9 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
 - Implemented: `voltdmf/signals.decode_shift()` (byte-3 lookup),
   `_SHIFT_BY_BYTE3`; `SIGNAL_IDS["shift"]` → `0x1F5`, `confirmed=True`;
   `_ALT_SHIFT_ADDR` → `0x135`. `_DecodeListener` decodes only `0x1F5`.
-- Follow-up: `voltdmf/daemon.py` can now construct
-  `SafetyGate(allow_unknown_shift=False)` once `0x1F5` is confirmed live on
-  the daemon's RX path (it already is in `is_signal_frame`). Left as a
-  deliberate daemon change, not done here.
+- **Done** (`4013ea3`): `allow_unknown_shift=False` is now the `SafetyGate`
+  default and the daemon takes it, so injection is blocked on UNKNOWN / short
+  `0x1F5` as well as on any non-DRIVE detent.
 
 ## Ignition behaviour (from `ignition_check.py`)  (NOT CONFIRMED)
 

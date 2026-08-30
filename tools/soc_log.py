@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended SOC-discovery drive log. PASSIVE -- never transmits.
+"""Unattended SOC-discovery drive log. Passive by default; one opt-in poll.
 
 The Gen 1 dash shows no state-of-charge percentage, only EV range (miles)
 and a 10-increment battery gauge, so SOC cannot be read off one frame
@@ -9,7 +9,16 @@ each gauge increment drops, then find the monotonically-falling field
 offline with ``tools/mine_capture.py --monotonic`` and anchor it to those
 drops.
 
-What it does, all read-only:
+Session 8 narrowed the broadcast SOC field to three energy-linked
+candidates (``0x3E3`` b0/b1/b6, ``0x228`` b2, ``0x186`` b6) but logged no
+reading at a known SOC, so none could be scaled. This tool now stamps
+those candidate raw values on every log line, so a Session-9 anchor drive
+(full charge -> idle -> steady drive -> HOLD) calibrates them straight
+from the capture. ``--diag-soc`` additionally polls the diagnostic charge
+PID for a continuous ground-truth percent -- that is the one transmit
+path; everything else is read-only.
+
+What it does (read-only unless ``--diag-soc`` is given):
 
   * spawns ``candump -l`` for the entire session -> ``candump-<ts>.log``
     (this is the actual data; everything else just helps you align it)
@@ -30,6 +39,17 @@ What it does, all read-only:
     ``candump`` pipe -- purely for context when correlating the SOC
     candidate against load. Decode is cross-checked (wiki + capture) but
     not speedo-verified; accel is a slope over ~1 s of samples, no IMU.
+  * each log line also carries the current raw value of every broadcast
+    SOC candidate (``cand[3E3.0=161 3E3.1=161 3E3.6=160 228.2=79
+    186.6=63]``) from a third passive ``candump`` pipe -- so a mark taken
+    at a known SOC on the next drive pins the raw->% scale
+  * ``--diag-soc`` (ACTIVE TX -- the only transmit path): every
+    ``--diag-soc-every`` s send the UDS ReadDataByIdentifier poll
+    ``22 005B`` ("Hybrid/EV Battery Pack Remaining Charge", raw*100/255 %)
+    and stamp the decoded percent on each line (``soc22=61.2%(0x9C@7EC)``).
+    Default session, mode-22 only -- no session switch, no TesterPresent --
+    so it will not suppress the normal broadcasts. Single ISO-TP frame each
+    way, so it needs only ``cansend`` + a filtered ``candump``.
   * optional: ``--lcd`` mirrors the ``t+<s>`` clock and the live gauge
     level to a SparkFun serial 4x20 (see ``tools/lcd.py``)
 
@@ -47,6 +67,9 @@ Afterwards:
 Usage:
   # 90 min capture, gauge buttons, LCD, SOC-MARK backstop every 2 min
   ./soc_log.py --yes --minutes 90 --buttons --lcd
+
+  # Session-9 anchor drive: also poll the diagnostic charge PID every 10 s
+  ./soc_log.py --yes --minutes 90 --buttons --lcd --diag-soc
 
   # capture + periodic anchors only, no buttons wired
   ./soc_log.py --yes --minutes 60
@@ -74,6 +97,30 @@ from voltdmf.lcd import SerLcd  # noqa: E402
 from voltdmf.signals import SIGNAL_IDS  # noqa: E402
 
 _SPEED_ADDR = SIGNAL_IDS["speed"].addr  # 0x3E9 -- present in the Session-8 capture (10 Hz)
+
+# Broadcast SOC candidates from the Session-8 timer-rejection analysis, as
+# (addr, (byte offsets,)). Logged raw on every line -- passive -- so a mark
+# taken at a known SOC on the next drive calibrates raw->% straight from
+# the capture. 0x3E3 is triple-redundant (b0/b1/b6); require agreement to
+# reject noise once one is picked.
+_SOC_CANDIDATES: tuple[tuple[int, tuple[int, ...]], ...] = (
+    (0x3E3, (0, 1, 6)),
+    (0x228, (2,)),
+    (0x186, (6,)),
+)
+
+# UDS ReadDataByIdentifier for "Hybrid/EV Battery Pack Remaining Charge"
+# (GM Volt RE wiki: 22 005B, value * 100/255 %). Request and response each
+# fit one ISO-TP single frame, so cansend + a filtered candump is enough --
+# no isotp / python-can. Target ECU is not in the wiki table; try the
+# BECM/hybrid id first, then powertrain, and lock onto whichever answers.
+_DIAG_DID = 0x005B
+_DIAG_REQ_CANDIDATES = (0x7E4, 0x7E0)
+
+
+def _uds_soc_percent(raw: int) -> float:
+    """22 005B raw byte -> battery charge percent (raw * 100 / 255)."""
+    return raw * 100.0 / 255.0
 
 
 # -- can0 state (read-only, via iproute2) ---------------------------------
@@ -214,6 +261,191 @@ class SpeedProbe:
             self._proc.kill()
 
 
+# -- broadcast SOC candidates (passive) --------------------------------
+class CandidateProbe:
+    """Latest raw byte value of every broadcast SOC candidate, from a
+    dedicated ``candump`` pipe. Passive -- never transmits. ``fmt()`` gives
+    the ``cand[...]`` tail stamped on every log line; ``snapshot()`` returns
+    ``[("3E3.0", 161), ("228.2", 79), ...]`` (value ``None`` until a frame
+    for that id has landed)."""
+
+    def __init__(self, channel: str, log) -> None:
+        self._proc = None
+        self._lock = threading.Lock()
+        self._latest: dict[int, bytes] = {}
+        self._ids = {addr for addr, _ in _SOC_CANDIDATES}
+        filt = ",".join(f"{a:X}:7FF" for a in sorted(self._ids))
+        try:
+            self._proc = subprocess.Popen(
+                ["candump", "-L", f"{channel},{filt}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as exc:
+            log(f"  candidate probe off ({exc}); marks will show cand~n/a")
+            return
+        threading.Thread(target=self._reader, daemon=True).start()
+        log(f"  candidate probe: candump -L {channel},{filt}  "
+            f"(0x3E3 b0/b1/b6, 0x228 b2, 0x186 b6 -- passive)")
+
+    def _reader(self) -> None:
+        for line in self._proc.stdout:
+            parts = line.split()
+            if len(parts) != 3 or "#" not in parts[2]:
+                continue
+            cid, _, hx = parts[2].partition("#")
+            try:
+                addr = int(cid, 16)
+                data = bytes.fromhex(hx)
+            except ValueError:
+                continue
+            if addr in self._ids:
+                with self._lock:
+                    self._latest[addr] = data
+
+    def snapshot(self) -> list[tuple[str, int | None]]:
+        out: list[tuple[str, int | None]] = []
+        with self._lock:
+            for addr, offs in _SOC_CANDIDATES:
+                data = self._latest.get(addr)
+                for off in offs:
+                    have = data is not None and len(data) > off
+                    out.append((f"{addr:X}.{off}", data[off] if have else None))
+        return out
+
+    def fmt(self) -> str:
+        body = " ".join(f"{k}={'--' if v is None else v}"
+                        for k, v in self.snapshot())
+        return f"cand[{body}]"
+
+    def close(self) -> None:
+        if self._proc is None:
+            return
+        self._proc.send_signal(signal.SIGINT)
+        try:
+            self._proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+
+
+# -- diagnostic SOC poll (OPT-IN; the only transmit path) --------------
+class DiagSocProbe:
+    """``--diag-soc``: send ``22 005B`` every ``period`` s and decode the
+    reply as battery charge percent. THIS IS THE ONLY TRANSMIT PATH in this
+    tool. Stays in the default diagnostic session and uses mode-22 only --
+    no session switch, no TesterPresent -- so it cannot put an ECU into a
+    state that suppresses the normal broadcasts. Request and response each
+    fit one ISO-TP single frame, so it needs only ``cansend`` + a filtered
+    ``candump``. Tries the candidate request ids until one answers, locks
+    onto it, and disables itself (one log line) if none do."""
+
+    def __init__(self, channel: str, period: float, log,
+                 req_id: int | None = None) -> None:
+        self._chan = channel
+        self._period = max(2.0, period)
+        self._log = log
+        self._reqs = (req_id,) if req_id else _DIAG_REQ_CANDIDATES
+        self._pinned = req_id is not None
+        self._req_id: int | None = req_id
+        self._lock = threading.Lock()
+        self._pct: float | None = None
+        self._raw: int | None = None
+        self._rx_id: int | None = None
+        self._at: float | None = None
+        self.polls = 0
+        self.replies = 0
+        self.nrcs = 0
+        self._stop = threading.Event()
+        self._proc = None
+        try:
+            # any standard 11-bit ECU response id 0x7E8..0x7EF
+            self._proc = subprocess.Popen(
+                ["candump", "-L", f"{channel},7E8:7F8"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as exc:
+            log(f"  DIAG poll OFF -- candump listener did not start ({exc})")
+            return
+        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._poller, daemon=True).start()
+        who = (f"{req_id:X}" if req_id else
+               "auto " + "/".join(f"{r:X}" for r in self._reqs))
+        log(f"  DIAG poll ON (ACTIVE TX): 22 005B every {self._period:.0f}s, "
+            f"req id {who}")
+
+    def _send(self, req_id: int) -> None:
+        frame = f"{req_id:03X}#0322{_DIAG_DID:04X}55555555"
+        try:
+            subprocess.run(["cansend", self._chan, frame],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=2, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._log(f"  DIAG cansend failed ({exc})")
+
+    def _poller(self) -> None:
+        while not self._stop.wait(self._period):
+            targets = (self._req_id,) if self._req_id else self._reqs
+            for r in targets:
+                if r is None:
+                    continue
+                self.polls += 1
+                self._send(r)
+                if self._req_id:
+                    break
+                time.sleep(0.4)  # settle one reply before trying the next id
+
+    def _reader(self) -> None:
+        for line in self._proc.stdout:
+            parts = line.split()
+            if len(parts) != 3 or "#" not in parts[2]:
+                continue
+            cid, _, hx = parts[2].partition("#")
+            try:
+                rx = int(cid, 16)
+                d = bytes.fromhex(hx)
+            except ValueError:
+                continue
+            if len(d) < 4:
+                continue
+            # positive: 04 62 00 5B XX ...    negative: 03 7F 22 <NRC> ...
+            if (d[0] >= 4 and d[1] == 0x62
+                    and (d[2] << 8 | d[3]) == _DIAG_DID and len(d) >= 5):
+                with self._lock:
+                    self._raw = d[4]
+                    self._pct = _uds_soc_percent(d[4])
+                    self._rx_id = rx
+                    self._at = time.time()
+                    self.replies += 1
+                    if self._req_id is None:
+                        self._req_id = rx - 8  # lock onto the ECU that answered
+                        self._log(f"  DIAG locked: {rx - 8:X} -> {rx:X}  "
+                                  f"first read {self._pct:.1f}% (0x{d[4]:02X})")
+            elif d[1] == 0x7F and d[2] == 0x22:
+                with self._lock:
+                    self.nrcs += 1
+
+    def snapshot(self):
+        with self._lock:
+            if self._pct is None:
+                return None
+            age = None if self._at is None else time.time() - self._at
+            return (self._pct, self._raw, self._rx_id, age)
+
+    def fmt(self) -> str:
+        s = self.snapshot()
+        if s is None:
+            return "soc22=n/a"
+        pct, raw, rx, age = s
+        stale = "" if (age is not None and age < self._period * 3) else "!"
+        return f"soc22={pct:.1f}%{stale}(0x{raw:02X}@{rx:X})"
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._proc is not None:
+            self._proc.send_signal(signal.SIGINT)
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+
+
 # -- LCD mirror (optional; no-ops when lcd is None) ---------------------
 class Dash:
     def __init__(self, lcd, t0: float, level: int, total: int) -> None:
@@ -266,10 +498,13 @@ class Session:
     """Shared clock, gauge tracker and mark recorder. Thread-safe: GPIO
     button callbacks and the main loop all land here."""
 
-    def __init__(self, log, speed: "SpeedProbe", dash: "Dash", channel: str,
+    def __init__(self, log, speed: "SpeedProbe", cand: "CandidateProbe",
+                 diag: "DiagSocProbe | None", dash: "Dash", channel: str,
                  level: int, total: int) -> None:
         self.log = log
         self.speed = speed
+        self.cand = cand
+        self.diag = diag
         self.dash = dash
         self.channel = channel
         self.level = level
@@ -283,9 +518,13 @@ class Session:
         spd = "n/a" if sp is None else f"{sp:.0f}mph"
         ac = self.speed.accel_mps2()
         acc = "a~n/a" if ac is None else f"a~{ac:+.1f}"
-        return (f"+{dt:7.1f}s  spd~{spd:<6} {acc:<7} "
+        line = (f"+{dt:7.1f}s  spd~{spd:<6} {acc:<7} "
                 f"gauge={self.level}/{self.total}"
-                f"  can0={can_state(self.channel)}")
+                f"  can0={can_state(self.channel)}"
+                f"  {self.cand.fmt()}")
+        if self.diag is not None:
+            line += f"  {self.diag.fmt()}"
+        return line
 
     def mark(self, kind: str, note: str = "") -> None:
         """A plain time anchor: START / END / periodic SOC-MARK."""
@@ -442,7 +681,7 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--yes", action="store_true",
                     help="required for a live run: you are set up and about "
-                         "to drive; this tool is passive (never transmits)")
+                         "to drive; passive unless --diag-soc is also given")
     ap.add_argument("--channel", default="can0")
     ap.add_argument("--minutes", type=float, default=60.0,
                     help="session length before it stops itself (default 60)")
@@ -477,9 +716,25 @@ def main() -> None:
                          "panel resets -- that is a 5 V sag, not software)")
     ap.add_argument("--logfile", default=None,
                     help="log path (default ~/vdmf-soclog-<timestamp>.log)")
+    ap.add_argument("--diag-soc", action="store_true",
+                    help="ACTIVE TX: also poll the diagnostic charge PID "
+                         "(UDS 22 005B) for a continuous ground-truth SOC %. "
+                         "This is the only path that transmits.")
+    ap.add_argument("--diag-soc-every", type=float, default=10.0, metavar="SECS",
+                    help="seconds between 22 005B polls (default 10)")
+    ap.add_argument("--diag-req-id", default=None, metavar="HEX",
+                    help="pin the UDS request id (e.g. 0x7E4); default tries "
+                         "0x7E4 then 0x7E0 and locks onto whichever answers")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and exit; no hardware touched")
     args = ap.parse_args()
+
+    diag_req_id = None
+    if args.diag_req_id is not None:
+        try:
+            diag_req_id = int(args.diag_req_id, 16)
+        except ValueError:
+            ap.error(f"--diag-req-id: not hex: {args.diag_req_id!r}")
 
     total = max(1, args.bars)
     start_level = total if args.bars_start is None else args.bars_start
@@ -489,10 +744,20 @@ def main() -> None:
     btn_desc = (f"GPIO{args.button_a_gpio} down / GPIO{args.button_b_gpio} up"
                 if args.buttons else "OFF")
 
-    print("SOC-discovery drive log (PASSIVE -- no TX)")
+    if args.diag_soc:
+        who = f"{diag_req_id:X}" if diag_req_id else "auto 7E4/7E0"
+        diag_desc = (f"ACTIVE TX -- 22 005B every {args.diag_soc_every:.0f}s "
+                     f"(req id {who})")
+    else:
+        diag_desc = "off (passive run)"
+
+    print(f"SOC-discovery drive log ({'ACTIVE TX -- --diag-soc' if args.diag_soc else 'PASSIVE -- no TX'})")
     print(f"plan: {args.minutes:.0f} min capture on {args.channel}")
     print(f"  gauge: {start_level}/{total} at start   buttons: {btn_desc}")
     print(f"  SOC-MARK backstop: {mark_desc}   LCD: {'on' if args.lcd else 'off'}")
+    print(f"  broadcast SOC candidates: 0x3E3 b0/b1/b6, 0x228 b2, 0x186 b6 "
+          f"(passive, on every line)")
+    print(f"  diagnostic SOC poll: {diag_desc}")
     print(f"  raw capture -> {args.capture_dir}/candump-<ts>.log "
           f"(mine with tools/mine_capture.py)")
 
@@ -514,6 +779,7 @@ def main() -> None:
     log, fh = make_logger(logpath)
     log(f"soc_log start  channel={args.channel}  minutes={args.minutes:.0f}  "
         f"mark-every={args.mark_every:.0f}s  logfile={logpath}")
+    log(f"mode: {'ACTIVE TX (--diag-soc: 22 005B poll)' if args.diag_soc else 'PASSIVE (no TX)'}")
     log(f"can0 state: {st}")
 
     cap_proc, cap_path = start_capture(args.channel, args.capture_dir, log)
@@ -536,7 +802,12 @@ def main() -> None:
     t0 = time.time()
     dash = Dash(lcd, t0, start_level, total)
     speed = SpeedProbe(args.channel, log)
-    session = Session(log, speed, dash, args.channel, start_level, total)
+    cand = CandidateProbe(args.channel, log)
+    diag = (DiagSocProbe(args.channel, args.diag_soc_every, log,
+                         req_id=diag_req_id)
+            if args.diag_soc else None)
+    session = Session(log, speed, cand, diag, dash, args.channel,
+                      start_level, total)
     session.t0 = t0  # share the exact origin with the Dash
 
     buttons = Buttons(session, args.button_a_gpio, args.button_b_gpio,
@@ -585,8 +856,16 @@ def main() -> None:
     log(f"  {session.n} marks over {(time.time() - t0) / 60:.1f} min")
     log(f"  gauge {start_level}/{total} -> {session.level}/{total}  "
         f"({start_level - session.level} increment(s) dropped)")
+    if diag is not None:
+        s = diag.snapshot()
+        last = f"{s[0]:.1f}% (0x{s[1]:02X}@{s[2]:X})" if s else "no reply"
+        log(f"  diag poll: {diag.polls} sent, {diag.replies} replies, "
+            f"{diag.nrcs} NRC; last {last}")
     stop_capture(cap_proc, cap_path, log)
     speed.close()
+    cand.close()
+    if diag is not None:
+        diag.close()
     if buttons is not None:
         buttons.close()
     if lcd is not None:

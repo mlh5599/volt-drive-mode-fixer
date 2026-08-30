@@ -32,6 +32,16 @@ Level 1 charging).
 > `e69cb44` / `55fe176`; deployed pin `55fe176`). The SOC discharge drive can
 > now be run start-to-finish from the driver's seat with no laptop. Only the
 > drive itself + `mine_capture.py` analysis remain for SOC.
+>
+> **Update (session 8, 2026-08-30):** the **full-drain SOC drive is done**
+> (10/10 → 0/10, all bar-drops hand-marked). Timer-rejection analysis
+> narrowed SOC to **three broadcast candidates** (`0x3E3` b0/b1/b6, `0x228`
+> b2, `0x186` b6) and excluded four elapsed-time counters — but **no
+> known-SOC anchor was logged**, so nothing is calibrated yet
+> (`docs/analysis/session8-soc-candidates.md`). `soc_log.py` gained
+> per-line candidate raw stamps + an opt-in `--diag-soc` (`22 005B`) poll.
+> §2b below now describes the **Session-9 anchor drive** — that plus the
+> stationary injection sweep and `ignition_check.py` are what's left.
 
 ---
 
@@ -119,8 +129,10 @@ broadcast candidates — **`0x3E3` b0/b1/b6** (strongest), **`0x228` b2**
 elapsed-time counters (`0x4CB`/`0x3DD`/`0x137`/`0x4E9`). **No scaling anchor
 was logged** (no reading at a known SOC), so `signals.py` is untouched. GM
 Volt RE wiki carries battery charge % only as diagnostic PID `22 005B`
-(`X·100/255`). Detail: `docs/field-session-log.md` Session 8 +
-<https://claude.ai/code/artifact/e345abc6-76d7-43ca-98fa-e58c48f7c3d2>.
+(`X·100/255`). Detail: `docs/field-session-log.md` Session 8 + the visual
+write-up (normalised overlay, per-bar table, timer-rejection scorecard,
+native-scale shapes) in [`analysis/session8-soc-candidates.md`](analysis/session8-soc-candidates.md)
+— charts regenerable from the capture via `tools/soc_report.py`.
 
 - [x] Bench prep A1–A4 (2026-08-30); panel-launch path verified in-car
       (session 7, deployed pin `55fe176`).
@@ -134,9 +146,22 @@ Volt RE wiki carries battery charge % only as diagnostic PID `22 005B`
 
 - [ ] Start at a **full charge**. Start the capture (**hold SW1+SW2 ~5 s**,
       or `systemctl start voltdmf-soclog.service` / `soc_log.py --yes
-      --minutes 90 --buttons --lcd`). Engine on, **sit in Park ~2 min** —
-      this is the missing anchor: the raw value of each candidate at the
-      "100 % display" state.
+      --minutes 90 --buttons --lcd --diag-soc`). Engine on, **sit in Park
+      ~2 min** — this is the missing anchor: the raw value of each candidate
+      at the "100 % display" state.
+      - Every mark line now carries `cand[3E3.0=… 3E3.1=… 3E3.6=… 228.2=…
+        186.6=…]` (always on, passive), so the three broadcast candidates are
+        logged inline with no extra step.
+      - `--diag-soc` is **part of this run**, not optional: it polls UDS
+        `22 005B` every ~10 s and stamps `soc22=NN.N%(0xRAW@7EC)` — the
+        continuous known-SOC ground truth that lets the capture solve the
+        raw→% fit directly. It is the one active-TX path (default session,
+        mode-22 only, so broadcasts are not suppressed); auto-detects the ECU
+        (0x7E4 then 0x7E0) and self-disables if nothing answers.
+      - The deployed `voltdmf-soclog.service` and the ansible `voltdmf` role
+        still launch the **passive** form. Before the drive, either add
+        `--diag-soc` to that unit's `ExecStart` (and bump `voltdmf_version`
+        to the new SHA), or run `soc_log.py … --diag-soc` by hand.
 - [ ] Drive as **constant** as possible (steady speed / throttle) so
       d(candidate)/d(SOC) is a clean slope. The new `spd~` / `a~` in each
       mark is there to correlate against load.
@@ -146,11 +171,10 @@ Volt RE wiki carries battery charge % only as diagnostic PID `22 005B`
       here — both a candidate confirmation and the second anchor for the slope.
       (2 bars is also the chosen SOC-HOLD floor — see `DESIGN.md`.)
 - [ ] Hold both buttons 3 s (parked) to stop.
-- [ ] *(optional)* poll `22 005B` every ~10 s for a continuous ground-truth
-      SOC % — active TX, benign diagnostic read, but decide before the drive.
 - [ ] `mine_capture.py <capture> --series 3E3:0:1 / 228:2:1 / 186:6:1 --every 20`;
       read each candidate's raw value at the 2-min idle anchor and at the
-      HOLD entry.
+      HOLD entry. Cross-check against the inline `cand[…]` / `soc22=…` stamps
+      in the marks log.
 - [ ] Set `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH` (or a direct percent
       decode) in `voltdmf/signals.py` from the two anchors; flip
       `soc.confirmed = True`; wire `decode_soc` into `_DecodeListener` /

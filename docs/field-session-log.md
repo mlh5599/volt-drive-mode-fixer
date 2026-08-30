@@ -43,9 +43,13 @@ barely moves.
 - **Charge-mode 8/12 A toggles not captured** — the car left Park at +15.7 s,
   before any toggling. Deprioritised (owner's call).
 
-Visual writeup (normalised overlay, per-bar delta heatmap, scorecard,
-native-scale shapes, the speed trace):
-<https://claude.ai/code/artifact/e345abc6-76d7-43ca-98fa-e58c48f7c3d2>
+Visual write-up — normalised overlay, per-bar table, timer-rejection
+scorecard, native-scale shapes, speed trace — is in the repo at
+[`analysis/session8-soc-candidates.md`](analysis/session8-soc-candidates.md)
+(charts regenerable from the capture via `tools/soc_report.py`):
+
+![Session-8 SOC candidates: normalised completion of every candidate and
+rejected timer on one axis, with speed and the ten gauge-bar drops](analysis/img/session8-overlay.svg)
 
 ### GM Volt reverse-engineering wiki cross-check
 
@@ -59,14 +63,15 @@ IDs against the capture (`tools/` scratch script `wikichk.py`):
   literal `0x1580` for 90 km/h is a typo — 90 km/h is 5760 counts). Verified
   against the capture: ~0 at rest, ~63 mph highway cruise, dip to ~8 mph at
   the turnaround (**+1240 s** — this is the real turnaround; an earlier
-  draft of the artifact had mislabelled it +830–990 s). Bytes 2 & 6 are a
+  analysis draft had mislabelled it +830–990 s). Bytes 2 & 6 are a
   mux/rolling counter; bytes 0–1 hold the speed word regardless.
 - **Diagnostic SOC exists as a poll, not a broadcast:** `22 005B`
   "Hybrid/EV Battery Pack Remaining Charge", `X·100/255` %, 1 byte, mode-22
   request. Reinforces that a clean filtered SOC may be diagnostic-only
-  (like the per-cell voltages behind the BECM). An option for the next
-  drive: poll it every ~10 s for continuous ground-truth to calibrate the
-  broadcast candidate against — but that's active TX, needs a call.
+  (like the per-cell voltages behind the BECM). Session 9 polls this every
+  ~10 s (`soc_log.py --diag-soc`) for continuous ground-truth to calibrate
+  the broadcast candidates against — active TX, but default-session /
+  mode-22 only so it won't suppress the broadcasts.
 - Accelerator position (context for load): `0x0C9` b5 / `0x1A1` b7 (pedal
   only, 0 during cruise), `0x1C3` b7 (includes cruise output). Brake:
   `0x0F1` b2. Odometer: `0x120` b1–4, 1/64 km.
@@ -84,7 +89,25 @@ IDs against the capture (`tools/` scratch script `wikichk.py`):
 - **`voltdmf/signals.py`** — `decode_speed_mph` corrected; new
   `decode_speed_kmh`; `"speed"` note rewritten (still `confirmed=False` —
   not speedo-checked). `tests/test_signals.py` updated (wiki's 5760-count =
-  90 km/h vector). Full suite green (170).
+  90 km/h vector).
+- **`tools/soc_log.py` — Session-9 additions.** An always-on passive
+  `CandidateProbe` (`candump -L can0,186:7FF,228:7FF,3E3:7FF`) stamps every
+  broadcast candidate's raw byte on every log line
+  (`cand[3E3.0=161 3E3.1=161 3E3.6=160 228.2=79 186.6=63]`). New opt-in
+  `--diag-soc` (the one transmit path; still needs `--yes`) polls UDS
+  `22 005B` every `--diag-soc-every` s, auto-detects the responding ECU
+  (0x7E4 → 0x7E0, `--diag-req-id` to pin), and stamps `soc22=61.2%(0x9C@7EC)`;
+  it self-disables with one log line if nothing answers. The deployed
+  `voltdmf-soclog.service` / ansible `voltdmf` role keep the passive
+  `ExecStart` — add `--diag-soc` (and bump `voltdmf_version`) before a drive.
+- **`tools/soc_report.py` (new)** — stdlib-only, read-only. `extract` parses
+  the marks log + capture into `docs/analysis/data/session8-soc.json`;
+  `render` draws the overlay / native-scale SVGs under `docs/analysis/img/`.
+  The visual write-up lives at `docs/analysis/session8-soc-candidates.md`
+  (this replaces the old published-artifact link).
+- `tests/test_soc_log.py` (new) covers `_uds_soc_percent`, the
+  `CandidateProbe` line parser, and `DiagSocProbe` positive/negative-response
+  matching + ECU lock-on. Full suite green (183).
 
 ### Decision — SOC-HOLD floor = 2 gauge bars
 
@@ -99,6 +122,14 @@ placeholder moved 18 → 20 (~2 bars on the 10-bar gauge), `hold_reset_percent`
 
 Planned by the owner; written into `phase-c-field-checklist.md` §2b:
 
+Run it with `soc_log.py --yes --minutes 90 --buttons --lcd --diag-soc` (the
+`--diag-soc` flag is new — see "Code / tooling" above). Every log line now
+carries the raw value of all three broadcast candidates
+(`cand[3E3.0=… 228.2=… 186.6=…]`), and `--diag-soc` adds a `22 005B` poll
+every 10 s (`soc22=…%`) — the diagnostic poll is now **part of the run**, not
+optional, so the broadcast candidates and the diagnostic percent are logged
+side by side for a direct raw→% fit.
+
 1. Start at a **full charge**. Engine on, sit in Park **~2 min** — pins the
    "100 % display" raw value for `0x3E3 b0` / `0x228 b2` (the anchor this
    drive was missing).
@@ -108,9 +139,18 @@ Planned by the owner; written into `phase-c-field-checklist.md` §2b:
    charge-sustaining segment where a genuine SOC field stops falling (or
    rises slightly) is both a strong candidate confirmation and the second
    anchor for the slope.
-4. Optional: poll `22 005B` for continuous ground-truth SOC %.
 
-`voltdmf/signals.py` SOC constants stay untouched until an anchor lands.
+`--diag-soc` is active TX (UDS `22 005B`, default session, mode-22 only). The
+deployed `voltdmf-soclog.service` / the ansible `voltdmf` role still launch
+the passive form — add `--diag-soc` to that ExecStart (and bump
+`voltdmf_version`) before the drive, or start `soc_log.py` by hand with the
+flag. `voltdmf/signals.py` SOC constants stay untouched until an anchor lands.
+
+**Engine-RPM backstop — rejected (owner, 2026-08-30).** An idea to force HOLD
+after N minutes of sustained gas-engine RPM is no use here: it fires *after*
+depletion, and HOLD is not even selectable once the pack is depleted. The
+whole point is prevention before the cliff, so no post-depletion signal can
+be the trigger.
 
 ---
 

@@ -4,10 +4,18 @@ Documentation=file:///usr/share/doc/voltdmf/DESIGN.md
 # Started on demand by voltdmf-btn.service when the launch gesture fires;
 # never enabled, never started at boot (no [Install]).
 #
-# PASSIVE: tools/soc_log.py spawns `candump -l` and its own event log and
-# never transmits. It is independent of voltdmf.service -- not bound to it --
-# and the daemon's LCD watch screen yields via VOLTDMF_LCD_LOCK while this
-# runs, resuming when soc_log.py releases the lock on exit.
+# PASSIVE by default: tools/soc_log.py spawns `candump -l` plus its own event
+# log and does not transmit. The always-on broadcast-candidate probe is also
+# passive. The one opt-in TX path is `--diag-soc` (UDS `22 005B` poll every
+# ~10 s, default session / mode-22 only) -- NOT in the ExecStart below. For a
+# scaling-anchor drive that wants continuous known-SOC ground truth, add
+# `--diag-soc` here (and bump voltdmf_version), or run soc_log.py by hand --
+# see docs/phase-c-field-checklist.md Session 9. Keep this unit and the
+# ansible `voltdmf` role's copy in sync.
+#
+# It is independent of voltdmf.service -- not bound to it -- and the daemon's
+# LCD watch screen yields via VOLTDMF_LCD_LOCK while this runs, resuming when
+# soc_log.py releases the lock on exit.
 After=voltdmf.socket
 
 [Service]
@@ -43,6 +51,7 @@ Environment=VOLTDMF_LCD_LOCK=/run/lock/voltdmf-lcd.lock
 
 # soc_log.py already aborts if can0 is STOPPED or absent, and refuses to run
 # without --yes. 90 min / 10-bar gauge / SOC-MARK backstop every 2 min.
+# Append `--diag-soc` for an active-TX ground-truth SOC poll (see header).
 ExecStart=/usr/bin/python3 /opt/voltdmf/repo/tools/soc_log.py \
     --yes --minutes 90 --buttons --lcd \
     --button-a-gpio 24 --button-b-gpio 23 \

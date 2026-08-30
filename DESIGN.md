@@ -1,8 +1,14 @@
 # Volt Drive Mode Fixer — Design
 
-**Status (2026-08-23):** hardware ordered (see BOM in "Hardware design"),
-awaiting arrival. Next step on arrival: Phase 1 signal discovery (see
-"Phased plan") — nothing to do until then.
+**Status (2026-08-30):** built and deployed on the Pi (`voltpi`); field
+testing (Phase C). Mode-button input (`0x1E1`), current-mode status
+(`0x1F4` byte 1) and shift/PRNDL (`0x1F5` byte 3) are all confirmed on-road,
+and the closed-loop menu walk has an owner-confirmed on-road PASS. **SOC is
+the one signal still open** (Session-8 drive narrowed it to three broadcast
+candidates, no scaling anchor yet — see "Open items") and the last blocker on
+a non-dry-run daemon; the level-triggered reconciler in "Mode policy" is
+designed but not yet implemented, blocked on the same calibration. Next field
+test: the Session-9 SOC anchor drive (`docs/phase-c-field-checklist.md` §2b).
 
 ## Problem
 
@@ -158,7 +164,7 @@ layer of defense.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus** (2026-08-29; re-confirmed 0 frames in the Session-8 213 MB full-drain capture). Session-8 analysis narrowed it to three energy-linked broadcast candidates (`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6) and excluded four elapsed-time counters. No raw→% anchor yet. The GM Volt RE wiki carries battery charge % only as diagnostic PID `22 005B` (`X·100/255`). See "Open items" and `docs/field-session-log.md` Session 8. Until a candidate is calibrated the reconciler's SOC-HOLD floor cannot engage. |
+| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus** (2026-08-29; re-confirmed 0 frames in the Session-8 213 MB full-drain capture). Session-8 analysis narrowed it to three energy-linked broadcast candidates (`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6) and excluded four elapsed-time counters. No raw→% anchor yet. The GM Volt RE wiki carries battery charge % only as diagnostic PID `22 005B` (`X·100/255`); the Session-9 anchor drive polls it (`soc_log.py --diag-soc`) for continuous ground-truth to scale the candidates against. See "Open items", `docs/field-session-log.md` Session 8, and `docs/analysis/session8-soc-candidates.md`. Until a candidate is calibrated the reconciler's SOC-HOLD floor cannot engage. |
 | Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. This is the one frame the project transmits — `voltdmf/canio.send_mode_button_press()` (tracking-echo press). |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki and cross-checked against the Session-8 full-drain capture (~0 at rest, ~63 mph cruise, ~8 mph at the turnaround); not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` now logs it plus a derived accel). |
@@ -354,6 +360,11 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
 | `reload` | re-read the config file, rebuild the policy | queued → loop thread |
 
+> **Implemented today:** `status`, `arm`, `disarm`, `set-mode`, `reload`.
+> `setpoint` (and the reconciler it feeds) is designed here but not yet
+> written — it lands with the reconciler once SOC is calibrated. Until then
+> `tools/button_helper.py`'s `setpoint` call is a logged no-op.
+
 - **Privilege boundary = file mode.** The `.socket` unit binds it
   `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no
   polkit, no D-Bus.
@@ -445,7 +456,8 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 - **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) never appears on
   this Gen 1 bus — re-confirmed absent (0 frames) in the Session-8 213 MB
   full-drain capture. That drive (`docs/field-session-log.md` Session 8;
-  visual analysis: <https://claude.ai/code/artifact/e345abc6-76d7-43ca-98fa-e58c48f7c3d2>)
+  visual analysis in `docs/analysis/session8-soc-candidates.md`, charts
+  regenerable from the capture via `tools/soc_report.py`)
   narrowed it to three energy-linked broadcast candidates — `0x3E3` bytes
   0/1/6 (triple-redundant, best timer rejection), `0x228` byte 2 (cleanest
   but coarse ≈ 1.5 counts/bar), `0x186` byte 6 (fine but noisy) — and
@@ -457,7 +469,11 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   filtered SOC may be poll-only. Next drive (see `docs/phase-c-field-checklist.md`
   §2b) starts at a full charge + ~2 min idle to pin the "100 %" raw value,
   then holds a steady pace to the 2-bar mark and runs ~10 min in HOLD for a
-  charge-sustaining second anchor. The reconciler's SOC-HOLD floor cannot
+  charge-sustaining second anchor — with `soc_log.py --diag-soc` polling
+  `22 005B` throughout for a continuous known-SOC reference to fit the
+  broadcast candidates against (that poll is now part of the run, not
+  optional; it is the tool's one transmit path). Each capture line also
+  carries every candidate's raw byte. The reconciler's SOC-HOLD floor cannot
   engage until this lands — it is the last blocker on a non-dry-run daemon.
 
 ### Deferred (not blocking)
