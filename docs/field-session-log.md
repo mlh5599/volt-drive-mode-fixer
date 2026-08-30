@@ -6,6 +6,55 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 7 — 2026-08-30 (in-car — panel-launched SOC capture works end-to-end after three GPIO hand-off fixes)
+
+Short in-car test of Session 6's button helper: the **SW1+SW2 held 5 s →
+`voltdmf-soclog.service`** gesture. The launch worked first try, but
+`soc_log.py`'s own buttons (A/B gauge, hold-both stop) took three rounds to
+come right. No SOC data captured — the point was the button path; the
+discharge drive is still to do.
+
+**Round 1 — `5b951da` (did not fix it).** `button_helper._wait_out_unit`
+trusted the exit of a polkit `systemctl start` as "the oneshot finished".
+Over the unprivileged `User=voltdmf-btn` path that call returns as soon as
+the job is *queued*, so the helper re-grabbed SW1/SW2 a few seconds into the
+90-min capture and `soc_log.py` came up `buttons off … 'GPIO busy'`. Changed
+to poll `systemctl is-active`, added a settle after the release, plus a retry
+loop in `soc_log.py`. Still dead on the car.
+
+**Round 2 — `e69cb44` (fixed the buttons).** Root cause: gpiozero's
+`Button.close()` drops the Python object but leaves lgpio's `gpiochip`
+handle open, so the kernel lines stay claimed by `voltdmf-btn` for the whole
+capture — every `soc_log.py` retry hits `'GPIO busy'`. Proved on `voltpi`
+against pins 24/23: after `Button.close()` only, a fresh process gets
+`error('GPIO busy')`; after `Device.pin_factory.close()` it claims OK. Fix:
+`_release_buttons()` now also closes the gpiozero pin factory
+(`Device.pin_factory = None`; the next `Button()` rebuilds it), which shuts
+the gpiochip fd so the kernel frees every line. `soc_log.py`'s acquire loop
+does the same teardown between tries, widened to ~15 s. Also hardened
+`_unit_running()` — a transient `systemctl is-active` failure now reads as
+"still up" (3 tries), never "finished", so a systemctl hiccup can't make the
+helper snatch the lines back mid-capture. **A/B gauge taps and the stop then
+worked in the car.**
+
+**Round 3 — `55fe176` (stop gesture no longer leaks a gauge move).** You
+can't press both pads on the same millisecond, so whichever landed first
+fired its `when_pressed` (`GAUGE-UP`/`DOWN`) before the hold-both stop was
+recognised — every stop left a stray gauge line just before `END`. Dropped
+the callbacks: the main loop's `tick()` (~5 Hz) reads both pads by
+`is_pressed` edge and commits a tap only on *release*, and only if the other
+pad was never down during that press. A staggered two-button hold now
+records just the stop. State machine unit-tested off-Pi (solo taps,
+staggered stop, long-solo-then-stop, sequential taps).
+
+**State.** `voltdmf_version` → `55fe176`, converged with `--tags voltdmf`.
+Helper healthy (`LGPIOFactory`, holding BCM 24/23 at idle), daemon up,
+`voltdmf_dry_run` stays `true`. The panel-launched SOC capture is now a
+clean "hold both 5 s, drive, hold both 3 s to stop"; the SOC discharge drive
+itself is the next in-car task.
+
+---
+
 ## Session 6 — 2026-08-30 (keyboard + Pi bench — LCD-lock fix landed; `~/vdmf` drift fixed; SOC-drive bench prep complete; reconciler design shift)
 
 No car. `voltpi` on the bench with `can0` up (no bus), the SparkFun 4x20, and
