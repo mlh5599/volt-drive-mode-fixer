@@ -653,23 +653,35 @@ is the fix for both our symptoms:
 - **SOC signal** — `0x206` never appears on this bus (Gen-2 ID is wrong for
   Gen 1). Needs a discharge drive with `tools/watch_soc.py` to find the real
   ID + scaling for `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH`.
-- **Shift / PRNDL** — `0x135` bytes 0–6 constant in Park (byte 7 is a free
-  counter), `0x1F5` static. Nothing to decode without moving the shifter.
-  Keeps `SafetyGate(allow_unknown_shift=True)` for now.
+- **Shift / PRNDL** — ✅ RESOLVED on the road (session 4). `0x1F5` byte 3 is
+  the PRNDL detent (1 PARK … 5 LOW): stepped 1→5 in order through a parked
+  P-R-N-D-L walk, then held 4 (DRIVE) for the whole 9-minute drive.
+  `signals.decode_shift` is live; `SafetyGate` now blocks on `UNKNOWN` by
+  default (`allow_unknown_shift=False`, commit `4013ea3`). `0x135` byte 0
+  also tracks the shifter but with a messier non-sequential encoding — left
+  undecoded.
 - **Ignition behaviour** — does the bus go quiet with the car off and how
   long after; is the drive mode remembered or reset to NORMAL on restart.
   Run `tools/ignition_check.py`.
 
 ### Follow-ups for "back at a keyboard" (no car needed)
 
-- Wire `signals.decode_drive_mode` into `voltdmf/daemon.py` as
-  `current_mode_source`, replacing `PressCountingModeTracker`.
-- Add `0x1F4` to `signals.is_signal_frame` and the RX `_DecodeListener`
-  (left out on purpose this session to keep the running daemon untouched).
-- homelab-ansible `roles/voltdmf`: change
+- ✅ **DONE — commit `4013ea3`.** `voltdmf/daemon.py` now reads current mode
+  straight off the bus: `current_mode_source = lambda: state.drive_mode`,
+  replacing `PressCountingModeTracker`. `ASSUMED_START_MODE` and the
+  `on_presses_sent` wiring are gone. `state.drive_mode` is `None` until the
+  first `0x1F4` frame, which `ModeCycleController` turns into
+  `ModeUnknownError` → no injection — the fail-safe on a bus we can't observe.
+- ✅ **DONE — already in `c9acafa`.** `0x1F4` is in `signals.is_signal_frame`
+  and the RX `_DecodeListener` decodes byte 1 into `state.drive_mode`.
+- ✅ **DONE — commit `4013ea3`.** `SafetyGate` default `allow_unknown_shift`
+  flipped `True` → `False`. `decode_shift` (`0x1F5` byte 3) is confirmed, so
+  an `UNKNOWN` shift now means a short/garbled frame and blocks injection.
+  Bench rigs without a `0x1F5` stream pass `allow_unknown_shift=True`.
+- ⬜ homelab-ansible `roles/voltdmf`: change
   `templates/voltdmf-can0-up.service.j2` to `restart-ms 100` and add a
   `voltdmf_can_restart_ms` default — an in-car CAN device must self-recover
   from BUS-OFF.
-- Once injection passes: bump `voltdmf_version` in
+- ⬜ Once injection passes: bump `voltdmf_version` in
   `inventories/production/host_vars/voltpi.haguehome.lan/vars.yml` to the
   confirmed-signals commit. Keep `voltdmf_dry_run: true`.
