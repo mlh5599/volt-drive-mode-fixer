@@ -6,7 +6,7 @@ decoded-signal reference). Newest session first.
 
 ---
 
-## Session 6 — 2026-08-30 (keyboard + Pi bench — LCD-lock fix landed; `~/vdmf` drift fixed; SOC-drive bench prep complete)
+## Session 6 — 2026-08-30 (keyboard + Pi bench — LCD-lock fix landed; `~/vdmf` drift fixed; SOC-drive bench prep complete; reconciler design shift)
 
 No car. `voltpi` on the bench with `can0` up (no bus), the SparkFun 4x20, and
 the two PiCAN2 switches attached. Goal: get everything that doesn't need the
@@ -49,6 +49,19 @@ the car is done:
 On the drive itself only procedure steps 1 and 3–6 remain, all in-car. The
 other two gates before `voltdmf_dry_run: false` (stationary injection sweep,
 `ignition_check.py`) are unchanged.
+
+**Design shift — continuous reconciler (spec only, not built).** Since ignition
+is effectively always on (the Pi only has power while the car runs), there is
+no ignition edge, so the two edge-triggered strategies (`OnStartTrigger`,
+`SocThresholdTrigger`) are being replaced by one level-triggered reconciler:
+each loop pass computes `desired_mode(setpoint, soc, floor_latched)` and walks
+the car there through the unchanged `SafetyGate` → `ModeCycleController`.
+Setpoint is a 2-state toggle HOLD ⇄ MOUNTAIN on one panel button (via a tiny
+system-Python `gpiozero` helper calling `voltdmf-ctl setpoint …`); the SOC-HOLD
+floor always wins; no persisted state (read-only root + overlayfs coming) so
+every boot starts in HOLD. Written up in `DESIGN.md` "Mode policy — continuous
+reconciler"; `ignition_check.py` drops off the blocker list. Implementation
+waits on the SOC signal. Next: the SOC discharge drive tomorrow.
 
 ---
 

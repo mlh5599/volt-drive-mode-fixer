@@ -11,25 +11,28 @@ the pack voltage to sag under load, which trips "reduced propulsion" mode: the
 gas engine revs to near max RPM to generate power directly, and the car
 becomes sluggish. The owner currently avoids this by manually switching
 drive/charge modes before the battery runs low. This project automates that
-with a device on the car's CAN bus that applies configurable, independent
-trigger strategies (below) to switch modes before the pack gets low enough to
-cause the problem.
+with a device on the car's CAN bus that continuously reconciles the drive mode
+(see "Mode policy" below) toward a desired mode, switching before the pack gets
+low enough to cause the problem.
 
 ## Design requirements
 
 - **DR1 — Prevent reduced-propulsion mode.** Act on EV battery SOC/range
   before the pack depletes far enough to cause voltage sag and trigger
   reduced-propulsion mode.
-- **DR2 — Configurable on-start trigger.** On every drive cycle (ignition
-  on), optionally switch to Mountain Mode.
-- **DR3 — Configurable SOC-threshold trigger.** When SOC drops to a
-  configurable percentage, optionally switch to Hold Mode.
+- **DR2 — Drive toward a chosen mode each drive cycle.** On every drive cycle
+  (ignition on) hold a selected mode (MOUNTAIN or, by default, the SOC-HOLD
+  floor). Originally framed as a one-shot "on-start trigger"; now the
+  reconciler's setpoint — see "Mode policy".
+- **DR3 — SOC floor.** When SOC drops to a configurable percentage, switch to
+  Hold Mode and keep it there until the pack recovers. Originally a separate
+  "SOC-threshold trigger"; now the always-on floor in "Mode policy".
 - **DR4 — Off-the-shelf hardware preferred.** Favor a proven, reusable CAN
   interface over custom PCB/firmware design; hobbyist-level electronics
   work (soldering, wiring, light scripting) is acceptable where needed.
-- **DR5 — Extensible to a future Trip Mode trigger.** The trigger/injector
-  architecture must accommodate adding a speed-based Hold trigger later
-  without a redesign.
+- **DR5 — Extensible to a future Trip Mode input.** The reconciler/injector
+  architecture must accommodate a speed-based Hold input feeding the desired
+  mode later without a redesign.
 
 ## Vehicle context
 
@@ -59,62 +62,66 @@ Each mode's behavior:
 Because it's a cycle button rather than discrete per-mode controls, reaching
 a specific target mode means sending the same one button-press message a
 computed number of times from the current mode — not one distinct message
-per mode. See "Trigger strategies" and "Software architecture" below.
+per mode. See "Mode policy" and "Software architecture" below.
 
-## Trigger strategies (configurable)
+## Mode policy — continuous reconciler
 
-Two independent trigger strategies, each individually enabled/disabled and
-configured, plus a planned future third. They share the same underlying
-injector — a trigger just decides *when* to fire and *which* mode to request.
+> **Model change (2026-08-30).** The original two edge-triggered strategies
+> (*on-start → Mountain*, *SOC-threshold → Hold*) are replaced by a single
+> **level-triggered reconciler**. Rationale: ignition is effectively always
+> on (the Pi only has power while the car runs), so there is no ignition edge
+> to trigger on, and an edge-triggered switch does nothing if the driver
+> later bumps the mode by hand or a switch doesn't take. A reconciler that
+> continuously drives the car toward a *desired* mode is simpler and
+> self-healing. DR2/DR3 still hold — the reconciler satisfies both — but they
+> are no longer separate configurable triggers.
 
-1. **On-start → Mountain Mode (DR2).** Every drive cycle (ignition on), the
-   device switches to Mountain Mode. Mountain Mode keeps a buffer in the
-   pack rather than depleting it fully, so this is a simple, always-on
-   hedge that satisfies the baseline on-start requirement.
-2. **SOC threshold → Hold Mode (DR3).** When SOC drops to a configurable
-   percentage, the device switches to Hold Mode. Hold maintains the pack at
-   whatever SOC it's at when engaged (using the gas engine to avoid dropping
-   further) — so triggering it right as SOC nears the danger zone should
-   prevent the pack from ever reaching the voltage-sag point that causes
-   reduced-propulsion mode. (Mountain has a similar backstop effect once the
-   pack hits ~50%, but Hold is the one that can be engaged at *any* SOC, which
-   is why it's the threshold target rather than Mountain.)
-3. **Trip Mode (DR5, future work — not building this yet).** The
-   [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
-   actual approach: switch to Hold above a speed threshold (e.g. highway
-   driving) to bank EV range for later city driving, then release it
-   below the threshold. Worth adding once triggers 1 and 2 are working,
-   reusing the same injector/config plumbing. Tracked, not scheduled.
+**Desired mode = f(setpoint, SOC).** One loop pass computes the mode the car
+*should* be in; if `state.drive_mode` (read from `0x1F4` byte 1) differs, it
+asks the safety gate to walk the menu there.
 
-**Mechanics of reaching a target mode.** Since the button cycles
-Normal → Sport → Mountain → Hold, "switch to Hold" actually means "press the
-button N times," where N depends on the *current* mode (e.g. 3 presses from
-Normal, 1 press from Mountain). This makes reading back the current mode a
-requirement, not a nice-to-have — without it, the device can't know how many
-presses to send. The current-mode status signal has since been confirmed
-(`0x1F4` byte 1 — see "Known CAN signals" / "Open items"), so the daemon reads
-it directly rather than blind-counting presses.
+| | SOC above `hold_reset_percent` | SOC at/below `hold_threshold_percent` |
+| --- | --- | --- |
+| **setpoint = HOLD** (default) | desired = *none* — leave the car alone (NORMAL / whatever the driver picked) | desired = **HOLD** |
+| **setpoint = MOUNTAIN** | desired = **MOUNTAIN** | desired = **HOLD** (floor wins) |
 
-Strategies 1 and 2 are meant to run **together** as the recommended default:
-Mountain Mode conserves the pack proactively from the start of every drive,
-and the SOC-threshold trigger is the backstop that engages Hold if the pack
-still gets low anyway.
+- **The SOC-HOLD floor is always active** and always wins. There is no
+  "off" / suspend — the whole point of the device is that the pack never
+  sags, so the worst case is always "hold at the current SOC".
+- **Hysteresis.** Below `hold_threshold_percent` the floor engages (desired =
+  HOLD); it stays engaged until SOC climbs back above `hold_reset_percent`.
+  The latch lives in memory only.
+- **Setpoint** is a two-state toggle, **HOLD ⇄ MOUNTAIN**, changed by one
+  panel button (see "Runtime control" / "Hardware design"). It is *not*
+  persisted — the Pi runs a read-only root with an overlay filesystem, so
+  there is nothing to write to, and **every boot starts in HOLD**. A fresh
+  key cycle is a fresh drive; re-selecting MOUNTAIN each time is acceptable.
+- **Reconcile cadence vs. the driver.** The reconcile runs every loop but
+  every switch still goes through `SafetyGate` (preconditions + the 60 s
+  cooldown), so if the driver fights the setpoint the daemon re-asserts at
+  most once a minute. The button is the intended override — flip it to HOLD
+  and the daemon stops asserting MOUNTAIN.
 
-Config sketch (exact schema TBD when the daemon is written):
+**Mechanics of reaching a target mode** (unchanged). The button cycles
+Normal → Sport → Mountain → Hold, so "go to HOLD" means "press N times" where
+N depends on the current mode. The current-mode status signal is confirmed
+(`0x1F4` byte 1), so the controller reads it directly and closes the loop on
+the live menu cursor (`0x1F4` byte 4) rather than blind-counting.
+
+**Trip Mode (DR5, future work — not building this yet).** The
+[prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
+speed-based Hold (bank EV range on the highway, release it in the city) would
+become a third setpoint or a modifier on the policy, reusing the same
+reconcile + injector plumbing. Tracked, not scheduled.
+
+Config sketch (exact schema TBD when the reconciler is written):
 
 ```yaml
-on_start:
-  enabled: true
-  target_mode: mountain
-
-soc_threshold:
-  enabled: true
-  target_mode: hold
-  threshold_percent: 25       # calibrated against dash %, see "Open items"
-  reset_percent: 40           # SOC must rise back above this to re-arm
-
-trip_mode:
-  enabled: false              # future work
+policy:
+  hold_threshold_percent: 18   # floor engages at/below this — calibrate, see "Open items"
+  hold_reset_percent: 25       # SOC must climb back above this to disengage the floor
+  default_setpoint: hold       # always HOLD in practice (no persisted state)
+  mountain_button_gpio: 24     # BCM pin the button helper watches (PiCAN2 SW1)
 ```
 
 ## Prior art (reuse this, don't rebuild it)
@@ -143,9 +150,9 @@ layer of defense.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus (2026-08-29).** The real EV-SOC message ID is still unknown; `~0.25` kWh/count from OVMS is unverified for this pack. Needs a discharge drive (`tools/soc_log.py` / `tools/watch_soc.py`) to find the ID and calibrate raw→% against the dash. Until then the SOC-threshold trigger cannot fire. |
+| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus (2026-08-29).** The real EV-SOC message ID is still unknown; `~0.25` kWh/count from OVMS is unverified for this pack. Needs a discharge drive (`tools/soc_log.py`) to find the ID and calibrate raw→% against the dash. Until then the reconciler's SOC-HOLD floor cannot engage. |
 | Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. This is the one frame the project transmits — `voltdmf/canio.send_mode_button_press()` (tracking-echo press). |
-| Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on — its own process start *is* the on-start trigger, no separate ignition-sense signal required. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
+| Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
 | Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Used as a safety precondition — `SafetyGate` blocks injection unless in DRIVE (and blocks on UNKNOWN / short frame). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** Use SOC (message ID still to be found on this bus) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
@@ -254,26 +261,30 @@ Reuse rather than rebuild:
 The custom code needed is small and specific to this project:
 
 1. **Config loader** — reads the YAML sketched above, validates it (e.g.
-   `reset_percent > threshold_percent`), and produces the set of active
-   triggers for the run.
-2. **SOC monitor** — reads `0x206`, converts to a usable SOC value, applies
-   a debounce/smoothing filter (raw CAN values can be noisy frame-to-frame).
-3. **Trigger evaluators** — one per strategy, sharing the SOC monitor's
-   output and a shared drive-cycle/ignition signal:
-   - *on-start*: fires once per drive cycle as soon as ignition-on is
-     detected.
-   - *soc-threshold*: fires once when SOC crosses below
-     `threshold_percent` (latch), and re-arms once SOC rises back above
-     `reset_percent` (e.g. after charging) — this avoids repeatedly firing
-     if SOC hovers near the threshold.
-4. **Mode-cycle controller** — reads current mode from the status signal
-   (`0x1F4` byte 1, confirmed), walks the drive-mode menu to a trigger's
-   requested `target_mode` along the fixed Normal→Sport→Mountain→Hold cycle
-   order — closing the loop on the live menu cursor (`0x1F4` byte 4) — and
-   sends the taps through the safety wrapper below. This is the one place
-   that needs the actual button-press CAN frame; every trigger just asks it
-   for a `target_mode` and it doesn't care which trigger asked.
-5. **Safety wrapper** (see next section) — the only code path allowed to
+   `hold_reset_percent > hold_threshold_percent`), and produces the policy
+   for the run.
+2. **SOC monitor** — reads the EV-SOC frame (ID TBD — `0x206` is absent on
+   this bus), converts to a usable SOC value, applies a debounce/smoothing
+   filter (raw CAN values can be noisy frame-to-frame).
+3. **Reconciler** — one pure function, `desired_mode(setpoint, soc,
+   floor_latched) -> DriveMode | None`, per the "Mode policy" table, plus the
+   in-memory floor-latch hysteresis. The loop calls it every pass and, when
+   `desired` is not `None` and differs from `state.drive_mode`, hands
+   `desired` to the safety gate. No per-drive edge state, no once-only latch.
+4. **Button helper** — a tiny separate process (system Python, `gpiozero`)
+   that watches `mountain_button_gpio` and calls `voltdmf-ctl setpoint …` on
+   each press to toggle HOLD ⇄ MOUNTAIN. Kept out of the daemon so the
+   daemon's venv gains no GPIO dependency and its privilege set is unchanged;
+   it reaches the daemon only through the existing control socket. Its own
+   systemd unit in `roles/voltdmf`.
+5. **Mode-cycle controller** — reads current mode from the status signal
+   (`0x1F4` byte 1, confirmed), walks the drive-mode menu to the requested
+   `target_mode` along the fixed Normal→Sport→Mountain→Hold cycle order —
+   closing the loop on the live menu cursor (`0x1F4` byte 4) — and sends the
+   taps through the safety wrapper below. This is the one place that needs the
+   actual button-press CAN frame; the reconciler and `set-mode` both just ask
+   it for a `target_mode` and it doesn't care which asked.
+6. **Safety wrapper** (see next section) — the only code path allowed to
    transmit.
 
 The button-press signal (`0x1E1`) and the current-mode readback (`0x1F4`)
@@ -316,10 +327,10 @@ this project needs. Tighten that:
   account through a control socket (see "Runtime control" below). Every
   command that could transmit still funnels through the *same*
   `SafetyGate.request*()` → single `send_mode_button_press()` path the
-  triggers use. A manual `set-mode` overrides only the trigger *arming*
-  decision — it is still subject to preconditions, the press cap, the
-  cooldown, and the menu-cursor readback. There is still no "send arbitrary
-  frame" path.
+  reconciler uses. A manual `set-mode` is an out-of-band nudge that does not
+  move the setpoint — it is still subject to preconditions, the press cap, the
+  cooldown, and the menu-cursor readback, and the reconciler will pull the mode
+  back on its next pass. There is still no "send arbitrary frame" path.
 
 ### Runtime control
 
@@ -331,8 +342,9 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | --- | --- | --- |
 | `status` | daemon + vehicle snapshot | answered read-only on the socket thread |
 | `arm` / `disarm` | flip the runtime transmit-enable | queued → loop thread |
-| `set-mode <mode>` | request one mode switch now | queued → `SafetyGate.request_verbose()` |
-| `reload` | re-read the config file, rebuild triggers | queued → loop thread |
+| `setpoint <hold\|mountain>` | move the reconciler setpoint (the panel button is a `setpoint` caller) | queued → loop thread |
+| `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
+| `reload` | re-read the config file, rebuild the policy | queued → loop thread |
 
 - **Privilege boundary = file mode.** The `.socket` unit binds it
   `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no
@@ -350,12 +362,18 @@ invocations. State changes come in over an `AF_UNIX` stream socket
   boots *disarmed*; an operator must `voltdmf-ctl arm` it (or start it with
   `--armed`). Under `--dry-run`, `arm` is refused outright and the CAN layer
   no-ops every press regardless.
-- **Manual override is soft.** A successful `set-mode` records the target for
-  display; the next real trigger edge clears it and reclaims control. Between
-  edges nothing re-asserts, so the manually chosen mode simply persists.
-- **`reload` resets trigger latches.** Rebuilding triggers means a
-  `once-per-drive` trigger (on-start) can fire again — reload is an explicit
-  operator action, treated as a re-arm.
+- **`setpoint` is the normal control.** It moves the reconciler's HOLD ⇄
+  MOUNTAIN toggle; the reconciler then drives the car toward the desired mode
+  and holds it there, self-healing if the driver bumps the stalk. The setpoint
+  lives in memory only — every boot starts at `hold` (no persisted state; see
+  "Mode policy").
+- **`set-mode` is a soft, out-of-band nudge.** It asks the mode-cycle
+  controller for one switch now without moving the setpoint, so the reconciler
+  will pull the mode back on its next pass (after the cooldown). Use it for
+  bench pokes, not steady-state control.
+- **`reload` re-reads the policy.** It rebuilds the `policy:` block (thresholds,
+  button pin). The floor-latch hysteresis state is dropped on reload, so the
+  floor re-evaluates from the current SOC.
 
 ## Phased plan
 
@@ -374,19 +392,19 @@ invocations. State changes come in over an `AF_UNIX` stream socket
      controller needs. A good place to check: whatever message drives the
      dash cluster's mode indicator icon, since that has to be broadcast on
      the bus regardless of what triggered the change.
-   - Separately, check whether the car resets to Normal on every ignition
-     cycle or remembers the last mode across power-off — this determines
-     whether the on-start trigger can assume a fixed starting mode or also
-     needs the status signal.
+   - Ignition-cycle mode persistence is no longer on the critical path: the
+     reconciler is level-triggered and reads the live mode from `0x1F4` every
+     pass, so it converges regardless of what mode the car powers up in.
 2. **Bench-safe injection test.** Using the discovered button-press message,
    replay presses from the laptop (still stationary) and confirm the mode
    actually advances one step per press, in the expected order, and that
    nothing else on the bus reacts badly (watch for new DTCs, warning
    lights).
-3. **Daemon development.** Write the config loader, SOC monitor, trigger
-   evaluators, and safety-wrapped injector(s) described above, using the
-   confirmed CAN IDs. Test on the Pi with the overlay filesystem enabled
-   (see "Hardware design") before final deployment.
+3. **Daemon development.** Write the config loader, SOC monitor, the
+   reconciler, the button helper, and safety-wrapped injector(s) described
+   above, using the confirmed CAN IDs. Test on the Pi with the overlay
+   filesystem enabled (see "Hardware design") before final deployment — the
+   read-only root is why the reconciler keeps no persisted state.
 4. **Deployment.** Mount the Pi + PiCAN2 in the car, power from the
    accessory socket, and test across several real drive cycles, tuning the
    SOC threshold based on how early the switch needs to happen to reliably
@@ -408,8 +426,9 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   current-mode source; the press-counting fallback is retired, and no
   indirect-inference fallback is needed. byte 4 gives a live menu cursor used
   to close the loop on a walk.
-- **Ignition/drive-cycle start** — no dedicated signal needed: the Pi is on
-  the switched accessory socket, so process start *is* the on-start event.
+- **Ignition/drive-cycle start** — no dedicated signal needed, and no longer
+  used as a trigger. The Pi is powered whenever the car is usable, and the
+  reconciler is level-triggered, so there is no ignition edge to catch.
 - **Shift/PRNDL → `0x1F5` byte 3** (`1`–`5` = P/R/N/D/L). `SafetyGate` blocks
   injection unless in DRIVE and blocks on UNKNOWN.
 
@@ -418,13 +437,18 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 - **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) never appears on
   this Gen 1 bus. The real EV-SOC message ID is unknown; raw→percent
   (`SOC_KWH_PER_COUNT`, `GEN1_PACK_USABLE_KWH`) is uncalibrated. Needs a
-  discharge drive with `tools/soc_log.py` / `tools/watch_soc.py` against the
-  dash reading. The SOC-threshold trigger cannot fire until this lands.
-- **Drive-mode persistence across ignition cycles.** Whether the car resets to
-  NORMAL on every start or remembers the last-used mode — affects only whether
-  the on-start trigger can assume a starting mode (it currently reads `0x1F4`
-  either way). Also: how long after key-off the HS-CAN goes quiet. Run
-  `tools/ignition_check.py`.
+  discharge drive with `tools/soc_log.py` (passive capture + panel-button gauge
+  marks) against the dash reading, then `tools/mine_capture.py --monotonic`.
+  The reconciler's SOC-HOLD floor cannot engage until this lands — it is the
+  last blocker on a non-dry-run daemon.
+
+### Deferred (not blocking)
+
+- **Drive-mode persistence across ignition cycles.** Off the critical path
+  under the reconciler (it reads the live mode from `0x1F4` and converges from
+  any starting mode). Still mildly interesting for tuning the first-pass delay,
+  along with how long after key-off the HS-CAN goes quiet — `tools/ignition_check.py`,
+  whenever it's convenient.
 
 ## Sources
 
