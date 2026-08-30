@@ -262,12 +262,24 @@ class Buttons:
         except Exception as exc:  # noqa: BLE001
             log(f"  buttons off (no gpiozero: {exc})")
             return
-        try:
-            a = Button(gpio_a, pull_up=True, bounce_time=0.05)
-            b = Button(gpio_b, pull_up=True, bounce_time=0.05)
-        except Exception as exc:  # noqa: BLE001
-            log(f"  buttons off (GPIO {gpio_a}/{gpio_b} unavailable: {exc})")
-            return
+        # When button_helper.py launches us it has only just close()d these
+        # same pins; the kernel can still report them busy for a beat. Retry
+        # briefly before giving up and running the whole drive button-less.
+        a = b = None
+        for attempt in range(1, 9):
+            try:
+                a = Button(gpio_a, pull_up=True, bounce_time=0.05)
+                b = Button(gpio_b, pull_up=True, bounce_time=0.05)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if a is not None:
+                    a.close()
+                    a = None
+                if attempt == 8:
+                    log(f"  buttons off (GPIO {gpio_a}/{gpio_b} unavailable "
+                        f"after {attempt} tries: {exc})")
+                    return
+                time.sleep(0.75)
         a.when_pressed = lambda: self._session.gauge(-1)
         b.when_pressed = lambda: self._session.gauge(+1)
         self._btns = (a, b)

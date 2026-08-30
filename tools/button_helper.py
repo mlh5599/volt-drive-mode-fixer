@@ -165,6 +165,7 @@ class ButtonHelper:
             time.sleep(0.3)          # let the daemon watch screen close the port
         self._flash_lcd("SOC CAPTURE", "starting candump...", "", "hold BOTH = stop")
         self._release_buttons()      # soc_log.py --buttons needs these same pins
+        self._stop.wait(0.5)         # let lgpio free the lines before soc_log grabs
         try:
             self._wait_out_unit(start=True)
         finally:
@@ -184,32 +185,52 @@ class ButtonHelper:
         return r.stdout.strip() in _RUNNING_STATES
 
     def _wait_out_unit(self, *, start: bool = False) -> None:
-        """Block until the capture unit is no longer running. With ``start``,
-        kick it off first -- ``systemctl start`` without ``--no-block`` also
-        attaches to an already-queued job, so this is safe either way."""
-        argv = ["systemctl", "start", self._unit] if start else \
-               ["systemctl", "start", "--no-block", self._unit]
-        try:
-            proc = subprocess.Popen(argv)
-        except OSError as exc:
-            log.error("could not run %s: %s", " ".join(argv), exc)
-            return
-        # Poll proc *and* the stop flag so SIGTERM to the helper returns
-        # promptly. If we bail early the unit keeps running under systemd --
-        # we deliberately do not stop the capture.
-        while not self._stop.is_set():
-            try:
-                rc = proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                if not start and not self._unit_running():
-                    return
-                continue
-            if rc == 0:
-                log.info("%s completed", self._unit)
+        """Block until the capture unit is no longer running, tracking it by
+        ``systemctl is-active`` -- never by the ``systemctl start`` exit.
+
+        A blocking ``systemctl start`` only reliably waits out a Type=oneshot
+        job when it is called as root on the system bus; over the polkit path
+        the helper uses (User=voltdmf-btn) it can return as soon as the job is
+        queued. Trusting its return code let the helper re-grab SW1/SW2
+        seconds into a 90-minute capture, so soc_log.py came up with
+        "GPIO busy" and ran the whole drive with its buttons dead. Poll
+        instead.
+
+        With ``start``: fire ``--no-block``, wait for the unit to actually come
+        up, then fall through to the leave-watch. If we bail on ``self._stop``
+        the unit keeps running under systemd -- we never stop the capture."""
+        if start:
+            r = self._run_systemctl(["start", "--no-block", self._unit])
+            if r is not None and r.returncode != 0:
+                log.error("could not start %s: %s", self._unit,
+                          (r.stderr or r.stdout).strip())
+                return
+            # Wait out the pre-start window so the leave-watch below does not
+            # see the stale `inactive` and return immediately.
+            deadline = time.monotonic() + 20.0
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                if self._unit_running():
+                    break
+                self._stop.wait(0.25)
             else:
-                log.warning("%s exited non-zero (systemctl rc=%d)", self._unit, rc)
-            return
+                if not self._stop.is_set():
+                    log.warning("%s did not come up within 20s -- watching anyway",
+                                self._unit)
+
+        while not self._stop.is_set():
+            if not self._unit_running():
+                log.info("%s finished", self._unit)
+                return
+            self._stop.wait(1.0)
         log.info("helper stopping -- leaving %s running", self._unit)
+
+    def _run_systemctl(self, args: list[str]) -> "subprocess.CompletedProcess | None":
+        try:
+            return subprocess.run(["systemctl", *args],
+                                  capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.error("systemctl %s failed: %s", " ".join(args), exc)
+            return None
 
     # -- GPIO ----------------------------------------------------------
     def _acquire_with_retry(self, tries: int = 12, delay: float = 0.5) -> None:
