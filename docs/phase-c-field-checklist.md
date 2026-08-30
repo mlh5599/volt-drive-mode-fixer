@@ -23,6 +23,14 @@ Covers DESIGN.md **Phase A** (CAN bring-up) → **Phase C** (signal discovery) �
 > on-road PASS (session 4). Remaining: the **SOC discharge drive** (bench prep
 > A1–A4 done — see field-session-log Session 6), `ignition_check.py`, and the
 > stationary injection sweep.
+>
+> **Update (session 7, 2026-08-30):** the **panel-button path** for the SOC
+> drive is **verified in-car** — SW1+SW2 held 5 s launches
+> `voltdmf-soclog.service`, and in the logger A/B move the gauge and
+> hold-both-3s stops clean (took three GPIO hand-off fixes: `5b951da` /
+> `e69cb44` / `55fe176`; deployed pin `55fe176`). The SOC discharge drive can
+> now be run start-to-finish from the driver's seat with no laptop. Only the
+> drive itself + `mine_capture.py` analysis remain for SOC.
 
 ---
 
@@ -96,7 +104,7 @@ per-byte scan, then a full-frame diff of a physical press. Full detail in
       injection too — see Phase C.5)
 - [x] Video of the cluster during the walk, checked against timestamps
 
-### 2b · SOC — find the ID + scaling  ⚠️ still needs the drive; bench prep done
+### 2b · SOC — find the ID + scaling  ⚠️ still needs the drive; capture path verified in-car
 
 `0x206` **never appears** on this bus (Gen-2 ID, wrong for Gen 1), and this
 dash shows **no SOC %** — only EV-range miles + a 10-increment battery gauge.
@@ -111,9 +119,15 @@ drive".
       pin, `soc_log.py --dry-run` clean, `button_check.py` (claim + idle +
       debounce + `hold both 3s` stop) and a 1-min `soc_log.py --buttons
       --lcd` run (two-way LCD hand-off) verified on the Pi.
-- [ ] The drive: start `soc_log.py --yes --minutes 90 --buttons --lcd` parked
-      with a near-full gauge, discharge ≥4–5 increments tapping A on each
-      drop, hold both buttons to stop.
+- [x] Panel-launch path verified in-car (session 7, 2026-08-30): SW1+SW2 held
+      5 s starts `voltdmf-soclog.service`; in the logger A/B move the gauge
+      and hold-both-3s stops without a stray gauge mark. Deployed pin
+      `55fe176` (fixes `5b951da` / `e69cb44` / `55fe176`).
+- [ ] The drive: park with a near-full gauge, **hold SW1+SW2 ~5 s** to start
+      the 90-min capture (or, from a laptop, `systemctl start
+      voltdmf-soclog.service` / `soc_log.py --yes --minutes 90 --buttons
+      --lcd`). Discharge ≥4–5 increments, tapping A on each drop (B if it
+      climbs back), then hold both buttons 3 s to stop.
 - [ ] `mine_capture.py <capture> --ids` / `--monotonic --top 25` /
       `--series ID:OFF:W[:le] --every 20`; cross the top monotonic field
       against the button/`SOC-MARK` timestamps (steps with the gauge, flat
