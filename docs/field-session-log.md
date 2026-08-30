@@ -739,6 +739,19 @@ SOC hunt either way.
   Converged onto voltpi 2026-08-29 with
   `ansible-playbook playbooks/voltpi.yml --tags voltdmf`; `can0` now boots
   `ERROR-ACTIVE restart-ms 100`, no hand `ip link` needed.
-- ⬜ Once injection passes: bump `voltdmf_version` in
-  `inventories/production/host_vars/voltpi.haguehome.lan/vars.yml` to the
-  confirmed-signals commit. Keep `voltdmf_dry_run: true`.
+- ✅ **DONE — homelab-ansible `onboard-voltpi` @ `c76c592` + `6fbf2cd`,
+  converged + verified on voltpi 2026-08-29.** `roles/voltdmf` now deploys the
+  runtime control socket: `voltdmf.socket` (systemd-activated
+  `/run/voltdmf/control.sock`, `0660 voltdmf:voltdmf`), `voltdmf.service` gains
+  `Requires=/After=voltdmf.socket` + `RuntimeDirectory=voltdmf`, and a
+  `/usr/local/bin/voltdmf-ctl` symlink. `voltdmf-ctl status` works over the
+  socket; daemon logs `control socket up (inherited fd)`, still
+  `armed=False, dry_run=True`. Operators in the `voltdmf` group get
+  `voltdmf-ctl status | set-mode <m> | arm | disarm | reload` with no sudo.
+- ✅ **DONE — `6fbf2cd`.** Bumped `voltdmf_version` in
+  `inventories/production/host_vars/voltpi.haguehome.lan/vars.yml` to
+  `380e924` (confirmed-signals + control-socket `main`) — done early, out of
+  order, because the control socket needs `voltdmf/control.py`. This also
+  unstuck `/opt/voltdmf/repo`, which the `git` task had left frozen at the
+  2026-08-28 scaffold (`voltdmf_version` must be a full SHA, not `main`).
+  `voltdmf_dry_run` stays `true`.
