@@ -33,9 +33,11 @@ alone; `--lcd-port` / `--lcd-baud` / `--lcd-backlight` tune it.
 
 Hand-off is advisory: the tools above that drive the LCD (`lcd.py`,
 `drive_log.py --lcd`, `soc_log.py --lcd`) write a small lock file
-(`~/.voltdmf-lcd.lock`, override `VOLTDMF_LCD_LOCK`); the watch thread sees it,
-closes its port, and idles until the lock is dropped, then resumes. A lock
-left by a dead process is ignored.
+(`/run/lock/voltdmf-lcd.lock`, or `~/.voltdmf-lcd.lock` off-Pi; override with
+`VOLTDMF_LCD_LOCK`); the watch thread sees it, closes its port, and idles
+until the lock is dropped, then resumes. A lock left by a dead process is
+ignored. `/run/lock` is used because the deployed daemon runs as `voltdmf`
+under `ProtectHome=` and shares no `$HOME` with the login user's tools.
 
 Deliverable of Phase C: fill the confirmed values into `voltdmf/signals.py` and
 `voltdmf/canio.py`, flip the `confirmed` flags, and write

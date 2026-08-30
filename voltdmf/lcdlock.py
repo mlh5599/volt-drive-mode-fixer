@@ -19,12 +19,32 @@ import contextlib
 import os
 from pathlib import Path
 
-#: Both the daemon and the tools run as the same user on the Pi, so a
-#: dotfile in ``$HOME`` is the least surprising shared location. Override
-#: with ``VOLTDMF_LCD_LOCK`` (tests point it at a tmp path).
-LOCK_PATH = Path(
-    os.environ.get("VOLTDMF_LCD_LOCK", str(Path.home() / ".voltdmf-lcd.lock"))
-)
+def _default_lock_path() -> Path:
+    """Where the hand-off file lives when ``VOLTDMF_LCD_LOCK`` is unset.
+
+    On the Pi the daemon runs as ``voltdmf`` under ``ProtectHome=`` /
+    ``ProtectSystem=strict`` while the by-hand tools run as the login user
+    out of ``~/vdmf`` -- they share no writable ``$HOME``. ``/run/lock`` (FHS,
+    tmpfs, ``1777``) is the one spot both can always reach, so prefer it and
+    fall back to a ``$HOME`` dotfile only where it is missing (dev boxes,
+    non-Linux). Stale files there are owned by whoever last held the lock;
+    the sticky bit can stop the daemon unlinking one it did not create, but
+    :func:`holder` treats a dead-pid file as absent regardless.
+    """
+    override = os.environ.get("VOLTDMF_LCD_LOCK")
+    if override:
+        return Path(override)
+    run_lock = Path("/run/lock")
+    if run_lock.is_dir():
+        return run_lock / "voltdmf-lcd.lock"
+    return Path.home() / ".voltdmf-lcd.lock"
+
+
+#: Advisory hand-off file, ``"<pid>: <what>"``. Override with
+#: ``VOLTDMF_LCD_LOCK`` (the deployed unit sets it; tests point it at a tmp
+#: path). Reassigning this module attribute also works -- callers read it
+#: lazily via ``path or LOCK_PATH``.
+LOCK_PATH = _default_lock_path()
 
 
 def _pid_alive(pid: int) -> bool:

@@ -45,7 +45,8 @@ watch screen).
      `render_screen()`. Fail-soft: never raises into the daemon loop, a
      missing/unusable serial port is just a dark screen with one warning.
    - `voltdmf/lcdlock.py` (new) — advisory hand-off lock at
-     `~/.voltdmf-lcd.lock` (`VOLTDMF_LCD_LOCK` override), `"<pid>: <what>"`.
+     `/run/lock/voltdmf-lcd.lock` (was `~/.voltdmf-lcd.lock`; `VOLTDMF_LCD_LOCK`
+     override), `"<pid>: <what>"`.
      `tools/lcd.py`, `drive_log.py --lcd`, `soc_log.py --lcd` take it; the
      watch thread sees it, closes its port, idles, and resumes on release.
      A lock left by a dead pid is ignored.
@@ -111,14 +112,14 @@ All Phase C work is now on `main`: `phase-c-soc-discovery` and
    still need `daemon.py` to use it as `current_mode_source` /
    `menu_cursor_source` instead of the press-counting tracker. Consider
    `SafetyGate(allow_unknown_shift=False)` now that `0x1F5` decodes.
-3. **Make the installed daemon the idle display.** (a) ✅ `/opt/voltdmf`
-   redeployed via Ansible (host_vars SHA pin, `6fbf2cd`). (b) ✅ service user
-   now has `SupplementaryGroups=dialout` (`7388119`) — watch screen starts
-   clean. (c) ⬜ hand-off lock path: the daemon runs as `voltdmf` with
-   `ProtectHome=true`, so `~/.voltdmf-lcd.lock` resolves nowhere near
-   `mike`'s home — set `VOLTDMF_LCD_LOCK` to a shared path (e.g.
-   `/run/voltdmf/lcd.lock`) in both the unit and the tools' defaults. Only
-   bites when a by-hand tool wants the panel; the daemon paints it fine now.
+3. **Make the installed daemon the idle display.** ✅ Done. (a) `/opt/voltdmf`
+   redeployed via Ansible (host_vars SHA pin, `6fbf2cd`). (b) service user has
+   `SupplementaryGroups=dialout` (`7388119`) — watch screen starts clean.
+   (c) hand-off lock moved off `~/.voltdmf-lcd.lock` (daemon runs as `voltdmf`
+   with `ProtectHome=`, no shared `$HOME` with `mike`'s tools) to
+   `/run/lock/voltdmf-lcd.lock` — `lcdlock._default_lock_path()` prefers
+   `/run/lock` (1777 tmpfs), and the unit sets `Environment=VOLTDMF_LCD_LOCK`
+   from the new `voltdmf_lcd_lock_path` default to match.
 4. Default detached `drive_log.py` / `soc_log.py` runs to `--no-bounce`, or
    fix the `/etc/sudoers.d/50-voltdmf-canlink` match.
 5. OBD-II DTC scan.
@@ -772,6 +773,14 @@ SOC hunt either way.
     changes, so a service-only restart slipped past. Preserve keeps the dir
     (and the socket file) across a restart of either unit; the socket's
     `RemoveOnStop=true` still clears the file on a real `.socket` stop.
-  - Item 3(c) (hand-off lock path `VOLTDMF_LCD_LOCK` → `/run/voltdmf/...`)
-    still open — the watch screen runs without it; only matters once a
-    by-hand tool needs to take the panel from the daemon.
+  - Item 3(c) — LCD hand-off lock. `lcdlock.LOCK_PATH` defaulted to
+    `~/.voltdmf-lcd.lock`, but the daemon (`voltdmf`, `ProtectHome=`) and the
+    login user's tools share no writable `$HOME`, so the tool wrote
+    `/home/mike/...` while the daemon watched `/opt/voltdmf/...` — hand-off
+    never fired. Now `lcdlock._default_lock_path()` prefers
+    `/run/lock/voltdmf-lcd.lock` (1777 tmpfs, both can reach it), `$HOME`
+    dotfile only as an off-Pi fallback; `VOLTDMF_LCD_LOCK` still overrides.
+    The unit sets `Environment=VOLTDMF_LCD_LOCK` from the new
+    `voltdmf_lcd_lock_path` ansible default so the two stay pinned together.
+    Code change is in the volt repo — needs a `voltdmf_version` bump +
+    converge to land on voltpi.
