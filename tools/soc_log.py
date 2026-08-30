@@ -262,24 +262,42 @@ class Buttons:
         except Exception as exc:  # noqa: BLE001
             log(f"  buttons off (no gpiozero: {exc})")
             return
-        # When button_helper.py launches us it has only just close()d these
-        # same pins; the kernel can still report them busy for a beat. Retry
-        # briefly before giving up and running the whole drive button-less.
+        # When button_helper.py launches us it has only just handed these pins
+        # back; lgpio's release on the other side can lag a second or two, and
+        # a half-done claim here poisons the retry. Between tries, close what
+        # we got AND drop the pin factory (frees the gpiochip fd) before the
+        # next attempt. ~15 s of headroom, then run button-less.
+        from gpiozero import Device  # noqa: PLC0415
+
+        def _drop_factory() -> None:
+            try:
+                if Device.pin_factory is not None:
+                    Device.pin_factory.close()
+                    Device.pin_factory = None
+            except Exception:  # noqa: BLE001
+                pass
+
         a = b = None
-        for attempt in range(1, 9):
+        tries = 15
+        for attempt in range(1, tries + 1):
             try:
                 a = Button(gpio_a, pull_up=True, bounce_time=0.05)
                 b = Button(gpio_b, pull_up=True, bounce_time=0.05)
                 break
             except Exception as exc:  # noqa: BLE001
-                if a is not None:
-                    a.close()
-                    a = None
-                if attempt == 8:
+                for x in (a, b):
+                    if x is not None:
+                        try:
+                            x.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                a = b = None
+                _drop_factory()
+                if attempt == tries:
                     log(f"  buttons off (GPIO {gpio_a}/{gpio_b} unavailable "
                         f"after {attempt} tries: {exc})")
                     return
-                time.sleep(0.75)
+                time.sleep(1.0)
         a.when_pressed = lambda: self._session.gauge(-1)
         b.when_pressed = lambda: self._session.gauge(+1)
         self._btns = (a, b)

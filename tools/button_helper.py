@@ -55,10 +55,12 @@ log = logging.getLogger("button_helper")
 #: between samples; slow enough to stay invisible on the CPU.
 _POLL_S = 0.05
 
-#: `systemctl is-active` outputs that mean "the capture is still going".
-#: A Type=oneshot/RemainAfterExit=no unit sits in `activating` for its whole
-#: run, so `active` alone is not enough.
-_RUNNING_STATES = {"active", "activating", "reloading"}
+#: `systemctl is-active` outputs that mean "the capture is over". Everything
+#: else -- `active`, `activating` (a Type=oneshot/RemainAfterExit=no unit sits
+#: here for its whole run), `reloading`, `deactivating`, or an unreadable
+#: answer -- is treated as "still going". Guessing "over" is the dangerous
+#: direction: it makes the helper grab SW1/SW2 back mid-capture.
+_DONE_STATES = {"inactive", "failed"}
 
 
 class ButtonHelper:
@@ -176,13 +178,21 @@ class ButtonHelper:
 
     # -- systemd unit plumbing -------------------------------------------
     def _unit_running(self) -> bool:
-        try:
-            r = subprocess.run(["systemctl", "is-active", self._unit],
-                               capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError) as exc:
-            log.warning("systemctl is-active failed (%s); assuming not running", exc)
-            return False
-        return r.stdout.strip() in _RUNNING_STATES
+        """True while the capture unit is up. On a transient ``systemctl``
+        error we keep saying "up" (up to three tries) rather than "finished":
+        a false "finished" makes the caller re-grab SW1/SW2 while soc_log.py
+        is still running, which is exactly the bug this whole dance avoids."""
+        for _ in range(3):
+            try:
+                r = subprocess.run(["systemctl", "is-active", self._unit],
+                                   capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("systemctl is-active %s failed (%s); assuming still up",
+                            self._unit, exc)
+                self._stop.wait(0.5)
+                continue
+            return r.stdout.strip() not in _DONE_STATES
+        return True
 
     def _wait_out_unit(self, *, start: bool = False) -> None:
         """Block until the capture unit is no longer running, tracking it by
@@ -265,6 +275,18 @@ class ButtonHelper:
                 except Exception:  # noqa: BLE001
                     pass
                 setattr(self, name, None)
+        # gpiozero's Button.close() drops the Python object but leaves lgpio's
+        # gpiochip handle open, so the kernel lines stay claimed and the next
+        # owner (soc_log.py) comes up "GPIO busy" for the whole capture. Tear
+        # the pin factory down too: closing the gpiochip fd frees every line
+        # it holds. The next Button() call lazily rebuilds the factory.
+        try:
+            from gpiozero import Device  # noqa: PLC0415
+            if Device.pin_factory is not None:
+                Device.pin_factory.close()
+                Device.pin_factory = None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("pin-factory teardown skipped: %s", exc)
 
     # -- LCD (best-effort; the capture does not depend on it) -----------
     def _flash_lcd(self, *rows: str) -> None:
