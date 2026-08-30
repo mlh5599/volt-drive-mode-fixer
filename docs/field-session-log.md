@@ -111,16 +111,14 @@ All Phase C work is now on `main`: `phase-c-soc-discovery` and
    still need `daemon.py` to use it as `current_mode_source` /
    `menu_cursor_source` instead of the press-counting tracker. Consider
    `SafetyGate(allow_unknown_shift=False)` now that `0x1F5` decodes.
-3. **Make the installed daemon the idle display** (deferred this session —
-   picked "leave the service alone, run the dashboard by hand" for now). To
-   have `voltdmf.service` paint the watch screen at idle, three things need
-   fixing: (a) `/opt/voltdmf` has stale code — redeploy via Ansible;
-   (b) the `voltdmf` service user (uid 997, no supp. groups) can't open
-   `/dev/serial0` (`root:dialout`) — add it to `dialout` in the role;
-   (c) hand-off lock path: the daemon runs as `voltdmf` with
+3. **Make the installed daemon the idle display.** (a) ✅ `/opt/voltdmf`
+   redeployed via Ansible (host_vars SHA pin, `6fbf2cd`). (b) ✅ service user
+   now has `SupplementaryGroups=dialout` (`7388119`) — watch screen starts
+   clean. (c) ⬜ hand-off lock path: the daemon runs as `voltdmf` with
    `ProtectHome=true`, so `~/.voltdmf-lcd.lock` resolves nowhere near
    `mike`'s home — set `VOLTDMF_LCD_LOCK` to a shared path (e.g.
-   `/run/voltdmf/lcd.lock`) in both the unit and the tools' defaults.
+   `/run/voltdmf/lcd.lock`) in both the unit and the tools' defaults. Only
+   bites when a by-hand tool wants the panel; the daemon paints it fine now.
 4. Default detached `drive_log.py` / `soc_log.py` runs to `--no-bounce`, or
    fix the `/etc/sudoers.d/50-voltdmf-canlink` match.
 5. OBD-II DTC scan.
@@ -755,3 +753,25 @@ SOC hunt either way.
   unstuck `/opt/voltdmf/repo`, which the `git` task had left frozen at the
   2026-08-28 scaffold (`voltdmf_version` must be a full SHA, not `main`).
   `voltdmf_dry_run` stays `true`.
+- ✅ **DONE — homelab-ansible `onboard-voltpi` @ `7388119`, converged +
+  verified on voltpi 2026-08-30.** Fixes item 3(b) above and a latent
+  control-socket bug:
+  - `voltdmf.service` gains `SupplementaryGroups=dialout` (new
+    `voltdmf_service_supplementary_groups` default), so the daemon can open
+    `/dev/serial0` for the LCD watch screen. Log now shows `LCD watch screen
+    thread started` with no `Permission denied` after it; process `Groups:
+    20 984`. No change to the system user or the device mode.
+  - `RuntimeDirectoryPreserve=yes` on **both** `voltdmf.service` and
+    `voltdmf.socket`. Deploying the `dialout` change exposed it: a bare
+    `systemctl restart voltdmf.service` (the `Restart voltdmf` handler)
+    removed + recreated the shared `/run/voltdmf`, deleting the endpoint
+    `voltdmf.socket` had bound — the `.socket` unit stays active and keeps
+    handing the daemon its inherited fd, so the daemon looks fine, but
+    `voltdmf-ctl` gets `FileNotFoundError` (no path left to connect to). The
+    socket-rebind handler chain only runs when the `.socket` template
+    changes, so a service-only restart slipped past. Preserve keeps the dir
+    (and the socket file) across a restart of either unit; the socket's
+    `RemoveOnStop=true` still clears the file on a real `.socket` stop.
+  - Item 3(c) (hand-off lock path `VOLTDMF_LCD_LOCK` → `/run/voltdmf/...`)
+    still open — the watch screen runs without it; only matters once a
+    by-hand tool needs to take the panel from the daemon.
