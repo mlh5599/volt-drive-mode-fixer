@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 from .modecycle import ModeCycleController
@@ -28,6 +29,22 @@ MODE_SWITCH_COOLDOWN_S = 60.0
 MAX_PLAUSIBLE_SPEED_MPH = 100.0
 
 _BLOCKING_SHIFTS = {ShiftPosition.PARK, ShiftPosition.REVERSE, ShiftPosition.NEUTRAL}
+
+
+@dataclass(frozen=True)
+class RequestOutcome:
+    """What :meth:`SafetyGate.request_verbose` did, for a human-facing reply.
+
+    ``sent`` -- presses actually went on the wire.
+    ``blocked`` -- a precondition, the cooldown, or an error stopped it (as
+    opposed to a clean no-op because the car already reads ``target``).
+    ``reason`` -- always a short human-readable phrase.
+    """
+
+    sent: bool
+    presses: int
+    blocked: bool
+    reason: str
 
 
 class SafetyGate:
@@ -59,30 +76,55 @@ class SafetyGate:
         return None
 
     def _in_cooldown(self) -> bool:
+        return self.cooldown_remaining() > 0.0
+
+    def cooldown_remaining(self) -> float:
+        """Seconds left before another burst is allowed (0.0 if none)."""
         if self._last_switch is None:
-            return False
-        return (self._monotonic() - self._last_switch) < self._cooldown_s
+            return 0.0
+        return max(0.0, self._cooldown_s - (self._monotonic() - self._last_switch))
 
     def request(self, target: DriveMode, state: VehicleState) -> bool:
         """Attempt to switch to ``target``. Returns True only if presses were sent."""
+        return self.request_verbose(target, state).sent
+
+    def request_verbose(
+        self, target: DriveMode, state: VehicleState, *, force: bool = False
+    ) -> RequestOutcome:
+        """Like :meth:`request` but returns a :class:`RequestOutcome` with a
+        human-readable reason -- used by the control socket's ``set-mode``.
+
+        ``force`` walks the menu even when the mode source already reads
+        ``target`` (passed through to :meth:`ModeCycleController.switch_to`).
+        Preconditions, the cooldown, and the press cap are *not* bypassable.
+        """
         reason = self._precondition_failure(state)
         if reason is not None:
             log.info("mode switch to %s blocked: %s", target.value, reason)
-            return False
+            return RequestOutcome(False, 0, True, f"blocked: {reason}")
         if self._in_cooldown():
+            left = self.cooldown_remaining()
             log.debug("mode switch to %s suppressed: within cooldown", target.value)
-            return False
+            return RequestOutcome(
+                False, 0, True, f"blocked: within cooldown ({left:.0f}s left)"
+            )
 
         try:
-            sent = self._controller.switch_to(target)
-        except Exception:  # fail-passive: never propagate into the RX loop
+            sent = (
+                self._controller.switch_to(target, force=True)
+                if force
+                else self._controller.switch_to(target)
+            )
+        except Exception as exc:  # fail-passive: never propagate into the RX loop
             log.exception("mode switch to %s failed; staying passive", target.value)
             self._last_switch = self._monotonic()  # apply cooldown even on failure
-            return False
+            return RequestOutcome(False, 0, True, f"switch failed: {exc}")
 
         self._last_switch = self._monotonic()
         if sent == 0:
             log.info("already in %s; nothing to do", target.value)
-            return False
+            return RequestOutcome(False, 0, False, f"already in {target.value}")
         log.info("switched toward %s with %d press(es)", target.value, sent)
-        return True
+        return RequestOutcome(
+            True, sent, False, f"switched toward {target.value} with {sent} press(es)"
+        )

@@ -48,10 +48,54 @@ Pi 3B. They are checked in so the box is reproducible.
 sudo install -d /etc/voltdmf
 sudo cp ../config.example.yaml /etc/voltdmf/config.yaml   # then edit
 sudo pip install --break-system-packages ..               # or install the wheel
-sudo cp ../systemd/voltdmf.service /etc/systemd/system/
-sudo systemctl enable --now voltdmf
+sudo groupadd --system voltdmf                            # control-socket group
+sudo usermod -aG voltdmf "$USER"                          # log out/in to pick it up
+sudo cp ../systemd/voltdmf.service ../systemd/voltdmf.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now voltdmf.socket voltdmf.service
 journalctl -u voltdmf -f
 ```
+
+If `voltdmf.service` is managed elsewhere (e.g. the Ansible `roles/voltdmf`
+unit on `voltpi`, which runs as `User=voltdmf` + `AmbientCapabilities=CAP_NET_RAW`
+and keeps `--dry-run` in `ExecStart`), do **not** replace it. Install only the
+socket plus a drop-in:
+
+```
+sudo cp ../systemd/voltdmf.socket /etc/systemd/system/
+sudo cp -r ../systemd/voltdmf.service.d /etc/systemd/system/   # Requires=/After=voltdmf.socket
+sudo usermod -aG voltdmf "$USER"
+sudo ln -sf /opt/voltdmf/venv/bin/voltdmf-ctl /usr/local/bin/voltdmf-ctl
+sudo systemctl daemon-reload
+sudo systemctl enable --now voltdmf.socket
+sudo systemctl restart voltdmf.service
+```
+
+The socket file ends up `0660 voltdmf:voltdmf` (owner follows the service user),
+so operators reach it through the `voltdmf` group exactly as in the root layout.
+
+### Runtime control (`voltdmf-ctl`)
+
+The daemon runs permanently as root; steer it from your normal account via the
+control socket at `/run/voltdmf/control.sock` (mode `0660 root:voltdmf` — you
+must be in the `voltdmf` group, see above). No `sudo`:
+
+```
+voltdmf-ctl status                 # daemon + vehicle snapshot
+voltdmf-ctl arm                    # allow transmission (refused under --dry-run)
+voltdmf-ctl set-mode hold          # request one switch now (safety gate still applies)
+voltdmf-ctl disarm                 # stop transmitting; keep reading/evaluating
+voltdmf-ctl reload                 # re-read /etc/voltdmf/config.yaml
+```
+
+A non-`--dry-run` daemon **boots disarmed** — nothing transmits until
+`voltdmf-ctl arm` (or start it with `--armed`). `systemctl restart voltdmf`
+resets it to disarmed again. `voltdmf.socket` is socket-activated: `voltdmf-ctl`
+works even if the service is momentarily down (the command queues briefly).
+
+For bench work without the units, run the daemon with an explicit path:
+`python -m voltdmf --config … --control-socket /tmp/voltdmf.sock` and point the
+client at it with `--socket /tmp/voltdmf.sock` or `$VOLTDMF_CONTROL_SOCKET`.
 
 **Overlay File System (do this LAST, after the daemon is validated):**
 `sudo raspi-config` -> Performance Options -> Overlay File System = enabled;

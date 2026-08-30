@@ -33,10 +33,10 @@ status signal, and calibrate SOC against the dash.
 | Path | What |
 |---|---|
 | `DESIGN.md` | Full hardware/software design, phased plan, safety model. |
-| `voltdmf/` | The daemon: `config`, `signals`, `state`, `triggers`, `modecycle`, `safety`, `canio`, `daemon`. `python -m voltdmf --config ... [--dry-run]`. |
+| `voltdmf/` | The daemon: `config`, `signals`, `state`, `triggers`, `modecycle`, `safety`, `canio`, `daemon`, `control`/`ctl`. `python -m voltdmf --config ... [--dry-run]`. |
 | `tools/` | Phase C signal-discovery scripts (see `tools/README.md`). |
 | `host/` | Pi `config.txt` snippet + `systemd-networkd` unit to bring up `can0`. |
-| `systemd/` | `voltdmf.service`. |
+| `systemd/` | `voltdmf.service` + `voltdmf.socket` (control socket). |
 | `docs/signals-confirmed.md` | Phase C deliverable — the verified signal table (empty until then). |
 | `tests/` | `pytest` unit tests (hardware-free). |
 
@@ -49,6 +49,12 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 `--dry-run` reads and evaluates against a live bus but transmits nothing — the
 safe mode for early on-vehicle testing.
+
+The daemon runs permanently as root under systemd; change modes and daemon state
+from an unprivileged account with `voltdmf-ctl` (`status` / `arm` / `disarm` /
+`set-mode <mode>` / `reload`) over its control socket. A non-dry-run daemon
+boots **disarmed** until `voltdmf-ctl arm`. See `host/README.md` §"Runtime
+control" and DESIGN.md §"Runtime control".
 
 **Hardware:** PiCAN2 (Raspberry Pi CAN-bus HAT) + Raspberry Pi 3B, connected
 to the OBD-II port via an off-the-shelf OBD-II-to-DB9 cable, powered from

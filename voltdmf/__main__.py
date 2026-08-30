@@ -22,6 +22,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
+    ctl = p.add_argument_group("runtime control socket")
+    ctl.add_argument(
+        "--control-socket", metavar="PATH", default=None,
+        help="bind the control socket at PATH (bench use). Under systemd the "
+             "socket is passed by voltdmf.socket and this is not needed.",
+    )
+    ctl.add_argument(
+        "--no-control", dest="control", action="store_false",
+        help="disable the runtime control socket entirely",
+    )
+    ctl.add_argument(
+        "--armed", action="store_true",
+        help="start with transmission enabled instead of disarmed (ignored "
+             "under --dry-run)",
+    )
+    p.set_defaults(control=True)
+
     lcd = p.add_argument_group("LCD watch screen")
     lcd.add_argument("--no-lcd", dest="lcd", action="store_false",
                      help="do not drive the SparkFun LCD watch screen")
@@ -50,7 +67,11 @@ def main(argv: list[str] | None = None) -> int:
 
     daemon = Daemon(config, channel=args.channel, dry_run=args.dry_run,
                     lcd=args.lcd, lcd_port=args.lcd_port, lcd_baud=args.lcd_baud,
-                    lcd_backlight=args.lcd_backlight)
+                    lcd_backlight=args.lcd_backlight,
+                    control_enabled=args.control,
+                    control_socket_path=args.control_socket,
+                    config_path=args.config,
+                    start_armed=args.armed)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: daemon.request_stop())
 

@@ -18,6 +18,7 @@ dev = ["pytest>=7.4"]
 
 [project.scripts]
 voltdmf = "voltdmf.__main__:main"
+voltdmf-ctl = "voltdmf.ctl:main"
 
 [tool.setuptools]
 packages = ["voltdmf"]

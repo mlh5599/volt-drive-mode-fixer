@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Callable
 
 import can
 
@@ -91,11 +92,25 @@ SEND_CLUSTER_SIZE = PRESS_TRACK_FRAMES
 
 
 class CanInterface:
-    def __init__(self, channel: str = "can0", *, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        channel: str = "can0",
+        *,
+        dry_run: bool = False,
+        tx_gate: Callable[[], bool] | None = None,
+    ) -> None:
         self._channel = channel
         self._dry_run = dry_run
+        # Runtime transmit enable, checked live on every press. ``--dry-run`` is
+        # the immutable session lock; this is the toggle the control socket's
+        # arm/disarm flips. When it returns False we take the same no-op path as
+        # dry-run (log the intended press, transmit nothing).
+        self._tx_gate = tx_gate
         self._bus: can.BusABC | None = None
         self._notifier: can.Notifier | None = None
+
+    def _tx_suppressed(self) -> bool:
+        return self._dry_run or (self._tx_gate is not None and not self._tx_gate())
 
     # -- lifecycle --------------------------------------------------------
     def open(self) -> None:
@@ -198,10 +213,11 @@ class CanInterface:
         space presses ~5 s apart (the cluster rate-limits) -- see the module
         comment. The car commits the new mode ~2-3 s later.
         """
-        if self._dry_run:
-            log.info("[dry-run] would inject 0x1E1 press: track module + "
+        if self._tx_suppressed():
+            why = "dry-run" if self._dry_run else "disarmed"
+            log.info("[%s] would inject 0x1E1 press: track module + "
                      "byte4|=0x%02x x%d, then stop TX for >=%.2fs",
-                     PRESS_BYTE4, PRESS_TRACK_FRAMES, RELEASE_GAP_S)
+                     why, PRESS_BYTE4, PRESS_TRACK_FRAMES, RELEASE_GAP_S)
             return
         if self._bus is None:
             raise RuntimeError("open() first")

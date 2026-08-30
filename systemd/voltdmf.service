@@ -2,8 +2,12 @@
 Description=Volt Drive Mode Fixer
 # See DESIGN.md and host/README.md in the source tree for setup and rationale.
 Documentation=file:///usr/share/doc/voltdmf/DESIGN.md
-After=network-online.target
+After=network-online.target voltdmf.socket
 Wants=network-online.target
+# Pull in the control socket, but the daemon runs continuously regardless of
+# whether anything has connected (socket activation here just supplies the
+# already-bound listening fd -- it does NOT make the service on-demand).
+Requires=voltdmf.socket
 # fail-passive: if it keeps dying, stop rather than thrash the bus
 StartLimitIntervalSec=120
 StartLimitBurst=5
@@ -23,6 +27,16 @@ User=root
 # User=voltdmf
 # AmbientCapabilities=CAP_NET_RAW
 # NoNewPrivileges=true
+
+# Run with the shared control group so the runtime dir and the socket are
+# reachable by operators in the `voltdmf` group without sudo. Create it once:
+#   groupadd --system voltdmf && usermod -aG voltdmf <operator>
+Group=voltdmf
+
+# /run/voltdmf, mode 0750, root:voltdmf -- holds control.sock. Declared on both
+# this unit and voltdmf.socket; systemd keeps it until the last one stops.
+RuntimeDirectory=voltdmf
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target

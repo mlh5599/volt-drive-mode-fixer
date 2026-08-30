@@ -311,6 +311,51 @@ this project needs. Tighten that:
 - **Bench test before live testing.** Validate the discovered mode-switch
   message with the car safely stationary (ignition on, engine off, or on
   jack stands) before relying on it while driving.
+- **Runtime control does not widen the transmit surface.** The daemon runs
+  permanently as root under systemd; operators drive it from an unprivileged
+  account through a control socket (see "Runtime control" below). Every
+  command that could transmit still funnels through the *same*
+  `SafetyGate.request*()` → single `send_mode_button_press()` path the
+  triggers use. A manual `set-mode` overrides only the trigger *arming*
+  decision — it is still subject to preconditions, the press cap, the
+  cooldown, and the menu-cursor readback. There is still no "send arbitrary
+  frame" path.
+
+### Runtime control
+
+The daemon is a long-running root service, not a set of one-shot CLI
+invocations. State changes come in over an `AF_UNIX` stream socket
+(`voltdmf/control.py`), reached with the unprivileged `voltdmf-ctl` client:
+
+| command | effect | path |
+| --- | --- | --- |
+| `status` | daemon + vehicle snapshot | answered read-only on the socket thread |
+| `arm` / `disarm` | flip the runtime transmit-enable | queued → loop thread |
+| `set-mode <mode>` | request one mode switch now | queued → `SafetyGate.request_verbose()` |
+| `reload` | re-read the config file, rebuild triggers | queued → loop thread |
+
+- **Privilege boundary = file mode.** The `.socket` unit binds it
+  `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no
+  polkit, no D-Bus.
+- **systemd socket activation.** `voltdmf.socket` passes an already-bound
+  listening fd as fd 3; `control.inherited_listener()` picks it up with no
+  `python-systemd` dependency. The service still runs continuously
+  (`WantedBy=multi-user.target`) — activation only supplies the fd, it does
+  not make the daemon on-demand.
+- **Single-threaded transmit preserved.** `status` is answered directly from
+  a state snapshot. Everything that can transmit or mutate state is put on a
+  `queue.Queue` and executed by the daemon's one loop thread — the CAN TX
+  path and `SafetyGate` are never touched from the socket thread.
+- **`--dry-run` is an immutable session lock.** A non-dry-run daemon still
+  boots *disarmed*; an operator must `voltdmf-ctl arm` it (or start it with
+  `--armed`). Under `--dry-run`, `arm` is refused outright and the CAN layer
+  no-ops every press regardless.
+- **Manual override is soft.** A successful `set-mode` records the target for
+  display; the next real trigger edge clears it and reclaims control. Between
+  edges nothing re-asserts, so the manually chosen mode simply persists.
+- **`reload` resets trigger latches.** Rebuilding triggers means a
+  `once-per-drive` trigger (on-start) can fire again — reload is an explicit
+  operator action, treated as a re-arm.
 
 ## Phased plan
 

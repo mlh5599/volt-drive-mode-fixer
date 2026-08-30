@@ -1,0 +1,22 @@
+[Unit]
+Description=Volt Drive Mode Fixer control socket
+# No PartOf=: the listening socket is kept up across voltdmf.service restarts
+# so voltdmf-ctl calls queue for a moment during a restart instead of failing.
+
+[Socket]
+# Passed to voltdmf.service as fd 3 (LISTEN_FDS=1). voltdmf.control.inherited_listener()
+# picks it up by fd -- it never re-opens the path -- so the socket file owner is
+# only a client-access concern, handled by SocketGroup + SocketMode below.
+ListenStream=/run/voltdmf/control.sock
+SocketMode=0660
+SocketGroup=voltdmf
+RemoveOnStop=true
+
+# Creates /run/voltdmf. Mode 0755 so a voltdmf-group operator can traverse it
+# to the socket; the 0660 socket file is the actual privilege gate. (When the
+# service also declares RuntimeDirectory=voltdmf, systemd ref-counts the dir.)
+RuntimeDirectory=voltdmf
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target
