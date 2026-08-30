@@ -257,6 +257,15 @@ class Buttons:
         self._both_since: float | None = None
         self.stop_requested = False
         self._btns = None
+        # Poll-driven gesture state (no when_pressed callbacks): a tap only
+        # commits on *release*, and only if the other button was never down
+        # during that press -- so reaching for the two-button stop can't slip
+        # a stray GAUGE-UP/DOWN in first (you never hit both pads on the same
+        # millisecond).
+        self._a_down_at: float | None = None
+        self._b_down_at: float | None = None
+        self._a_saw_b = False
+        self._b_saw_a = False
         try:
             from gpiozero import Button  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
@@ -298,25 +307,48 @@ class Buttons:
                         f"after {attempt} tries: {exc})")
                     return
                 time.sleep(1.0)
-        a.when_pressed = lambda: self._session.gauge(-1)
-        b.when_pressed = lambda: self._session.gauge(+1)
+        # No when_pressed: the main loop calls tick() ~5x/s and that is the
+        # single place presses are interpreted (see tick()).
         self._btns = (a, b)
         log(f"  buttons: GPIO{gpio_a}=A gauge-down  GPIO{gpio_b}=B gauge-up  "
-            f"hold both {stop_hold:.0f}s = stop")
+            f"(tap = on release)   hold both {stop_hold:.0f}s = stop")
 
-    def poll_stop(self) -> bool:
-        """Call from the main loop. True once both buttons have been held
-        for ``stop_hold`` seconds."""
-        if self._btns is None or self._stop_hold <= 0:
+    def tick(self) -> bool:
+        """Call from the main loop. Interprets both pads from ``is_pressed``
+        edges: a lone tap fires ``gauge(-/+1)`` on release, a held pair fires
+        the stop. Returns True once both have been held for ``stop_hold`` s."""
+        if self._btns is None:
             return False
         a, b = self._btns
-        if a.is_pressed and b.is_pressed:
-            now = time.time()
+        now = time.time()
+        a_p, b_p = a.is_pressed, b.is_pressed
+
+        # -- press edges
+        if a_p and self._a_down_at is None:
+            self._a_down_at, self._a_saw_b = now, b_p
+        if b_p and self._b_down_at is None:
+            self._b_down_at, self._b_saw_a = now, a_p
+        # -- the other pad joined an in-progress press -> neither is a tap
+        if a_p and b_p:
+            self._a_saw_b = self._b_saw_a = True
+
+        # -- release edges: commit a tap only if this press stayed solo
+        if not a_p and self._a_down_at is not None:
+            if not self._a_saw_b:
+                self._session.gauge(-1)
+            self._a_down_at, self._a_saw_b = None, False
+        if not b_p and self._b_down_at is not None:
+            if not self._b_saw_a:
+                self._session.gauge(+1)
+            self._b_down_at, self._b_saw_a = None, False
+
+        # -- both held for stop_hold -> stop
+        if self._stop_hold > 0 and a_p and b_p:
             if self._both_since is None:
                 self._both_since = now
             elif now - self._both_since >= self._stop_hold:
                 self.stop_requested = True
-        else:
+        elif not (a_p and b_p):
             self._both_since = None
         return self.stop_requested
 
@@ -462,7 +494,7 @@ def main() -> None:
                 while next_mark <= now:
                     next_mark += args.mark_every
 
-            if buttons is not None and buttons.poll_stop():
+            if buttons is not None and buttons.tick():
                 stopped_by = "button hold"
                 break
 
