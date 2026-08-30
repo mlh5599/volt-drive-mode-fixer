@@ -5,18 +5,24 @@ from voltdmf.signals import DriveMode, ShiftPosition
 
 
 @pytest.mark.parametrize(
-    "data, expected",
+    "data, expected_kmh",
     [
-        (bytes([0x13, 0x88]), 50.0),          # 5000 / 100
+        (bytes([0x16, 0x80]), 90.0),         # wiki example: 5760 counts == 90 km/h
         (bytes([0x00, 0x00]), 0.0),
-        (bytes([0xFF, 0xFF, 0x00]), 655.35),  # extra bytes ignored
+        (bytes([0x00, 0x40, 0xFF]), 1.0),    # 64 counts == 1 km/h; extra bytes ignored
     ],
 )
-def test_decode_speed_mph(data, expected):
-    assert signals.decode_speed_mph(data) == pytest.approx(expected)
+def test_decode_speed_kmh(data, expected_kmh):
+    assert signals.decode_speed_kmh(data) == pytest.approx(expected_kmh)
 
 
-def test_decode_speed_mph_short_frame():
+def test_decode_speed_mph_from_kmh():
+    # 5760 counts == 90 km/h == 55.923 mph
+    assert signals.decode_speed_mph(bytes([0x16, 0x80])) == pytest.approx(55.923, abs=1e-2)
+
+
+def test_decode_speed_short_frame():
+    assert signals.decode_speed_kmh(b"\x01") is None
     assert signals.decode_speed_mph(b"\x01") is None
 
 

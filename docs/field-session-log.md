@@ -6,6 +6,114 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 8 — 2026-08-30 (in-car — full-drain SOC drive captured + analysed; SOC narrowed to 3 candidates, still no scale; speed/accel logging fixed; wiki cross-check)
+
+The SOC discharge drive finally happened. One continuous highway run took
+the gauge from **10/10 → 0/10**; all ten bar-drops were hand-marked on the
+panel buttons. `captures/candump-2026-08-30_131932.log` (213.9 MB, ~29 min)
++ `captures/vdmf-soclog-20260830-131932.log`. Clean capture, no GPIO
+trouble this time (Session 7's three fixes held).
+
+### Analysis — which frame carries SOC
+
+Method: cross every monotonically-falling byte/word against the 10
+GAUGE-DOWN offsets, then a **timer-rejection test** — Pearson correlation
+between each segment's value-delta and its wall-clock duration. `r ≈ +1` →
+elapsed-time counter; `r ≈ 0` → energy-paced (SOC-like). The final bar is
+the discriminator: `1→0` fell in **53 s** vs a ~170 s average for the other
+nine, so a true SOC field spends near-average travel there while a clock
+barely moves.
+
+- **Excluded — elapsed-time counters** (`delta ∝ duration`, `r ≈ 0.85–0.97`):
+  `0x4CB`, `0x3DD`, `0x137`, `0x4E9`. These are what fooled earlier
+  `mine_capture.py --monotonic` runs.
+- **SOC candidates** (delta uncorrelated with duration; all flatten through
+  the mid-drive turnaround and steepen after):
+  - `0x3E3` bytes 0/1/6 — triple-redundant 8-bit, 201→161 over the drain,
+    timer-corr ≈ 0.00. **Strongest.** (`0x3E3` bytes 2 & 4 rise-then-fall →
+    probably pack temperature.)
+  - `0x228` byte 2 — 96→79, timer-corr −0.13, cleanest monotonicity but
+    coarse (≈ 1.5 counts/bar).
+  - `0x186` byte 6 @ 80 Hz — 130→63, finer resolution but noisy (±8),
+    guess-o-meter-like; briefly regen-ticked *up* at the turnaround.
+  - `0x2C7` bytes 1–2 — sags **and recovers** (V-shaped); that's pack
+    voltage under load, not a charge count. Excluded.
+- **No absolute scale.** No reading at a known SOC was logged, so none of
+  these can be turned into `SOC_KWH_PER_COUNT` yet.
+- **Charge-mode 8/12 A toggles not captured** — the car left Park at +15.7 s,
+  before any toggling. Deprioritised (owner's call).
+
+Visual writeup (normalised overlay, per-bar delta heatmap, scorecard,
+native-scale shapes, the speed trace):
+<https://claude.ai/code/artifact/e345abc6-76d7-43ca-98fa-e58c48f7c3d2>
+
+### GM Volt reverse-engineering wiki cross-check
+
+<https://vehicle-reverse-engineering.fandom.com/wiki/GM_Volt> — checked its
+IDs against the capture (`tools/` scratch script `wikichk.py`):
+
+- **`0x206` SOC — confirmed absent** here (0 frames in 213 MB). The wiki's
+  "206 Bytes 1-2 Battery SOC .250 kWh" is Gen 2 / another year.
+- **`0x3E9` speed — present** (17 340 frames, 10 Hz). Decode is **bytes 0–1
+  big-endian ÷ 64 → km/h** ("3E9 Bytes 1-2 Speed 1/64 KPH"; the wiki's hex
+  literal `0x1580` for 90 km/h is a typo — 90 km/h is 5760 counts). Verified
+  against the capture: ~0 at rest, ~63 mph highway cruise, dip to ~8 mph at
+  the turnaround (**+1240 s** — this is the real turnaround; an earlier
+  draft of the artifact had mislabelled it +830–990 s). Bytes 2 & 6 are a
+  mux/rolling counter; bytes 0–1 hold the speed word regardless.
+- **Diagnostic SOC exists as a poll, not a broadcast:** `22 005B`
+  "Hybrid/EV Battery Pack Remaining Charge", `X·100/255` %, 1 byte, mode-22
+  request. Reinforces that a clean filtered SOC may be diagnostic-only
+  (like the per-cell voltages behind the BECM). An option for the next
+  drive: poll it every ~10 s for continuous ground-truth to calibrate the
+  broadcast candidate against — but that's active TX, needs a call.
+- Accelerator position (context for load): `0x0C9` b5 / `0x1A1` b7 (pedal
+  only, 0 during cruise), `0x1C3` b7 (includes cruise output). Brake:
+  `0x0F1` b2. Odometer: `0x120` b1–4, 1/64 km.
+
+### Code / tooling this session
+
+- **`tools/soc_log.py` — speed logging fixed + accel added.** The old
+  `SpeedProbe` needed `python-can` (not installed for the system
+  interpreter the unit runs) and used a wrong `÷100` decode at the wrong
+  offset, so every Session-8 mark logged `spd~n/a`. Rewritten to read a
+  dedicated `candump -L can0,3E9:7FF` pipe (stdlib only) with the correct
+  `0x3E9` decode, and to derive a longitudinal accel (least-squares slope
+  over ~1.2 s of samples — no IMU). Marks now read
+  `spd~44mph  a~-0.3  gauge=6/10`.
+- **`voltdmf/signals.py`** — `decode_speed_mph` corrected; new
+  `decode_speed_kmh`; `"speed"` note rewritten (still `confirmed=False` —
+  not speedo-checked). `tests/test_signals.py` updated (wiki's 5760-count =
+  90 km/h vector). Full suite green (170).
+
+### Decision — SOC-HOLD floor = 2 gauge bars
+
+The `1→0` bar took 53 s. The bottom of the gauge is a cliff, so the floor
+has to engage while **2 bars** are still showing — no margin to wait for a
+lower reading. Recorded in `DESIGN.md` ("Mode policy"); `hold_threshold_percent`
+placeholder moved 18 → 20 (~2 bars on the 10-bar gauge), `hold_reset_percent`
+25 → 30 (~3 bars). Real values come from the candidate's raw reading at the
+2-bar / 3-bar crossings once it's calibrated.
+
+### Next session — the scaling-anchor drive
+
+Planned by the owner; written into `phase-c-field-checklist.md` §2b:
+
+1. Start at a **full charge**. Engine on, sit in Park **~2 min** — pins the
+   "100 % display" raw value for `0x3E3 b0` / `0x228 b2` (the anchor this
+   drive was missing).
+2. Drive as **constant** as possible (steady speed/load) so d(candidate)/d(SOC)
+   is clean — now with real `spd~`/`a~` in every mark to correlate against.
+3. At the **2-bar mark**, trigger **HOLD** and drive **~10 min** steady. A
+   charge-sustaining segment where a genuine SOC field stops falling (or
+   rises slightly) is both a strong candidate confirmation and the second
+   anchor for the slope.
+4. Optional: poll `22 005B` for continuous ground-truth SOC %.
+
+`voltdmf/signals.py` SOC constants stay untouched until an anchor lands.
+
+---
+
 ## Session 7 — 2026-08-30 (in-car — panel-launched SOC capture works end-to-end after three GPIO hand-off fixes)
 
 Short in-car test of Session 6's button helper: the **SW1+SW2 held 5 s →

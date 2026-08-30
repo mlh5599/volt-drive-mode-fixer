@@ -105,39 +105,58 @@ per-byte scan, then a full-frame diff of a physical press. Full detail in
       injection too — see Phase C.5)
 - [x] Video of the cluster during the walk, checked against timestamps
 
-### 2b · SOC — find the ID + scaling  ⚠️ still needs the drive; capture path verified in-car
+### 2b · SOC — find the ID + scaling  ⚠️ ID narrowed to 3 candidates (Session 8); still needs a scaling anchor
 
-`0x206` **never appears** on this bus (Gen-2 ID, wrong for Gen 1), and this
-dash shows **no SOC %** — only EV-range miles + a 10-increment battery gauge.
-So it's a from-scratch hunt: a real discharge drive captured with
-`tools/soc_log.py` (passive; spawns `candump -l`; two PiCAN2 panel buttons
-mark each gauge increment), then `tools/mine_capture.py --monotonic` anchored
-to the `GAUGE-DOWN` timestamps. Full procedure + bench-prep block:
-`docs/field-session-log.md` → "Next session — pick up here — SOC discovery
-drive".
+`0x206` **never appears** on this bus (Gen-2 ID, wrong for Gen 1) — re-confirmed
+0 frames in the Session-8 213 MB full-drain capture. This dash shows **no SOC %**,
+only EV-range miles + a 10-increment battery gauge.
 
-- [x] Bench prep A1–A4 (2026-08-30): `~/vdmf` clone refreshed to the deployed
-      pin, `soc_log.py --dry-run` clean, `button_check.py` (claim + idle +
-      debounce + `hold both 3s` stop) and a 1-min `soc_log.py --buttons
-      --lcd` run (two-way LCD hand-off) verified on the Pi.
-- [x] Panel-launch path verified in-car (session 7, 2026-08-30): SW1+SW2 held
-      5 s starts `voltdmf-soclog.service`; in the logger A/B move the gauge
-      and hold-both-3s stops without a stray gauge mark. Deployed pin
-      `55fe176` (fixes `5b951da` / `e69cb44` / `55fe176`).
-- [ ] The drive: park with a near-full gauge, **hold SW1+SW2 ~5 s** to start
-      the 90-min capture (or, from a laptop, `systemctl start
-      voltdmf-soclog.service` / `soc_log.py --yes --minutes 90 --buttons
-      --lcd`). **Before pulling out, still in Park, run the §2e charge-mode
-      prelude.** Then discharge ≥4–5 increments, tapping A on each drop (B if
-      it climbs back), then hold both buttons 3 s to stop.
-- [ ] `mine_capture.py <capture> --ids` / `--monotonic --top 25` /
-      `--series ID:OFF:W[:le] --every 20`; cross the top monotonic field
-      against the button/`SOC-MARK` timestamps (steps with the gauge, flat
-      between).
+**Session 8 (2026-08-30) — full-drain drive done.** `captures/candump-2026-08-30_131932.log`,
+gauge 10/10 → 0/10, all ten drops hand-marked. Timer-rejection analysis
+(per-bar delta vs per-bar duration) narrowed SOC to three energy-linked
+broadcast candidates — **`0x3E3` b0/b1/b6** (strongest), **`0x228` b2**
+(cleanest, coarse), **`0x186` b6** (fine, noisy) — and excluded four
+elapsed-time counters (`0x4CB`/`0x3DD`/`0x137`/`0x4E9`). **No scaling anchor
+was logged** (no reading at a known SOC), so `signals.py` is untouched. GM
+Volt RE wiki carries battery charge % only as diagnostic PID `22 005B`
+(`X·100/255`). Detail: `docs/field-session-log.md` Session 8 +
+<https://claude.ai/code/artifact/e345abc6-76d7-43ca-98fa-e58c48f7c3d2>.
+
+- [x] Bench prep A1–A4 (2026-08-30); panel-launch path verified in-car
+      (session 7, deployed pin `55fe176`).
+- [x] The full-drain discharge drive (Session 8). Capture clean, no GPIO
+      trouble.
+- [x] `soc_log.py` speed logging fixed + accel added (Session 8) — reads a
+      `candump -L can0,3E9:7FF` pipe, `0x3E9` b0–1 BE ÷ 64 → km/h → mph, plus
+      a derived `a~` slope. Marks now carry `spd~44mph  a~-0.3`.
+
+**Session 9 — the scaling-anchor drive** (owner's plan):
+
+- [ ] Start at a **full charge**. Start the capture (**hold SW1+SW2 ~5 s**,
+      or `systemctl start voltdmf-soclog.service` / `soc_log.py --yes
+      --minutes 90 --buttons --lcd`). Engine on, **sit in Park ~2 min** —
+      this is the missing anchor: the raw value of each candidate at the
+      "100 % display" state.
+- [ ] Drive as **constant** as possible (steady speed / throttle) so
+      d(candidate)/d(SOC) is a clean slope. The new `spd~` / `a~` in each
+      mark is there to correlate against load.
+- [ ] Tap **A** on every gauge-bar drop (B if it climbs back), as before.
+- [ ] At the **2/10-bar mark**, trigger **HOLD** and drive **~10 min** steady.
+      Charge-sustaining: a genuine SOC field stops falling (or rises a little)
+      here — both a candidate confirmation and the second anchor for the slope.
+      (2 bars is also the chosen SOC-HOLD floor — see `DESIGN.md`.)
+- [ ] Hold both buttons 3 s (parked) to stop.
+- [ ] *(optional)* poll `22 005B` every ~10 s for a continuous ground-truth
+      SOC % — active TX, benign diagnostic read, but decide before the drive.
+- [ ] `mine_capture.py <capture> --series 3E3:0:1 / 228:2:1 / 186:6:1 --every 20`;
+      read each candidate's raw value at the 2-min idle anchor and at the
+      HOLD entry.
 - [ ] Set `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH` (or a direct percent
-      decode) in `voltdmf/signals.py` from two well-separated marks; flip
+      decode) in `voltdmf/signals.py` from the two anchors; flip
       `soc.confirmed = True`; wire `decode_soc` into `_DecodeListener` /
-      `is_signal_frame`; record ID/offset/scale in `signals-confirmed.md`.
+      `is_signal_frame`; set `hold_threshold_percent` / `hold_reset_percent`
+      from the raw value at the 2-bar / 3-bar crossings; record
+      ID/offset/scale in `signals-confirmed.md`.
 
 ### 2c · Ignition behaviour  ⚠️ not started — needs a drive/ignition cycle
 
@@ -156,7 +175,7 @@ P-R-N-D-L.
 - [ ] With `candump can0,135:7FF` (then `1F5:7FF`) running, move P → R → N → D →
       L and record the byte/value per position
 
-### 2e · Charge-current setpoint — force 12 A Level 1  🎯 stretch goal, piggybacks on the SOC drive
+### 2e · Charge-current setpoint — force 12 A Level 1  💤 deferred (owner deprioritised 2026-08-30) — kept for a later dedicated capture
 
 Why: the center-stack 8 A → 12 A charge-rate setting reverts to 8 A every time
 the car leaves Park. The owner only ever charges on a known-good home circuit,

@@ -7,3 +7,6 @@ build/
 dist/
 # CAN captures from tools/logcan.sh
 candump-*.log
+
+# field capture data (soclog marks + candump), kept local
+captures/

@@ -25,6 +25,11 @@ What it does, all read-only:
     end the session cleanly without SSH.
   * every ``--mark-every`` s also logs a plain ``SOC-MARK`` time anchor
     (with the current gauge level) as a backstop between increment drops
+  * each log line also carries live speed + a derived longitudinal accel
+    (``spd~44mph  a~-0.3``), decoded from ``0x3E9`` via a second
+    ``candump`` pipe -- purely for context when correlating the SOC
+    candidate against load. Decode is cross-checked (wiki + capture) but
+    not speedo-verified; accel is a slope over ~1 s of samples, no IMU.
   * optional: ``--lcd`` mirrors the ``t+<s>`` clock and the live gauge
     level to a SparkFun serial 4x20 (see ``tools/lcd.py``)
 
@@ -68,7 +73,7 @@ from voltdmf import lcdlock  # noqa: E402
 from voltdmf.lcd import SerLcd  # noqa: E402
 from voltdmf.signals import SIGNAL_IDS  # noqa: E402
 
-_SPEED_ADDR = SIGNAL_IDS["speed"].addr  # 0x3E9 -- UNCONFIRMED Gen-1, may be absent
+_SPEED_ADDR = SIGNAL_IDS["speed"].addr  # 0x3E9 -- present in the Session-8 capture (10 Hz)
 
 
 # -- can0 state (read-only, via iproute2) ---------------------------------
@@ -117,36 +122,96 @@ def stop_capture(proc, path, log) -> None:
     log(f"raw capture closed: {path} ({sz:.1f} MB)")
 
 
-# -- tentative speed context (best-effort, decode UNCONFIRMED) ----------
+# -- speed + accel context from 0x3E9 (best-effort, decode cross-checked) --
 class SpeedProbe:
-    """Non-blocking peek at 0x3E9 for context in the log. Optional -- if
-    python-can or the bus is unavailable it just returns None forever."""
+    """Live vehicle speed and derived longitudinal accel from ``0x3E9``.
+
+    Reads a dedicated ``candump`` pipe filtered to the one ID -- no
+    ``python-can`` dependency (it is not installed for the system
+    interpreter on the Pi, which is what the systemd unit runs). A daemon
+    thread keeps the latest decoded value; ``mph()`` / ``accel_mps2()``
+    never block.
+
+    Decode: ``0x3E9`` bytes 0-1 big-endian / 64 = km/h -> mph
+    (``voltdmf.signals.decode_speed_mph``). Cross-checked against the GM
+    Volt reverse-engineering wiki and the Session-8 full-drain capture, but
+    not yet against a reference speedo -- so marks tag it ``spd~`` (no
+    guarantee). Accel is a least-squares slope over the last ~1.2 s of
+    speed samples; there is no IMU, so hard bumps and road grade are
+    invisible -- treat it as "are we speeding up or slowing down".
+    """
+
+    _MPH_TO_MPS = 0.44704
+    _WIN_S = 1.2
 
     def __init__(self, channel: str, log) -> None:
-        self._bus = None
+        self._proc = None
+        self._lock = threading.Lock()
+        self._mph: float | None = None
+        self._samples: list[tuple[float, float]] = []  # (ts, mph), newest last
+        filt = f"{channel},{_SPEED_ADDR:X}:7FF"
         try:
-            import can  # noqa: PLC0415
-            self._bus = can.Bus(interface="socketcan", channel=channel)
-        except Exception as exc:  # noqa: BLE001  (broad: this is optional)
+            self._proc = subprocess.Popen(
+                ["candump", "-L", filt],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as exc:
             log(f"  speed probe off ({exc}); marks will show spd~n/a")
+            return
+        threading.Thread(target=self._reader, daemon=True).start()
+        log(f"  speed probe: candump -L {filt}  "
+            f"(0x3E9 b0-1 BE / 64 kph -> mph; decode not speedo-checked)")
 
-    def mph(self, timeout: float = 0.3):
-        if self._bus is None:
+    def _reader(self) -> None:
+        # candump -L line format:  (1693500000.123456) can0 3E9#1600...
+        for line in self._proc.stdout:
+            parts = line.split()
+            if len(parts) != 3 or "#" not in parts[2]:
+                continue
+            try:
+                ts = float(parts[0].strip("()"))
+                data = bytes.fromhex(parts[2].split("#", 1)[1])
+            except ValueError:
+                continue
+            if len(data) < 2:
+                continue
+            mph = ((data[0] << 8 | data[1]) / 64.0) * 0.621371
+            with self._lock:
+                self._mph = mph
+                self._samples.append((ts, mph))
+                cutoff = ts - self._WIN_S
+                while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+                    self._samples.pop(0)
+
+    def mph(self):
+        with self._lock:
+            return self._mph
+
+    def accel_mps2(self):
+        """Longitudinal accel (m/s^2) from the last ~1.2 s of speed samples,
+        least-squares slope of v(t). ``None`` until enough samples land."""
+        with self._lock:
+            s = list(self._samples)
+        if len(s) < 3:
             return None
-        import struct  # noqa: PLC0415
-        end = time.time() + timeout
-        latest = None
-        while time.time() < end:
-            msg = self._bus.recv(timeout=max(0.0, end - time.time()))
-            if msg is None:
-                break
-            if msg.arbitration_id == _SPEED_ADDR and len(msg.data) >= 2:
-                latest = struct.unpack_from(">H", bytes(msg.data), 0)[0] / 100.0
-        return latest
+        t0 = s[0][0]
+        xs = [p[0] - t0 for p in s]
+        ys = [p[1] * self._MPH_TO_MPS for p in s]
+        n = len(s)
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        den = sum((x - mx) ** 2 for x in xs)
+        if den <= 1e-6:
+            return None
+        return sum((xs[i] - mx) * (ys[i] - my) for i in range(n)) / den
 
     def close(self) -> None:
-        if self._bus is not None:
-            self._bus.shutdown()
+        if self._proc is None:
+            return
+        self._proc.send_signal(signal.SIGINT)
+        try:
+            self._proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
 
 
 # -- LCD mirror (optional; no-ops when lcd is None) ---------------------
@@ -215,8 +280,11 @@ class Session:
 
     def _prefix(self, dt: float) -> str:
         sp = self.speed.mph()
-        spd = "n/a" if sp is None else f"{sp:.0f}?"
-        return (f"+{dt:7.1f}s  spd~{spd:<5} gauge={self.level}/{self.total}"
+        spd = "n/a" if sp is None else f"{sp:.0f}mph"
+        ac = self.speed.accel_mps2()
+        acc = "a~n/a" if ac is None else f"a~{ac:+.1f}"
+        return (f"+{dt:7.1f}s  spd~{spd:<6} {acc:<7} "
+                f"gauge={self.level}/{self.total}"
                 f"  can0={can_state(self.channel)}")
 
     def mark(self, kind: str, note: str = "") -> None:

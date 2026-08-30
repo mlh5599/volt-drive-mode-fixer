@@ -66,7 +66,13 @@ SIGNAL_IDS: dict[str, SignalId] = {
         "Vehicle speed",
         0x3E9,
         confirmed=False,
-        note="first 2 bytes big-endian, /100 -> mph (reference project, Gen 2)",
+        note="bytes 0-1 big-endian / 64 -> km/h (x0.621371 -> mph). Matches "
+        "the GM Volt reverse-engineering wiki (\"3E9 Bytes 1-2 Speed 1/64 "
+        "KPH\") and the Session-8 full-drain capture: ~0 at rest, ~63 mph "
+        "highway cruise, ~8 mph at the mid-drive turnaround (+1240 s). DLC 8, "
+        "10 Hz; bytes 2 & 6 are a mux/rolling counter, bytes 0-1 carry the "
+        "speed word regardless. Still confirmed=False -- not yet checked "
+        "against a reference speedo.",
     ),
     "shift": SignalId(
         "Shift / PRNDL position",
@@ -145,11 +151,27 @@ def decode_soc_percent(data: bytes) -> float | None:
 
 
 # --- Vehicle speed (0x3E9) -------------------------------------------------
-def decode_speed_mph(data: bytes) -> float | None:
-    """First two bytes, big-endian, /100 -> mph (reference project)."""
+_SPEED_KMH_PER_COUNT = 1.0 / 64.0
+_MPH_PER_KMH = 0.621371
+
+
+def decode_speed_kmh(data: bytes) -> float | None:
+    """Bytes 0-1, big-endian, / 64 -> km/h.
+
+    Per the GM Volt reverse-engineering wiki and cross-checked against the
+    Session-8 full-drain capture (see the ``"speed"`` note above). Bytes 2 &
+    6 of this frame are a mux/rolling counter; bytes 0-1 hold the speed word
+    regardless, so no de-muxing is needed here.
+    """
     if len(data) < 2:
         return None
-    return struct.unpack_from(">H", data, 0)[0] / 100.0
+    return (struct.unpack_from(">H", data, 0)[0]) * _SPEED_KMH_PER_COUNT
+
+
+def decode_speed_mph(data: bytes) -> float | None:
+    """Bytes 0-1, big-endian, / 64 -> km/h -> mph."""
+    kmh = decode_speed_kmh(data)
+    return None if kmh is None else kmh * _MPH_PER_KMH
 
 
 # --- Drive mode status (0x1F4) -----------------------------------------

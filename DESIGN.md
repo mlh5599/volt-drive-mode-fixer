@@ -91,6 +91,14 @@ asks the safety gate to walk the menu there.
 - **Hysteresis.** Below `hold_threshold_percent` the floor engages (desired =
   HOLD); it stays engaged until SOC climbs back above `hold_reset_percent`.
   The latch lives in memory only.
+- **Floor target = 2 gauge bars remaining.** Decided from the Session-8
+  full-drain drive: the last bar (`1→0`) fell in **53 s** against a ~170 s
+  average for the other nine — the bottom of the gauge is a cliff, not a
+  slope, so the floor has to engage while 2 bars are still showing, with no
+  margin to wait for a lower reading. On the 10-bar gauge that is ~20 %
+  displayed SOC; `hold_threshold_percent` / `hold_reset_percent` get their
+  real values from the raw SOC-candidate reading at the 2-bar and 3-bar
+  crossings once the candidate is calibrated (see "Open items").
 - **Setpoint** is a two-state toggle, **HOLD ⇄ MOUNTAIN**, changed by one
   panel button (see "Runtime control" / "Hardware design"). It is *not*
   persisted — the Pi runs a read-only root with an overlay filesystem, so
@@ -118,8 +126,8 @@ Config sketch (exact schema TBD when the reconciler is written):
 
 ```yaml
 policy:
-  hold_threshold_percent: 18   # floor engages at/below this — calibrate, see "Open items"
-  hold_reset_percent: 25       # SOC must climb back above this to disengage the floor
+  hold_threshold_percent: 20   # ~2 gauge bars — floor engages at/below this (calibrate, see "Open items")
+  hold_reset_percent: 30       # ~3 gauge bars — SOC must climb back above this to disengage the floor
   default_setpoint: hold       # always HOLD in practice (no persisted state)
   mountain_button_gpio: 24     # BCM pin the button helper watches (PiCAN2 SW1)
 ```
@@ -150,10 +158,10 @@ layer of defense.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus (2026-08-29).** The real EV-SOC message ID is still unknown; `~0.25` kWh/count from OVMS is unverified for this pack. Needs a discharge drive (`tools/soc_log.py`) to find the ID and calibrate raw→% against the dash. Until then the reconciler's SOC-HOLD floor cannot engage. |
+| EV battery SOC | `0x206`? | **Gen 2 candidate — NOT seen on this Gen 1 bus** (2026-08-29; re-confirmed 0 frames in the Session-8 213 MB full-drain capture). Session-8 analysis narrowed it to three energy-linked broadcast candidates (`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6) and excluded four elapsed-time counters. No raw→% anchor yet. The GM Volt RE wiki carries battery charge % only as diagnostic PID `22 005B` (`X·100/255`). See "Open items" and `docs/field-session-log.md` Session 8. Until a candidate is calibrated the reconciler's SOC-HOLD floor cannot engage. |
 | Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. This is the one frame the project transmits — `voltdmf/canio.send_mode_button_press()` (tracking-echo press). |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
-| Vehicle speed | `0x3E9` | 16-bit big-endian, ÷100 for mph. Not needed for the SOC-triggered design but useful for bench testing/logging. |
+| Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki and cross-checked against the Session-8 full-drain capture (~0 at rest, ~63 mph cruise, ~8 mph at the turnaround); not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` now logs it plus a derived accel). |
 | Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Used as a safety precondition — `SafetyGate` blocks injection unless in DRIVE (and blocks on UNKNOWN / short frame). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** Use SOC (message ID still to be found on this bus) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
@@ -435,12 +443,22 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 ### Still open (need a real discharge drive)
 
 - **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) never appears on
-  this Gen 1 bus. The real EV-SOC message ID is unknown; raw→percent
-  (`SOC_KWH_PER_COUNT`, `GEN1_PACK_USABLE_KWH`) is uncalibrated. Needs a
-  discharge drive with `tools/soc_log.py` (passive capture + panel-button gauge
-  marks) against the dash reading, then `tools/mine_capture.py --monotonic`.
-  The reconciler's SOC-HOLD floor cannot engage until this lands — it is the
-  last blocker on a non-dry-run daemon.
+  this Gen 1 bus — re-confirmed absent (0 frames) in the Session-8 213 MB
+  full-drain capture. That drive (`docs/field-session-log.md` Session 8;
+  visual analysis: <https://claude.ai/code/artifact/e345abc6-76d7-43ca-98fa-e58c48f7c3d2>)
+  narrowed it to three energy-linked broadcast candidates — `0x3E3` bytes
+  0/1/6 (triple-redundant, best timer rejection), `0x228` byte 2 (cleanest
+  but coarse ≈ 1.5 counts/bar), `0x186` byte 6 (fine but noisy) — and
+  positively excluded four elapsed-time counters (`0x4CB`, `0x3DD`, `0x137`,
+  `0x4E9`) that had fooled earlier `--monotonic` runs. **No absolute scaling
+  anchor yet:** no reading at a known SOC was logged. The GM Volt
+  reverse-engineering wiki lists battery charge *percent* only as a
+  diagnostic PID (`22 005B`, `X·100/255`), not a broadcast field, so a clean
+  filtered SOC may be poll-only. Next drive (see `docs/phase-c-field-checklist.md`
+  §2b) starts at a full charge + ~2 min idle to pin the "100 %" raw value,
+  then holds a steady pace to the 2-bar mark and runs ~10 min in HOLD for a
+  charge-sustaining second anchor. The reconciler's SOC-HOLD floor cannot
+  engage until this lands — it is the last blocker on a non-dry-run daemon.
 
 ### Deferred (not blocking)
 
