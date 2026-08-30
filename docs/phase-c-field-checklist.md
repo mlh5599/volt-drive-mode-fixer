@@ -17,6 +17,12 @@ Covers DESIGN.md **Phase A** (CAN bring-up) → **Phase C** (signal discovery) �
 > lags/reverts, and multi-press walk timing is not run-to-run consistent —
 > needs a physical-walk capture to tune against, then a drive to verify.
 > SOC / shift / ignition still need a drive.
+>
+> **Update (session 6, 2026-08-30):** shift **CONFIRMED** on the road
+> (session 4, `0x1F5` byte 3); the closed-loop menu walk got an owner-confirmed
+> on-road PASS (session 4). Remaining: the **SOC discharge drive** (bench prep
+> A1–A4 done — see field-session-log Session 6), `ignition_check.py`, and the
+> stationary injection sweep.
 
 ---
 
@@ -90,16 +96,32 @@ per-byte scan, then a full-frame diff of a physical press. Full detail in
       injection too — see Phase C.5)
 - [x] Video of the cluster during the walk, checked against timestamps
 
-### 2b · SOC scaling on `0x206`  ⚠️ blocked — needs a drive
+### 2b · SOC — find the ID + scaling  ⚠️ still needs the drive; bench prep done
 
-`0x206` **never appears** on this bus (Gen-2 ID, wrong for Gen 1). Needs a
-real discharge drive to find the actual ID + scaling.
+`0x206` **never appears** on this bus (Gen-2 ID, wrong for Gen 1), and this
+dash shows **no SOC %** — only EV-range miles + a 10-increment battery gauge.
+So it's a from-scratch hunt: a real discharge drive captured with
+`tools/soc_log.py` (passive; spawns `candump -l`; two PiCAN2 panel buttons
+mark each gauge increment), then `tools/mine_capture.py --monotonic` anchored
+to the `GAUGE-DOWN` timestamps. Full procedure + bench-prep block:
+`docs/field-session-log.md` → "Next session — pick up here — SOC discovery
+drive".
 
-- [ ] Start `tools/watch_soc.py` logging
-- [ ] Record `(raw 0x206, dash SOC %, dash EV-range or kWh)` at roughly
-      90 / 70 / 50 / 40 / 30 / 25 / 15 % — extra points around the intended
-      **threshold** and **reset** percentages
-- [ ] Derive scale/offset → `SOC_KWH_PER_COUNT`, `GEN1_PACK_USABLE_KWH`
+- [x] Bench prep A1–A4 (2026-08-30): `~/vdmf` clone refreshed to the deployed
+      pin, `soc_log.py --dry-run` clean, `button_check.py` (claim + idle +
+      debounce + `hold both 3s` stop) and a 1-min `soc_log.py --buttons
+      --lcd` run (two-way LCD hand-off) verified on the Pi.
+- [ ] The drive: start `soc_log.py --yes --minutes 90 --buttons --lcd` parked
+      with a near-full gauge, discharge ≥4–5 increments tapping A on each
+      drop, hold both buttons to stop.
+- [ ] `mine_capture.py <capture> --ids` / `--monotonic --top 25` /
+      `--series ID:OFF:W[:le] --every 20`; cross the top monotonic field
+      against the button/`SOC-MARK` timestamps (steps with the gauge, flat
+      between).
+- [ ] Set `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH` (or a direct percent
+      decode) in `voltdmf/signals.py` from two well-separated marks; flip
+      `soc.confirmed = True`; wire `decode_soc` into `_DecodeListener` /
+      `is_signal_frame`; record ID/offset/scale in `signals-confirmed.md`.
 
 ### 2c · Ignition behaviour  ⚠️ not started — needs a drive/ignition cycle
 

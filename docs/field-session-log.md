@@ -6,6 +6,52 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 6 — 2026-08-30 (keyboard + Pi bench — LCD-lock fix landed; `~/vdmf` drift fixed; SOC-drive bench prep complete)
+
+No car. `voltpi` on the bench with `can0` up (no bus), the SparkFun 4x20, and
+the two PiCAN2 switches attached. Goal: get everything that doesn't need the
+car out of the way so the SOC discharge drive is a pure "start it and drive".
+
+**LCD hand-off lock — fix landed and verified.** volt repo `9dc7a77`
+(`lcdlock._default_lock_path()` → `/run/lock/voltdmf-lcd.lock`), `voltdmf_version`
+bumped to `312ea1d`, converged with `ansible-playbook playbooks/voltpi.yml
+--tags voltdmf`. Before this the daemon (user `voltdmf`, `ProtectHome=`) and
+`mike`'s tools wrote different paths and the hand-off never fired. Now a bench
+`soc_log.py --lcd` run makes the daemon log `LCD claimed by another process;
+releasing the panel` ~1 s after `lcdlock.claim()`, then `LCD free again;
+resuming the watch screen` the instant the tool exits. `/run/lock/voltdmf-lcd.lock`
+is gone afterward. No settle-sleep between `claim()` and the port open is
+needed — the race is benign. Full writeup in the "Follow-ups" section below.
+
+**`~/vdmf` clone drift — fixed.** The bench clone had drifted 25 commits
+behind `origin/main`, with `tools/soc_log.py` + `tools/mine_capture.py`
+present only as *untracked* ad-hoc copies at an unknown version. Refreshed to
+`312ea1d` (== the deployed `voltdmf_version`) with `git stash push -u` →
+`git fetch` → `git reset --hard origin/main` → `git clean -fd`. Drifted state
+kept recoverable: stash `pre-SOC-drift`, plus
+`~/vdmf-preSOC-tracked-20260829-234738.patch` and
+`~/vdmf-preSOC-untracked-20260829-234738.tgz` on the Pi. The refresh step is
+now written into the SOC-discovery-drive procedure (Bench prep block).
+
+**SOC discharge drive — bench prep A1–A4 complete.** Everything not needing
+the car is done:
+- **A1/A2** clone at `312ea1d`; `soc_log.py --dry-run` clean.
+- **A3** `button_check.py`: BCM 24/23 claim clean, idle levels both `up`,
+  presses register through the 50 ms debounce, `hold both 3s -> stop gesture
+  OK` fires. (`--stop-hold` default is 3 s, not 4.)
+- **A4** `soc_log.py --yes --minutes 1 --buttons --lcd`: spawns `candump -l`,
+  opens the LCD, logs `GAUGE-DOWN`/`GAUGE-UP` on taps, self-stops at
+  `--minutes`, releases the lock; the two-way LCD hand-off works (timings
+  above). Expected noise: `speed probe off (No module named 'can')` — system
+  Python has no python-can, marks show `spd~n/a`; the raw candump capture is
+  the deliverable and still carries `gauge=N/10` on every line.
+
+On the drive itself only procedure steps 1 and 3–6 remain, all in-car. The
+other two gates before `voltdmf_dry_run: false` (stationary injection sweep,
+`ignition_check.py`) are unchanged.
+
+---
+
 ## Session 5 — 2026-08-29 (keyboard + Pi bench — SOC-log tool; daemon LCD watch screen; 0x1F4 → VehicleState)
 
 No car, but the Pi (`voltpi`) was on the bench with `can0` up and the
@@ -107,7 +153,9 @@ All Phase C work is now on `main`: `phase-c-soc-discovery` and
    near-full → well down, `--buttons`, then `mine_capture.py --monotonic`
    anchored to the `GAUGE-DOWN` timestamps. This is the one remaining
    unconfirmed signal (`soc`); everything else (`drive_mode_status`,
-   `drive_mode_button`, `shift`) is confirmed on-vehicle.
+   `drive_mode_button`, `shift`) is confirmed on-vehicle. **Bench prep A1–A4
+   done 2026-08-30 (Session 6) — clone refreshed, buttons + LCD hand-off
+   verified on the Pi; only the in-car steps 1, 3–6 of the procedure remain.**
 2. **Move the daemon onto the `0x1F4` closed loop** — the RX decode is done;
    still need `daemon.py` to use it as `current_mode_source` /
    `menu_cursor_source` instead of the press-counting tracker. Consider
@@ -651,6 +699,22 @@ Done 2026-08-29: clone now at `312ea1d`, dry-run clean. Backups on the Pi:
 `~/vdmf-preSOC-tracked-20260829-234738.patch`,
 `~/vdmf-preSOC-untracked-20260829-234738.tgz`.
 
+**Bench-verified on the Pi 2026-08-30 (car not present, `can0` up but no
+bus):**
+- `tools/button_check.py` — BCM 24/23 claim clean, idle levels both `up`;
+  presses register through the 50 ms debounce; `hold both 3s -> stop gesture
+  OK` fires.
+- `tools/soc_log.py --yes --minutes 1 --buttons --lcd` — spawns `candump -l`,
+  opens the LCD, logs `GAUGE-DOWN`/`GAUGE-UP` on button taps, self-stops at
+  `--minutes`, releases the hand-off lock. LCD hand-off works both ways with
+  no settle-sleep: daemon logs `LCD claimed by another process; releasing the
+  panel` ~1 s after `lcdlock.claim()`, then `LCD free again; resuming the
+  watch screen` the instant `soc_log` exits; `/run/lock/voltdmf-lcd.lock`
+  gone afterward. Expected noise: `speed probe off (No module named 'can')` —
+  system Python has no python-can, so marks show `spd~n/a`; the raw candump
+  capture is the deliverable and carries gauge level on every line anyway.
+So on the drive itself, only steps 1 and 3–6 remain.
+
 1. `can0` is already up from boot (500k, `restart-ms 100`) — nothing to bring
    up. Quick check over SSH before pulling away: `ip -br link show can0` = UP.
 2. Start the logger from the bench copy, using the **system** Python (it has
@@ -807,5 +871,10 @@ SOC hunt either way.
     dotfile only as an off-Pi fallback; `VOLTDMF_LCD_LOCK` still overrides.
     The unit sets `Environment=VOLTDMF_LCD_LOCK` from the new
     `voltdmf_lcd_lock_path` ansible default so the two stay pinned together.
-    Code change is in the volt repo — needs a `voltdmf_version` bump +
-    converge to land on voltpi.
+    ✅ **Landed on voltpi 2026-08-30** — volt repo `9dc7a77` (lcdlock
+    `_default_lock_path()`), `voltdmf_version` bumped to `312ea1d` and
+    converged with `--tags voltdmf`. Verified: installed `lcdlock.LOCK_PATH`
+    = `/run/lock/voltdmf-lcd.lock`, `VOLTDMF_LCD_LOCK` in `/proc/<pid>/environ`,
+    and a bench `soc_log.py --lcd` run drives the daemon to log `LCD claimed
+    by another process; releasing the panel` then `LCD free again` on exit —
+    the hand-off now actually fires (see Session 6).
