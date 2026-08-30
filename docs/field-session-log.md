@@ -626,6 +626,31 @@ battery gauge. `tools/soc_log.py` is the capture tool: it's **passive** (never
 transmits), spawns `candump -l` for the raw log, and takes two panel buttons
 so the driver can mark each gauge-increment change without looking away.
 
+**Bench prep (at a keyboard, before the drive) — refresh the `~/vdmf` clone.**
+`~/vdmf` is a by-hand rsync/scp target and drifts: on 2026-08-29 it was
+25 commits behind `origin/main` with `tools/soc_log.py` + `tools/mine_capture.py`
+present only as *untracked* ad-hoc copies at an unknown version, so their CLI
+didn't match this writeup. It must match the SHA the deployed daemon runs
+(`voltdmf_version` in the ansible host_vars — `312ea1d` as of 2026-08-30).
+Fix it and keep the drifted state recoverable:
+```
+ssh voltpi 'cd ~/vdmf && \
+  git stash push -u -m pre-SOC-drift && \
+  git fetch -q origin && git reset --hard origin/main && git clean -fd && \
+  git rev-parse --short HEAD && git status -s'
+```
+Expect `HEAD` = the deployed pin, `git status -s` empty, and
+`tools/{soc_log,mine_capture,ignition_check}.py` all tracked. Recover the old
+state with `git stash pop` if any of that diff ever matters (it didn't —
+intermediate work already committed + pushed in the 25 commits). Then a
+no-hardware sanity check:
+```
+cd ~/vdmf && /usr/bin/python3 tools/soc_log.py --dry-run --minutes 90 --buttons --lcd
+```
+Done 2026-08-29: clone now at `312ea1d`, dry-run clean. Backups on the Pi:
+`~/vdmf-preSOC-tracked-20260829-234738.patch`,
+`~/vdmf-preSOC-untracked-20260829-234738.tgz`.
+
 1. `can0` is already up from boot (500k, `restart-ms 100`) — nothing to bring
    up. Quick check over SSH before pulling away: `ip -br link show can0` = UP.
 2. Start the logger from the bench copy, using the **system** Python (it has
