@@ -173,3 +173,21 @@ def test_diag_close_is_safe_without_a_process():
     probe = _diag()
     probe.close()                 # _proc is None
     assert probe._stop.is_set()
+
+
+def test_build_parser_help_renders():
+    """--help must format without raising (a bare '%' in an action help=
+    string trips argparse's help-string %-expansion; regression for the
+    --diag-soc help text)."""
+    parser = soc_log._build_parser()
+    text = parser.format_help()            # raised ValueError before the fix
+    assert "--diag-soc" in text
+
+
+def test_build_parser_accepts_diag_soc_flags():
+    parser = soc_log._build_parser()
+    args = parser.parse_args(
+        ["--yes", "--diag-soc", "--diag-soc-every", "5", "--diag-req-id", "0x7E4"])
+    assert args.diag_soc is True
+    assert args.diag_soc_every == 5.0
+    assert args.diag_req_id == "0x7E4"

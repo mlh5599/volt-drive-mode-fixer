@@ -676,7 +676,7 @@ def make_logger(path: pathlib.Path):
     return log, fh
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--yes", action="store_true",
@@ -718,8 +718,8 @@ def main() -> None:
                     help="log path (default ~/vdmf-soclog-<timestamp>.log)")
     ap.add_argument("--diag-soc", action="store_true",
                     help="ACTIVE TX: also poll the diagnostic charge PID "
-                         "(UDS 22 005B) for a continuous ground-truth SOC %. "
-                         "This is the only path that transmits.")
+                         "(UDS 22 005B) for a continuous ground-truth SOC "
+                         "percentage. This is the only path that transmits.")
     ap.add_argument("--diag-soc-every", type=float, default=10.0, metavar="SECS",
                     help="seconds between 22 005B polls (default 10)")
     ap.add_argument("--diag-req-id", default=None, metavar="HEX",
@@ -727,6 +727,11 @@ def main() -> None:
                          "0x7E4 then 0x7E0 and locks onto whichever answers")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and exit; no hardware touched")
+    return ap
+
+
+def main() -> None:
+    ap = _build_parser()
     args = ap.parse_args()
 
     diag_req_id = None
