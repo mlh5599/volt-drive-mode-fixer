@@ -27,6 +27,10 @@ class FakeClock:
 
 
 def _state(**kw):
+    # Default to a drivable car: DRIVE clears the shift precondition, so tests
+    # that aren't about shift gating don't have to spell it out. SafetyGate
+    # now blocks on UNKNOWN by default (decode_shift is confirmed on-vehicle).
+    kw.setdefault("shift", ShiftPosition.DRIVE)
     st = VehicleState(**kw)
     st.mark_signal_seen()
     return st
@@ -46,6 +50,20 @@ def test_blocks_on_non_drive_shift(shift):
     gate = SafetyGate(ctl)
     assert gate.request(DriveMode.HOLD, _state(shift=shift)) is False
     assert ctl.calls == 0
+
+
+def test_blocks_on_unknown_shift_by_default():
+    ctl = FakeController()
+    gate = SafetyGate(ctl)
+    assert gate.request(DriveMode.HOLD, _state(shift=ShiftPosition.UNKNOWN)) is False
+    assert ctl.calls == 0
+
+
+def test_allow_unknown_shift_opt_in():
+    ctl = FakeController()
+    gate = SafetyGate(ctl, allow_unknown_shift=True)
+    assert gate.request(DriveMode.HOLD, _state(shift=ShiftPosition.UNKNOWN)) is True
+    assert ctl.calls == 1
 
 
 def test_blocks_on_implausible_speed():

@@ -53,13 +53,15 @@ class SafetyGate:
         controller: ModeCycleController,
         *,
         cooldown_s: float = MODE_SWITCH_COOLDOWN_S,
-        allow_unknown_shift: bool = True,
+        allow_unknown_shift: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._controller = controller
         self._cooldown_s = cooldown_s
-        # Shift decode is a Phase C stub today (always UNKNOWN); keeping this
-        # True lets bench testing proceed. Flip to False once decode_shift works.
+        # decode_shift is confirmed on-vehicle (0x1F5 byte 3 PRNDL, session 4,
+        # 2026-08-29), so UNKNOWN now means a short/garbled shift frame, not a
+        # missing decoder -- treat it as blocking. Callers that genuinely have
+        # no shift signal (bench rigs without 0x1F5) can still pass True.
         self._allow_unknown_shift = allow_unknown_shift
         self._monotonic = monotonic
         self._last_switch: float | None = None

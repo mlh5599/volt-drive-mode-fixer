@@ -24,7 +24,7 @@ from . import control
 from .canio import CanInterface
 from .config import Config, ConfigError, load_config
 from .lcddash import LcdDashboard
-from .modecycle import ModeCycleController, PressCountingModeTracker
+from .modecycle import ModeCycleController
 from .safety import SafetyGate
 from .signals import DriveMode
 from .state import VehicleState
@@ -38,12 +38,6 @@ LOOP_PERIOD_S = 1.0
 #: Wait this long for the bus to come alive before evaluating anything, so a
 #: crash-restart mid-drive reads real state before the on-start trigger fires.
 BUS_WARMUP_TIMEOUT_S = 10.0
-
-# UNCONFIRMED: assumes the car powers up in NORMAL every ignition cycle.
-# tools/ignition_check.py verifies this; until then the press-counting mode
-# tracker (and therefore every switch) is only as right as this line.
-ASSUMED_START_MODE = DriveMode.NORMAL
-
 
 class Daemon:
     def __init__(self, config: Config, *, channel: str = "can0",
@@ -101,15 +95,21 @@ class Daemon:
         self._state = state
         self._triggers = build_triggers(self._config)
         self._started = time.monotonic()
-        mode_tracker = PressCountingModeTracker(ASSUMED_START_MODE)
 
         with CanInterface(self._channel, dry_run=self._dry_run,
                           tx_gate=self._transmit_enabled) as can_if:
             can_if.start_rx(state)
+            # Current mode is read straight off the bus: the RX listener
+            # decodes 0x1F4 byte 1 (the committed drive mode) into
+            # state.drive_mode. It stays None until the first 0x1F4 frame
+            # arrives, and ModeCycleController turns that into a
+            # ModeUnknownError rather than injecting -- the fail-safe we want
+            # on a bus we cannot observe. This replaces PressCountingModeTracker,
+            # which blindly assumed NORMAL-on-start and drifted if the driver
+            # also touched the physical button.
             controller = ModeCycleController(
                 can_if,
-                mode_tracker.get,
-                on_presses_sent=mode_tracker.note_presses,
+                lambda: state.drive_mode,
             )
             self._gate = SafetyGate(controller)
 
