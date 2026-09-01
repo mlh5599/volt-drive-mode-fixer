@@ -6,6 +6,113 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 9 — 2026-08-31 (in-car — SOC anchor drive; `22 005B` poll confirmed as the SOC source, gauge↔SOC calibrated, HOLD verified charge-sustaining, Session-8 broadcast candidates falsified)
+
+The scaling-anchor drive. `soc_log.py --diag-soc` polled UDS `22 005B` every
+10 s for a real battery percent alongside the dash gauge.
+`captures/candump-2026-08-30_212037.log` (228 MB, ~31 min) +
+`captures/vdmf-soclog-20260830-212037.log`. Files kept local
+(git-ignored); the committed product is
+[`analysis/session9-soc-anchor.md`](analysis/session9-soc-anchor.md) (charts
+regenerable via `tools/soc_report9.py`).
+
+**Deviation from the plan:** no engine-on Park idle at 100 % — the driver
+went straight to driving, so there is **no true full-charge raw anchor**.
+The 89.8 % first read and the HOLD plateau serve instead. The drive: 89.8 %
+→ steady highway pace down to the **2-bar** gauge mark → driver forces
+**HOLD** → ~13 min more steady driving.
+
+Also note: the capture has a ~4 600-frame burst of stale pre-NTP frames at
+the head (boot clock jump). Any `mine_capture.py` / `soc_report9.py` run
+must slice to `epoch >= 1788198000`.
+
+![Session-9 diagnostic SOC across the whole drive, with the eight gauge-bar
+drops and the HOLD region marked](analysis/img/session9-timeline.svg)
+
+### The SOC source — `22 005B` works
+
+- request `7E0#0322005B…`, response `7E8#0462005B<XX>AA…`, one byte,
+  **SOC% = XX·100/255** (exact, linear: `0xE5`→89.8 %, `0x54`→32.9 %).
+- **185 replies / 186 requests, 1 NRC**; `can0` stayed `ERROR-ACTIVE` the
+  whole drive. Active mode-22 polling is reliable on this bus for a full
+  session.
+- EV-drive depletion ≈ **3.1 %/min** at 70–82 mph.
+
+This is the SOC input for the reconciler's SOC-HOLD floor. `signals.py` SOC
+constants still untouched — the floor is a percent threshold, not a kWh
+budget, so `SOC_KWH_PER_COUNT` / `GEN1_PACK_USABLE_KWH` may never be needed.
+
+### Calibration — gauge bars ↔ SOC
+
+Diagnostic SOC at each `GAUGE-DOWN` mark:
+
+| drop | diag SOC | raw |
+|-----:|---------:|:---:|
+| 10→9 | 83.5 % | `0xD5` |
+| 9→8  | 76.1 % | `0xC2` |
+| 8→7  | 69.8 % | `0xB2` |
+| 7→6  | 60.0 % | `0x99` |
+| 6→5  | 55.3 % | `0x8D` |
+| 5→4  | 47.8 % | `0x7A` |
+| 4→3  | 41.2 % | `0x69` |
+| 3→2  | 33.7 % | `0x56` |
+| 2→1  | not reached (SOC bottomed 29.8 %, then HOLD) | |
+
+Least-squares: **`SOC% ≈ 7.07·bars + 19.6`, r = 0.999** — ~7 % SOC per bar,
+near-perfectly linear. The unseen `2→1` edge extrapolates to ~27 %, so the
+**2-bar band ≈ 27–34 % SOC**. Concrete floor:
+
+> **force HOLD when diag SOC ≤ ~33 %** (raw ≤ `0x54`); 3-bar margin ≈ 41 %
+> (`0x69`).
+
+The `DESIGN.md` placeholders (`hold_threshold_percent` 20, `hold_reset_percent`
+30) are close enough to leave; the real trip point is 33 % against the diag
+poll.
+
+### HOLD verified charge-sustaining
+
+After the driver forced HOLD near the 2-bar mark (no gesture for it, so the
+exact instant isn't logged), diag SOC **stopped falling** — 29.8 % minimum
+at +1162 s, then a slow climb to 33.7 % over ~11 min of further driving. The
+gauge stayed pinned at 2 bars throughout. So a reconciler that forces HOLD
+at the floor will hold the line, not just slow the bleed — the design
+assumption, confirmed on-road.
+
+### Session-8 broadcast candidates — falsified
+
+Plotting each against the diag SOC settles what Session 8 couldn't:
+
+- **`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6 — not SOC.** They drift down
+  over the drain (naive r ≈ +0.45) but at the HOLD plateau, SOC ~31 %, each
+  takes *every value it held earlier at 60–85 % SOC* — a vertical smear, not
+  a curve (`0x3E3` b0 reads ~188 at both 76 % and 33 %). Powertrain
+  load/current/torque signals; the `soc_log` `cand[…]` column already showed
+  them swinging with speed and accel.
+- **`0x096` byte 3** (in the `x F0 0A xx` mux) — monotone vs diag SOC
+  (r = 0.95), steps `13 → 9` across the pack and flattens in HOLD like SOC
+  does, but that's **~13 % SOC per count**: a passive sanity signal, not a
+  control input. Likely integer kWh-remaining.
+
+**No usable passive broadcast SOC exists.** `mine_capture.py --monotonic` on
+this capture surfaces only timers/odometers plus that coarse `0x096` b3. Not
+worth another dedicated drive — the poll works.
+
+### Code / tooling this session
+
+- **`tools/soc_report9.py` (new)** — stdlib-only, read-only, companion to
+  `soc_report.py`. `extract` parses the marks log + capture (with the
+  stale-head slice) into `docs/analysis/data/session9-soc.json`; `render`
+  draws `session9-{timeline,calibration,candidates}.svg` under
+  `docs/analysis/img/`. Write-up: `docs/analysis/session9-soc-anchor.md`.
+- No `signals.py` / test changes — analysis only. Suite still green (198).
+
+### Speed decode
+
+`0x3E9` b0-1 BE ÷ 64 km/h held up again this session (80–82 mph sustained
+highway, 0 at stops) but is still not speedo-verified (`confirmed=False`).
+
+---
+
 ## Session 8 — 2026-08-30 (in-car — full-drain SOC drive captured + analyzed; SOC narrowed to 3 candidates, still no scale; speed/accel logging fixed; wiki cross-check)
 
 The SOC discharge drive finally happened. One continuous highway run took
