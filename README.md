@@ -25,14 +25,16 @@ Normal → Sport → Mountain → Hold, so reaching a target mode means computin
 how many presses to send from the current mode — see DESIGN.md for why that
 makes a current-mode status signal a hard requirement.
 
-**Status (2026-08-30):** deployed on the Pi (`voltpi`), field testing in
-Phase C, `--dry-run`. Confirmed on-road: the mode-button input (`0x1E1`), the
-current-mode status signal (`0x1F4` byte 1, the daemon's mode source), and
-shift/PRNDL (`0x1F5` byte 3); the closed-loop menu walk has an on-road PASS.
-**SOC is the one open signal** and the last blocker on a non-dry-run daemon —
-narrowed to three broadcast candidates but not yet scaled to a percentage.
-The reconciler itself is designed (see DESIGN.md §"Mode policy") but not yet
-implemented, blocked on the same SOC calibration. Progress and next steps:
+**Status (2026-08-31):** deployed on the Pi (`voltpi`), field testing in
+Phase C. Confirmed on-road: the mode-button input (`0x1E1`), the current-mode
+status signal (`0x1F4` byte 1, the daemon's mode source), and shift/PRNDL
+(`0x1F5` byte 3); the closed-loop menu walk has an on-road PASS. Session 9
+resolved SOC — the `22 005B` UDS poll gives exact pack percent and the
+gauge↔SOC curve is near-linear — so the reconciler and its SOC-HOLD floor are
+now **implemented**. `--dry-run` is gone: the daemon boots **armed** and
+`voltdmf-ctl disarm` is the mid-drive stop. Still to do: migrate the
+out-of-repo `roles/voltdmf` ExecStart / `config.yaml`, then validate the
+33 % floor timing over several drives. Progress and next steps:
 [`docs/phase-c-field-checklist.md`](docs/phase-c-field-checklist.md) and
 [`docs/field-session-log.md`](docs/field-session-log.md).
 
@@ -41,7 +43,7 @@ implemented, blocked on the same SOC calibration. Progress and next steps:
 | Path | What |
 |---|---|
 | `DESIGN.md` | Full hardware/software design, phased plan, safety model. |
-| `voltdmf/` | The daemon: `config`, `signals`, `state`, `triggers`, `modecycle`, `safety`, `canio`, `daemon`, `control`/`ctl`. `python -m voltdmf --config ... [--dry-run]`. |
+| `voltdmf/` | The daemon: `config`, `signals`, `state`, `reconciler`, `modecycle`, `safety`, `canio`, `daemon`, `control`/`ctl`. `python -m voltdmf --config ... [--start-disarmed]`. |
 | `tools/` | Phase C signal-discovery scripts (see `tools/README.md`), incl. `soc_log.py` (drive capture) and `soc_report.py` (analysis → `docs/analysis/`). |
 | `host/` | Pi `config.txt` snippet + `systemd-networkd` unit to bring up `can0`. |
 | `systemd/` | `voltdmf.service` + `voltdmf.socket` (control socket); `voltdmf-btn.service` (panel gestures) launching `voltdmf-soclog.service` (SW1+SW2 → SOC capture) / `voltdmf-chargelog.service` (SW2 solo-hold → charge-mode capture). |
@@ -58,16 +60,17 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
 
-`--dry-run` reads and evaluates against a live bus but transmits nothing — the
-safe mode for early on-vehicle testing.
+`--start-disarmed` boots with transmission suppressed (the reconciler still
+runs and logs what it *would* do, and the `22 005B` SOC poll still transmits)
+— the safe mode for bench work. Normally the daemon boots **armed**.
 
 The daemon runs permanently as root under systemd; change modes and daemon
 state from an unprivileged account with `voltdmf-ctl` (`status` / `arm` /
-`disarm` / `set-mode <mode>` / `reload`) over its control socket. A non-dry-run
-daemon boots **disarmed** until `voltdmf-ctl arm`. See `host/README.md`
-§"Runtime control" and DESIGN.md §"Runtime control". (The reconciler's
-`setpoint <hold|mountain>` control and the panel button that drives it are
-designed but not yet implemented; blocked on SOC.)
+`disarm` / `setpoint <hold|mountain>` / `set-mode <mode>` / `reload`) over its
+control socket. `voltdmf-ctl disarm` is the mid-drive stop. See `host/README.md`
+§"Runtime control" and DESIGN.md §"Runtime control". The panel SW1 tap drives
+`setpoint`; the SOC-HOLD floor overrides the setpoint to HOLD whenever the
+pack is low.
 
 **Hardware:** PiCAN2 (Raspberry Pi CAN-bus HAT) + Raspberry Pi 3B, connected
 to the OBD-II port via an off-the-shelf OBD-II-to-DB9 cable, powered from

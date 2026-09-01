@@ -152,7 +152,7 @@ def do_watch(lcd: SerLcd, args) -> None:
             time.sleep(args.interval)
         return
 
-    with CanInterface(args.channel, dry_run=False) as can_if:
+    with CanInterface(args.channel) as can_if:
         bus = can_if._bus
         field = args.soc_field
         ticks = 0

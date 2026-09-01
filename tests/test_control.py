@@ -140,6 +140,7 @@ def test_status_provider_failure_is_reported(server):
 
 @pytest.mark.parametrize("request_obj,expect_name", [
     ({"cmd": "set-mode", "mode": "hold", "force": False}, "set-mode"),
+    ({"cmd": "setpoint", "mode": "mountain"}, "setpoint"),
     ({"cmd": "arm"}, "arm"),
     ({"cmd": "disarm"}, "disarm"),
     ({"cmd": "reload"}, "reload"),

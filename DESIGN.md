@@ -1,13 +1,16 @@
 # Volt Drive Mode Fixer — Design
 
-**Status (2026-08-30):** deployed on the Pi (`voltpi`), field testing (Phase
-C), `--dry-run`. Mode-button input (`0x1E1`), current-mode status (`0x1F4`
-byte 1) and shift/PRNDL (`0x1F5` byte 3) are confirmed on-road; the
-closed-loop menu walk has an on-road PASS. **SOC is the one open signal** and
-the last blocker on a non-dry-run daemon — narrowed to three broadcast
-candidates, not yet scaled to a percentage. The level-triggered reconciler in
-"Mode policy" is designed but not yet implemented, blocked on the same
-calibration. Progress and per-drive procedures live in
+**Status (2026-08-31):** deployed on the Pi (`voltpi`), field testing (Phase
+C). Mode-button input (`0x1E1`), current-mode status (`0x1F4` byte 1) and
+shift/PRNDL (`0x1F5` byte 3) are confirmed on-road; the closed-loop menu walk
+has an on-road PASS. Session 9 resolved SOC: the `22 005B` UDS poll gives
+exact pack percent (`raw·100/255`) and the gauge↔SOC curve is near-linear
+(`SOC% ≈ 7.07·bars + 19.6`, r = 0.999), so the level-triggered reconciler in
+"Mode policy" — with the SOC-HOLD floor keyed off that poll and `0x096`
+byte 3 as a coarse failsafe — is now **implemented**. `--dry-run` is gone:
+the daemon boots **armed** and `voltdmf-ctl disarm` is the mid-drive stop.
+The out-of-repo `roles/voltdmf` still needs its ExecStart / `config.yaml`
+migrated to match. Progress and per-drive procedures live in
 `docs/phase-c-field-checklist.md`; the on-vehicle narrative in
 `docs/field-session-log.md`.
 
@@ -81,28 +84,38 @@ per mode. See "Mode policy" and "Software architecture" below.
 > without separate configurable triggers.
 
 **Desired mode = f(setpoint, SOC).** One loop pass computes the mode the car
-*should* be in; if `state.drive_mode` (read from `0x1F4` byte 1) differs, it
-asks the safety gate to walk the menu there.
+*should* be in; the result is always concrete (never "none"). If
+`state.drive_mode` (read from `0x1F4` byte 1) differs and the daemon is armed,
+it asks the safety gate to walk the menu there — so a hand-picked mode change
+gets walked back, at most once per 60 s cooldown.
 
 | | SOC above `hold_reset_percent` | SOC at/below `hold_threshold_percent` |
 | --- | --- | --- |
-| **setpoint = HOLD** (default) | desired = *none* — leave the car alone (NORMAL / whatever the driver picked) | desired = **HOLD** |
+| **setpoint = HOLD** (default) | desired = **HOLD** — enforce it | desired = **HOLD** |
 | **setpoint = MOUNTAIN** | desired = **MOUNTAIN** | desired = **HOLD** (floor wins) |
 
+- **Armed = enforce the setpoint.** Above the floor the daemon actively holds
+  the car in the setpoint mode; it does not "leave the car alone". Flip the
+  panel button to HOLD (or `voltdmf-ctl disarm`) to stop it asserting
+  MOUNTAIN.
 - **The SOC-HOLD floor is always active** and always wins. There is no
   "off" / suspend — the whole point of the device is that the pack never
   sags, so the worst case is always "hold at the current SOC".
-- **Hysteresis.** Below `hold_threshold_percent` the floor engages (desired =
-  HOLD); it stays engaged until SOC climbs back above `hold_reset_percent`.
-  The latch lives in memory only.
-- **Floor target = 2 gauge bars remaining.** Decided from the Session-8
-  full-drain drive: the last bar (`1→0`) fell in **53 s** against a ~170 s
-  average for the other nine — the bottom of the gauge is a cliff, not a
-  slope, so the floor has to engage while 2 bars are still showing, with no
-  margin to wait for a lower reading. On the 10-bar gauge that is ~20 %
-  displayed SOC; `hold_threshold_percent` / `hold_reset_percent` get their
-  real values from the raw SOC-candidate reading at the 2-bar and 3-bar
-  crossings once the candidate is calibrated (see "Open items").
+- **Hysteresis.** At/below `hold_threshold_percent` (**33** — diag SOC from
+  the `22 005B` poll) the floor engages (desired = HOLD); it stays latched
+  until a fresh poll reads back at/above `hold_reset_percent` (**41**). The
+  latch lives in memory only and is dropped on `reload`.
+- **Failsafe on a stale poll.** If the poll stops answering (older than
+  ~45 s), `0x096` byte 3 ≤ `bar_failsafe_raw` (**9**, ≈ 2 gauge bars) forces
+  HOLD. The b3 proxy can only *engage* the floor — releasing it takes a real
+  poll reading above the reset percent, so a poll outage fails safe into
+  charge-sustaining HOLD.
+- **Floor target = 2 gauge bars remaining.** From the Session-8 full-drain
+  drive the last bar (`1→0`) fell in **53 s** against a ~170 s average for
+  the other nine — the bottom of the gauge is a cliff, so the floor engages
+  while 2 bars still show. Session 9 pinned the numbers: `SOC% ≈
+  7.07·bars + 19.6` (r = 0.999); the 3→2 bar drop is **33.7 %** (raw 0x56),
+  the 4→3 bar mark **41.2 %** (raw 0x69) — hence 33 / 41.
 - **Setpoint** is a two-state toggle, **HOLD ⇄ MOUNTAIN**, changed by one
   panel button (see "Runtime control" / "Hardware design"). It is *not*
   persisted — the Pi runs a read-only root with an overlay filesystem, so
@@ -126,15 +139,24 @@ speed-based Hold (bank EV range on the highway, release it in the city) would
 become a third setpoint or a modifier on the policy, reusing the same
 reconcile + injector plumbing. Tracked, not scheduled.
 
-Config sketch (exact schema TBD when the reconciler is written):
+Config (`config.example.yaml`; parsed by `voltdmf/config.py`):
 
 ```yaml
 policy:
-  hold_threshold_percent: 20   # ~2 gauge bars — floor engages at/below this (calibrate, see "Open items")
-  hold_reset_percent: 30       # ~3 gauge bars — SOC must climb back above this to disengage the floor
-  default_setpoint: hold       # always HOLD in practice (no persisted state)
-  mountain_button_gpio: 24     # BCM pin the button helper watches (PiCAN2 SW1)
+  default_setpoint: hold        # hold | mountain — boot value, not persisted
+  hold_threshold_percent: 33    # floor forces HOLD at/below this diag SOC
+  hold_reset_percent: 41        # floor releases at/above this (hysteresis)
+  bar_failsafe_raw: 9           # 0x096 b3 <= this forces HOLD if the poll is stale
+
+soc_poll:
+  enabled: true                 # run the 22 005B UDS poll for ground-truth SOC
+  period_seconds: 10            # request cadence
 ```
+
+`parse_config` validates `hold_reset_percent > hold_threshold_percent`,
+`default_setpoint ∈ {hold, mountain}`, `0 ≤ bar_failsafe_raw ≤ 255`, and
+`period_seconds > 0`. The button GPIO pins live in the `button_helper.py`
+unit, not here.
 
 ## Prior art (reuse this, don't rebuild it)
 
@@ -162,12 +184,13 @@ layer of defense.
 
 | Signal | ID | Notes |
 |---|---|---|
-| EV battery SOC | open | **`0x206` (the Gen 2 candidate) is not on this bus.** Narrowed to three energy-linked broadcast candidates (`0x3E3` b0/b1/b6, `0x228` b2, `0x186` b6); no raw→% scaling anchor yet. Battery charge *percent* is available only as diagnostic PID `22 005B` (`X·100/255`), not a broadcast field. Until a candidate is calibrated the reconciler's SOC-HOLD floor cannot engage — see "Open items" and `docs/phase-c-field-checklist.md` §2b. |
-| Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. This is the one frame the project transmits — `voltdmf/canio.send_mode_button_press()` (tracking-echo press). |
+| EV battery SOC (exact) | `22 005B` (UDS PID) | **The daemon's SOC source.** `0x206` (the Gen 2 broadcast candidate) is not on this bus, and no passive frame carries SOC at usable resolution, so the daemon polls diagnostic PID `22 005B` ("Hybrid/EV Battery Pack Remaining Charge") every ~10 s: request `03 22 00 5B 55 55 55 55` to `0x7E4` then `0x7E0` (lock onto whichever answers), reply on `0x7E8..0x7EF`, `SOC% = d[4]·100/255`. Stays in the default diagnostic session, service-22 only — no session switch, no TesterPresent — so it can't suppress normal broadcasts. The poll is a second hard-coded TX path (`canio.send_soc_poll`), ungated by arm state, gated only by `soc_poll.enabled`. |
+| EV battery SOC (coarse proxy / failsafe) | `0x096`, byte 3 | Only valid in the `x F0 0A xx` mux (`data[1]==0xF0 and data[2]==0x0A`). Steps ~13 % SOC per count — far too coarse to key the floor off, used only as the failsafe when the `22 005B` poll goes stale: b3 ≤ `bar_failsafe_raw` (9 ≈ 2 gauge bars ≈ 30 %) forces HOLD. Session-9 provenance; `signals.decode_soc_bar_raw`. |
+| Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. `voltdmf/canio.send_mode_button_press()` (tracking-echo press) — one of the daemon's two hard-coded TX frames (the other is the `22 005B` SOC poll); this is the only one gated by arm state. |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki, cross-checked against a full-drain capture; not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` logs it plus a derived accel). |
 | Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Used as a safety precondition — `SafetyGate` blocks injection unless in DRIVE (and blocks on UNKNOWN / short frame). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
-| EV range remaining | — | **Not documented anywhere found.** Use SOC (message ID still to be found on this bus) as the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
+| EV range remaining | — | **Not documented anywhere found.** The `22 005B` SOC poll (above) is the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
 | Current drive mode (status, not button-press) | `0x1F4`, byte 1 | **CONFIRMED on Gen 1 (2026-08-29).** Latched mode: `0x00` NORMAL, `0x80` SPORT, `0x20` MOUNTAIN, `0x08` HOLD. byte 4 = live drive-mode menu cursor (steps ~40 ms after each tap; distinct byte codes), byte 5 bit 7 = menu-open hint. The daemon reads byte 1 as its current-mode source — the press-counting fallback is retired. |
 
@@ -272,17 +295,21 @@ Reuse rather than rebuild:
 
 The custom code needed is small and specific to this project:
 
-1. **Config loader** — reads the YAML sketched above, validates it (e.g.
+1. **Config loader** — reads the YAML above, validates it (e.g.
    `hold_reset_percent > hold_threshold_percent`), and produces the policy
    for the run.
-2. **SOC monitor** — reads the EV-SOC frame (ID TBD — `0x206` is absent on
-   this bus), converts to a usable SOC value, applies a debounce/smoothing
-   filter (raw CAN values can be noisy frame-to-frame).
-3. **Reconciler** — one pure function, `desired_mode(setpoint, soc,
-   floor_latched) -> DriveMode | None`, per the "Mode policy" table, plus the
-   in-memory floor-latch hysteresis. The loop calls it every pass and, when
-   `desired` is not `None` and differs from `state.drive_mode`, hands
-   `desired` to the safety gate. No per-drive edge state, no once-only latch.
+2. **SOC poller** — an inline loop step (`daemon._service_soc_poll`) that
+   sends `22 005B` every `soc_poll.period_seconds` (`canio.send_soc_poll`,
+   ungated by arm state); the RX listener folds replies on `0x7E8..0x7EF`
+   into `state.soc_percent` / `soc_raw` / `soc_percent_monotonic`. `0x096`
+   byte 3 is decoded passively into `state.soc_bar_raw` as the failsafe
+   proxy. `0x206` is absent on this bus.
+3. **Reconciler** (`voltdmf/reconciler.py`, replaces `triggers.py`) — a pure
+   object, `Reconciler.desired_mode(state) -> DriveMode` (always concrete),
+   per the "Mode policy" table, plus the in-memory floor-latch hysteresis and
+   the b3 failsafe. The loop calls it every pass and, when `desired` differs
+   from `state.drive_mode` and the daemon is armed, hands `desired` to the
+   safety gate. No per-drive edge state, no once-only latch.
 4. **Button helper** — a tiny separate process (system Python, `gpiozero`)
    that owns the two PiCAN2 pads (SW1 = BCM 24, SW2 = BCM 23) and dispatches
    by gesture:
@@ -325,11 +352,12 @@ CAN has no authentication, and the reference project's `SAFETY_ALLOUTPUT`
 approach means the panda can transmit *anything*, not just the one message
 this project needs. Tighten that:
 
-- **Single narrow send function.** All transmission goes through one
-  function that hard-codes the exact CAN ID + payload for the one
-  button-press message this project needs, and nothing else — the cycling
-  design means every mode transition reuses this same message. No
-  general-purpose "send arbitrary frame" path in the daemon.
+- **Two narrow send functions, no generic sender.** `canio` has exactly two
+  functions that put a frame on the bus: `send_mode_button_press()`
+  (hard-coded `0x1E1` press — every mode transition reuses this one message,
+  gated by arm state) and `send_soc_poll()` (hard-coded `22 005B` request,
+  ungated — a read-only diagnostic poll). Each hard-codes its ID + payload;
+  there is no general-purpose "send arbitrary frame" path.
 - **Rate limiting.** Cap both the size and rate of a press burst — at most
   3 presses (Normal→Hold, the longest possible cycle) with realistic
   inter-press spacing, never a sustained/looping transmission. Re-check the
@@ -340,8 +368,10 @@ this project needs. Tighten that:
   a state where it wouldn't make sense anyway.
 - **Fail passive.** If the daemon crashes or hangs, it should simply stop
   transmitting — never get stuck mid-loop retrying a send. Run it under a
-  process supervisor (e.g. `systemd` with restart-on-failure) but make sure
-  a fresh process start doesn't immediately re-fire a stale latch.
+  process supervisor (e.g. `systemd` with restart-on-failure). The daemon
+  keeps **no persisted state** (read-only overlay root): a fresh start boots
+  armed at `default_setpoint` with the floor latch clear and re-derives
+  everything from the live bus, so there is no stale latch to re-fire.
 - **Physical kill switch**: unplugging the OBD connector fully removes the
   device from the bus — keep it physically easy to reach for exactly this
   reason during early testing.
@@ -372,10 +402,9 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
 | `reload` | re-read the config file, rebuild the policy | queued → loop thread |
 
-> **Implemented today:** `status`, `arm`, `disarm`, `set-mode`, `reload`.
-> `setpoint` (and the reconciler it feeds) is designed here but not yet
-> written — it lands with the reconciler once SOC is calibrated. Until then
-> `tools/button_helper.py`'s `setpoint` call is a logged no-op.
+> **All five commands are implemented.** `setpoint` and the reconciler it
+> feeds landed in Session 9; `tools/button_helper.py`'s SW1 tap now drives a
+> real toggle.
 
 - **Privilege boundary = file mode.** The `.socket` unit binds it
   `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no
@@ -389,10 +418,14 @@ invocations. State changes come in over an `AF_UNIX` stream socket
   a state snapshot. Everything that can transmit or mutate state is put on a
   `queue.Queue` and executed by the daemon's one loop thread — the CAN TX
   path and `SafetyGate` are never touched from the socket thread.
-- **`--dry-run` is an immutable session lock.** A non-dry-run daemon still
-  boots *disarmed*; an operator must `voltdmf-ctl arm` it (or start it with
-  `--armed`). Under `--dry-run`, `arm` is refused outright and the CAN layer
-  no-ops every press regardless.
+- **One gate: armed / disarmed.** There is no `--dry-run`. The service boots
+  **armed** and immediately enforces the setpoint — injection efficacy is
+  on-road-confirmed, so there is no reason to hold it back a key cycle at a
+  time. `voltdmf-ctl disarm` is the mid-drive stop; `voltdmf-ctl arm` undoes
+  it. While disarmed the reconciler still runs and logs what it *would* do,
+  and the `22 005B` SOC poll still transmits (it is a read-only diagnostic
+  request, not a mode change). `--start-disarmed` boots into the stopped
+  state for bench work.
 - **`setpoint` is the normal control.** It moves the reconciler's HOLD ⇄
   MOUNTAIN toggle; the reconciler then drives the car toward the desired mode
   and holds it there, self-healing if the driver bumps the stalk. The setpoint
@@ -402,9 +435,10 @@ invocations. State changes come in over an `AF_UNIX` stream socket
   controller for one switch now without moving the setpoint, so the reconciler
   will pull the mode back on its next pass (after the cooldown). Use it for
   bench pokes, not steady-state control.
-- **`reload` re-reads the policy.** It rebuilds the `policy:` block (thresholds,
-  button pin). The floor-latch hysteresis state is dropped on reload, so the
-  floor re-evaluates from the current SOC.
+- **`reload` re-reads the config file.** It rebuilds the `policy:` /
+  `soc_poll:` blocks and the reconciler. The live setpoint is preserved (it
+  is the driver's choice, not a file value); the floor-latch hysteresis state
+  is dropped, so the floor re-evaluates from the current SOC.
 
 ## Phased plan
 
@@ -431,7 +465,7 @@ invocations. State changes come in over an `AF_UNIX` stream socket
    actually advances one step per press, in the expected order, and that
    nothing else on the bus reacts badly (watch for new DTCs, warning
    lights).
-3. **Daemon development.** Write the config loader, SOC monitor, the
+3. **Daemon development.** Write the config loader, the SOC poller, the
    reconciler, the button helper, and safety-wrapped injector(s) described
    above, using the confirmed CAN IDs. Test on the Pi with the overlay
    filesystem enabled (see "Hardware design") before final deployment — the
@@ -458,21 +492,25 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 - **Ignition/drive-cycle start** — no dedicated signal needed. The Pi is
   powered only while the car is usable and the reconciler is level-triggered,
   so there is no ignition edge to catch.
+- **SOC → `22 005B` UDS poll** (Session 9). Exact pack percent = `raw·100/255`
+  from a ~10 s service-22 poll; the gauge↔SOC curve is `SOC% ≈
+  7.07·bars + 19.6` (r = 0.999). The floor engages at 33 % (3→2 bar drop),
+  releases at 41 % (4→3 bar). This unblocked the armed reconciler.
 
-### Still open (needs a discharge drive)
+### Still open
 
-- **SOC signal ID + scaling.** `0x206` (the Gen 2 candidate) is not on this
-  bus. Narrowed to three energy-linked broadcast candidates — `0x3E3` bytes
-  0/1/6 (triple-redundant, best timer rejection), `0x228` byte 2 (cleanest
-  but coarse ≈ 1.5 counts/bar), `0x186` byte 6 (fine but noisy) — with four
-  elapsed-time counters positively excluded. **No raw→% scaling anchor yet:**
-  no reading at a known SOC has been logged, and battery charge *percent* is
-  available only as diagnostic PID `22 005B` (`X·100/255`), not a broadcast
-  field. The calibration drive (`docs/phase-c-field-checklist.md` §2b) pins
-  the endpoints from a full-charge idle and a charge-sustaining HOLD segment,
-  with `soc_log.py --diag-soc` polling `22 005B` throughout as a continuous
-  known-SOC reference. The reconciler's SOC-HOLD floor cannot engage until
-  this lands — it is the last blocker on a non-dry-run daemon.
+- **Drop the poll for a passive signal.** The `22 005B` poll works but it is
+  an active TX on the vehicle bus every 10 s; a passive broadcast field would
+  be cleaner. `0x096` byte 3 (the failsafe proxy) is far too coarse
+  (~13 % SOC/count). The three Session-8 broadcast candidates — `0x3E3` bytes
+  0/1/6, `0x228` byte 2, `0x186` byte 6 — still have no raw→% scaling anchor;
+  the running trip logs (SOC % vs. each candidate raw, stamped every line by
+  `soc_log.py`) are the data set to calibrate one against and eventually
+  retire the poll.
+- **Validate the 33 / b3≤9 timing on the road.** Watch the trip logs over
+  several drives — does the floor engage early enough that the pack never
+  reaches the 1→0 bar cliff, and does the b3 failsafe hold if a poll gap
+  lands at the wrong moment.
 
 ### Deferred (not blocking)
 
@@ -485,7 +523,7 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 ### Stretch goal — force 12 A Level 1 charging
 
 Not part of the drive-mode mission; a low-risk add-on that would reuse the
-same bus tap and the same `--dry-run`-gated injector safety wrapper.
+same bus tap and the same arm-gated injector safety wrapper.
 
 The center-stack setting that raises 120 V charging from **8 A to 12 A** can
 be changed at any time (even while driving), but **reverts to 8 A every time
@@ -511,7 +549,7 @@ Safety: 12 A at 120 V is 1.44 kW — within the car's own menu option and the
 Lear charger's ~12.7 A ceiling. The only real-world caveat (the wall circuit
 being rated for 12 A continuous) is one the owner controls by only ever
 plugging in at home. No safety-of-motion dimension. It is still a bus TX, so
-it goes through the same dry-run gate, error-frame watch, and DTC scan as
+it goes through the same arm gate, error-frame watch, and DTC scan as
 mode injection.
 
 ## Sources

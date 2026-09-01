@@ -2,6 +2,7 @@
 
     voltdmf-ctl status
     voltdmf-ctl set-mode hold [--force]
+    voltdmf-ctl setpoint hold | mountain
     voltdmf-ctl arm
     voltdmf-ctl disarm
     voltdmf-ctl reload
@@ -21,10 +22,12 @@ import os
 import socket
 import sys
 
+from .config import SETPOINT_MODES
 from .control import DEFAULT_SOCKET_PATH
 from .signals import DriveMode
 
 _MODES = [m.value for m in DriveMode]
+_SETPOINTS = [m.value for m in SETPOINT_MODES]
 _CONNECT_TIMEOUT_S = 3.0
 _REPLY_TIMEOUT_S = 25.0   # > the server's own reply timeout
 
@@ -96,11 +99,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sm.add_argument("mode", choices=_MODES)
     sm.add_argument("--force", action="store_true",
                     help="walk the menu even if already reading that mode")
-    sub.add_parser("arm", help="allow transmission (no-op under --dry-run)",
+    sp = sub.add_parser("setpoint",
+                        help="move the HOLD<->MOUNTAIN setpoint the reconciler holds",
+                        parents=[common])
+    sp.add_argument("mode", choices=_SETPOINTS)
+    sub.add_parser("arm", help="allow transmission (the daemon boots armed)",
                    parents=[common])
     sub.add_parser("disarm", help="suppress transmission; keep reading/evaluating",
                    parents=[common])
-    sub.add_parser("reload", help="re-read the config file and rebuild triggers",
+    sub.add_parser("reload",
+                   help="re-read the config file and rebuild the reconciler "
+                        "(keeps the setpoint, drops the SOC-floor latch)",
                    parents=[common])
     return ap
 
@@ -110,6 +119,8 @@ def _request_for(args: argparse.Namespace) -> dict:
     if args.cmd == "set-mode":
         req["mode"] = args.mode
         req["force"] = args.force
+    elif args.cmd == "setpoint":
+        req["mode"] = args.mode
     return req
 
 
@@ -118,18 +129,31 @@ def _print_status(state: dict) -> None:
         val = state.get(key, default)
         return default if val is None else str(val)
 
-    tx = "ARMED" if state.get("transmit_enabled") else (
-        "dry-run" if state.get("dry_run") else "disarmed")
-    print(f"transmit:   {tx}  (armed={g('armed')}, dry_run={g('dry_run')})")
+    tx = "ARMED" if state.get("transmit_enabled") else "disarmed"
+    print(f"transmit:   {tx}")
+    sp = g("setpoint")
+    floor = "  [SOC-HOLD floor latched]" if state.get("floor_latched") else ""
+    print(f"setpoint:   {sp}{floor}")
     print(f"drive mode: {g('drive_mode')}"
           + (f"  (manual override -> {state['manual_override']})"
              if state.get("manual_override") else ""))
     print(f"shift:      {g('shift')}")
-    print(f"soc:        {g('soc_percent')}%"
-          + (f"   speed: {g('speed_mph')} mph" if state.get("speed_mph") is not None
-             else ""))
+    soc_line = f"soc:        {g('soc_percent')}%"
+    extras = []
+    if state.get("soc_source"):
+        extras.append(f"src={state['soc_source']}")
+    if state.get("soc_age_s") is not None:
+        extras.append(f"age={state['soc_age_s']}s")
+    if state.get("soc_bar_raw") is not None:
+        extras.append(f"b3={state['soc_bar_raw']}")
+    if extras:
+        soc_line += "   (" + ", ".join(extras) + ")"
+    print(soc_line)
+    if state.get("uds_replies") is not None:
+        print(f"uds poll:   {g('uds_replies')} ok / {g('uds_nrcs')} nrc")
+    if state.get("speed_mph") is not None:
+        print(f"speed:      {g('speed_mph')} mph")
     print(f"bus:        {'active' if state.get('bus_active') else 'quiet'}")
-    print(f"triggers:   {', '.join(state.get('triggers', [])) or '(none)'}")
     cd = state.get("cooldown_remaining_s")
     if cd:
         print(f"cooldown:   {cd}s left")
@@ -150,10 +174,13 @@ def _print_human(cmd: str, reply: dict) -> None:
         _print_status(reply.get("state", {}))
     elif cmd == "set-mode":
         print(reply.get("result", "ok"))
+    elif cmd == "setpoint":
+        print(f"setpoint = {reply.get('setpoint', '?')}")
     elif cmd in ("arm", "disarm"):
         print(f"armed={reply.get('armed')}")
     elif cmd == "reload":
-        print(f"reloaded; triggers: {', '.join(reply.get('triggers', [])) or '(none)'}")
+        print(f"reloaded; setpoint = {reply.get('setpoint', '?')} "
+              f"(SOC-floor latch cleared)")
     else:
         print("ok")
 

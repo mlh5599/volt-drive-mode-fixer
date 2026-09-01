@@ -11,10 +11,10 @@ Pi 3B. They are checked in so the box is reproducible.
 > into a virtualenv (e.g. `/opt/voltdmf/venv`); template
 > `/etc/voltdmf/config.yaml`; and run `voltdmf.service` as an unprivileged
 > user with `AmbientCapabilities=CAP_NET_RAW` instead of as root. Gate the
-> whole thing behind a per-host enable flag, keep `--dry-run` on until the
-> bench injection test (DESIGN.md Phase C.5) passes, and **never let the
-> automation reboot the device** — if applying the overlay needs a reboot,
-> stop and let a human do it while the vehicle is parked.
+> whole thing behind a per-host enable flag, and **never let the automation
+> reboot the device** — if applying the overlay needs a reboot, stop and let
+> a human do it while the vehicle is parked. The daemon boots armed; put
+> `--start-disarmed` in `ExecStart` for a host that should come up stopped.
 
 ## Phase A -- bring up `can0`
 
@@ -57,9 +57,8 @@ journalctl -u voltdmf -f
 ```
 
 If `voltdmf.service` is managed elsewhere (e.g. the Ansible `roles/voltdmf`
-unit on `voltpi`, which runs as `User=voltdmf` + `AmbientCapabilities=CAP_NET_RAW`
-and keeps `--dry-run` in `ExecStart`), do **not** replace it. Install only the
-socket plus a drop-in:
+unit on `voltpi`, which runs as `User=voltdmf` + `AmbientCapabilities=CAP_NET_RAW`),
+do **not** replace it. Install only the socket plus a drop-in:
 
 ```
 sudo cp ../systemd/voltdmf.socket /etc/systemd/system/
@@ -82,15 +81,17 @@ must be in the `voltdmf` group, see above). No `sudo`:
 
 ```
 voltdmf-ctl status                 # daemon + vehicle snapshot
-voltdmf-ctl arm                    # allow transmission (refused under --dry-run)
-voltdmf-ctl set-mode hold          # request one switch now (safety gate still applies)
-voltdmf-ctl disarm                 # stop transmitting; keep reading/evaluating
+voltdmf-ctl disarm                 # mid-drive stop: stop transmitting, keep reading/evaluating
+voltdmf-ctl arm                    # resume transmission
+voltdmf-ctl setpoint mountain      # move the reconciler setpoint (HOLD <-> MOUNTAIN)
+voltdmf-ctl set-mode hold          # request one switch now, out of band (safety gate still applies)
 voltdmf-ctl reload                 # re-read /etc/voltdmf/config.yaml
 ```
 
-A non-`--dry-run` daemon **boots disarmed** — nothing transmits until
-`voltdmf-ctl arm` (or start it with `--armed`). `systemctl restart voltdmf`
-resets it to disarmed again. `voltdmf.socket` is socket-activated: `voltdmf-ctl`
+The daemon **boots armed** and enforces the setpoint immediately; there is no
+`--dry-run`. `voltdmf-ctl disarm` is the mid-drive stop, `systemctl restart
+voltdmf` re-arms. Start the service with `--start-disarmed` for a host that
+should come up stopped. `voltdmf.socket` is socket-activated: `voltdmf-ctl`
 works even if the service is momentarily down (the command queues briefly).
 
 For bench work without the units, run the daemon with an explicit path:

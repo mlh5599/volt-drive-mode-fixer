@@ -6,77 +6,94 @@ from voltdmf.signals import DriveMode
 
 def _valid() -> dict:
     return {
-        "on_start": {"enabled": True, "target_mode": "mountain"},
-        "soc_threshold": {
-            "enabled": True,
-            "target_mode": "hold",
-            "threshold_percent": 25,
-            "reset_percent": 40,
+        "policy": {
+            "default_setpoint": "hold",
+            "hold_threshold_percent": 33,
+            "hold_reset_percent": 41,
+            "bar_failsafe_raw": 9,
         },
-        "trip_mode": {"enabled": False},
+        "soc_poll": {"enabled": True, "period_seconds": 10},
     }
 
 
 def test_parse_valid():
     cfg = parse_config(_valid())
-    assert cfg.on_start.enabled is True
-    assert cfg.on_start.target_mode is DriveMode.MOUNTAIN
-    assert cfg.soc_threshold.target_mode is DriveMode.HOLD
-    assert cfg.soc_threshold.threshold_percent == 25
-    assert cfg.soc_threshold.reset_percent == 40
-    assert cfg.trip_mode.enabled is False
+    assert cfg.policy.default_setpoint is DriveMode.HOLD
+    assert cfg.policy.hold_threshold_percent == 33
+    assert cfg.policy.hold_reset_percent == 41
+    assert cfg.policy.bar_failsafe_raw == 9
+    assert cfg.soc_poll.enabled is True
+    assert cfg.soc_poll.period_seconds == 10
 
 
-def test_trip_mode_defaults_to_disabled_when_absent():
+def test_default_setpoint_mountain_is_ok():
     raw = _valid()
-    del raw["trip_mode"]
-    assert parse_config(raw).trip_mode.enabled is False
+    raw["policy"]["default_setpoint"] = "mountain"
+    assert parse_config(raw).policy.default_setpoint is DriveMode.MOUNTAIN
 
 
 def test_reset_must_exceed_threshold():
     raw = _valid()
-    raw["soc_threshold"]["reset_percent"] = 25
-    with pytest.raises(ConfigError, match="reset_percent"):
+    raw["policy"]["hold_reset_percent"] = 33
+    with pytest.raises(ConfigError, match="hold_reset_percent"):
         parse_config(raw)
 
 
-def test_bad_target_mode():
+@pytest.mark.parametrize("bad", ["normal", "sport", "ludicrous"])
+def test_bad_default_setpoint(bad):
     raw = _valid()
-    raw["on_start"]["target_mode"] = "ludicrous"
-    with pytest.raises(ConfigError, match="target_mode"):
-        parse_config(raw)
-
-
-def test_trip_mode_enabled_is_rejected():
-    raw = _valid()
-    raw["trip_mode"]["enabled"] = True
-    with pytest.raises(ConfigError, match="trip_mode"):
+    raw["policy"]["default_setpoint"] = bad
+    with pytest.raises(ConfigError, match="default_setpoint"):
         parse_config(raw)
 
 
 def test_missing_key():
     raw = _valid()
-    del raw["soc_threshold"]["threshold_percent"]
-    with pytest.raises(ConfigError, match="threshold_percent"):
+    del raw["policy"]["hold_threshold_percent"]
+    with pytest.raises(ConfigError, match="hold_threshold_percent"):
+        parse_config(raw)
+
+
+def test_missing_section():
+    raw = _valid()
+    del raw["soc_poll"]
+    with pytest.raises(ConfigError, match="soc_poll"):
         parse_config(raw)
 
 
 @pytest.mark.parametrize("bad", [-1, 101, "abc"])
 def test_percent_out_of_range(bad):
     raw = _valid()
-    raw["soc_threshold"]["threshold_percent"] = bad
+    raw["policy"]["hold_threshold_percent"] = bad
     with pytest.raises(ConfigError):
         parse_config(raw)
 
 
-def test_load_the_example_config(tmp_path):
+@pytest.mark.parametrize("bad", [-1, 256, "abc"])
+def test_bar_failsafe_out_of_range(bad):
+    raw = _valid()
+    raw["policy"]["bar_failsafe_raw"] = bad
+    with pytest.raises(ConfigError, match="bar_failsafe_raw"):
+        parse_config(raw)
+
+
+@pytest.mark.parametrize("bad", [0, -5, "soon"])
+def test_bad_poll_period(bad):
+    raw = _valid()
+    raw["soc_poll"]["period_seconds"] = bad
+    with pytest.raises(ConfigError, match="period_seconds"):
+        parse_config(raw)
+
+
+def test_load_the_example_config():
     # The repo's own example must always be valid.
     import pathlib
 
     example = pathlib.Path(__file__).parent.parent / "config.example.yaml"
     cfg = load_config(example)
-    assert cfg.on_start.target_mode is DriveMode.MOUNTAIN
-    assert cfg.soc_threshold.reset_percent > cfg.soc_threshold.threshold_percent
+    assert cfg.policy.default_setpoint in (DriveMode.HOLD, DriveMode.MOUNTAIN)
+    assert cfg.policy.hold_reset_percent > cfg.policy.hold_threshold_percent
+    assert cfg.soc_poll.enabled is True
 
 
 def test_load_missing_file():

@@ -57,9 +57,9 @@ def test_fmt_uptime(secs, want):
 
 # -- LcdDashboard._tick (drives a dry-run SerLcd, no serial port) --------
 def test_dashboard_drives_a_real_panel_by_default():
-    # regression: the daemon runs --dry-run on the Pi (no CAN TX) but the
-    # watch screen must still write to /dev/serial0, not just an in-memory
-    # image. LcdDashboard must not inherit the daemon's dry_run.
+    # regression: a disarmed daemon does no CAN TX, but the watch screen must
+    # still write to /dev/serial0, not just an in-memory image. LcdDashboard's
+    # own dry_run (the LCD serial port) is independent of daemon arm state.
     dash = LcdDashboard(_state(), lambda: "idle")
     assert dash._lcd_kwargs["dry_run"] is False
 

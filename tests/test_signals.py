@@ -26,27 +26,52 @@ def test_decode_speed_short_frame():
     assert signals.decode_speed_mph(b"\x01") is None
 
 
+def test_uds_soc_request_payload():
+    # ISO-TP single frame: 03 22 00 5B then 0x55 padding.
+    assert signals.uds_soc_request_payload() == bytes.fromhex("0322005B55555555")
+
+
 @pytest.mark.parametrize(
-    "data, expected_raw",
+    "raw, pct",
+    [(0, 0.0), (255, 100.0), (0x54, 32.94), (0xE5, 89.80)],
+)
+def test_uds_soc_percent(raw, pct):
+    assert signals.uds_soc_percent(raw) == pytest.approx(pct, abs=1e-2)
+
+
+def test_decode_uds_soc_positive():
+    # 7E8#04 62 005B <raw> ...
+    kind, raw = signals.decode_uds_soc(bytes([0x04, 0x62, 0x00, 0x5B, 0x54, 0, 0]))
+    assert kind == "ok"
+    assert raw == 0x54
+
+
+def test_decode_uds_soc_negative_response():
+    # 7E8#03 7F 22 <nrc> ...
+    kind, raw = signals.decode_uds_soc(bytes([0x03, 0x7F, 0x22, 0x31, 0, 0, 0]))
+    assert kind == "nrc"
+    assert raw is None
+
+
+def test_decode_uds_soc_other_and_short():
+    # right service, wrong DID -> not ours
+    assert signals.decode_uds_soc(bytes([0x04, 0x62, 0x00, 0x60, 0x11])) == ("other", None)
+    # too short to carry the charge byte
+    assert signals.decode_uds_soc(bytes([0x04, 0x62, 0x00, 0x5B])) == ("other", None)
+
+
+@pytest.mark.parametrize(
+    "data, expected",
     [
-        (bytes([0x00, 0x27, 0x10]), 0x2710),        # bytes 1-2 big-endian
-        (bytes([0xAA, 0x00, 0x00, 0xFF]), 0x0000),   # byte 0 is not part of it
-        (bytes([0x00, 0x12, 0x34, 0x56]), 0x1234),
+        (bytes([0x00, 0xF0, 0x0A, 0x09, 0, 0, 0, 0]), 9),   # mux hit
+        (bytes([0x00, 0xF0, 0x0A, 0x0D, 0, 0, 0, 0]), 13),
+        (bytes([0x00, 0xF0, 0x0B, 0x09, 0, 0, 0, 0]), None),  # wrong mux byte 2
+        (bytes([0x00, 0xE0, 0x0A, 0x09, 0, 0, 0, 0]), None),  # wrong mux byte 1
+        (bytes([0x00, 0xF0, 0x0A]), None),                    # short
     ],
 )
-def test_decode_soc_raw(data, expected_raw):
-    assert signals.decode_soc_raw(data) == expected_raw
-
-
-def test_decode_soc_raw_short_frame():
-    assert signals.decode_soc_raw(b"\x00\x01") is None
-
-
-def test_soc_percent_is_clamped():
-    assert signals.soc_percent_from_raw(0) == 0.0
-    assert signals.soc_percent_from_raw(10**9) == 100.0
-    mid = signals.soc_percent_from_raw(20)
-    assert 0.0 <= mid <= 100.0
+def test_decode_soc_bar_raw(data, expected):
+    assert signals.decode_soc_bar_raw(data) == expected
 
 
 @pytest.mark.parametrize(
@@ -96,21 +121,26 @@ def test_mode_cycle_order():
 
 
 def test_is_signal_frame():
-    assert signals.is_signal_frame(0x206)
+    assert signals.is_signal_frame(0x096)   # coarse passive SOC proxy
+    assert signals.is_signal_frame(0x7E8)   # UDS SOC poll reply (low)
+    assert signals.is_signal_frame(0x7EF)   # UDS SOC poll reply (high)
     assert signals.is_signal_frame(0x3E9)
     assert signals.is_signal_frame(0x135)
     assert signals.is_signal_frame(0x1F5)
     assert signals.is_signal_frame(0x1F4)  # drive-mode status, ~40 Hz
     assert not signals.is_signal_frame(0x1E1)
+    assert not signals.is_signal_frame(0x206)  # not on this bus
+    assert not signals.is_signal_frame(0x7E0)  # request id, not a reply
 
 
 def test_confirmed_signal_set():
     # Phase C, 2026-08-29 (session 4, drive): drive-mode status (0x1F4 b1),
     # the button injection (0x1E1), and PRNDL (0x1F5 b3) are all confirmed
-    # on-vehicle. SOC and speed still need a longer discharge drive.
+    # on-vehicle. Speed still needs a longer discharge drive; SOC is a UDS
+    # poll now, not a SIGNAL_IDS entry.
     confirmed = {name for name, s in signals.SIGNAL_IDS.items() if s.confirmed}
     assert confirmed == {"drive_mode_status", "drive_mode_button", "shift"}
     assert signals.SIGNAL_IDS["drive_mode_status"].addr == 0x1F4
     assert signals.SIGNAL_IDS["drive_mode_button"].addr == 0x1E1
     assert signals.SIGNAL_IDS["shift"].addr == 0x1F5
-    assert not signals.SIGNAL_IDS["soc"].confirmed
+    assert "soc" not in signals.SIGNAL_IDS

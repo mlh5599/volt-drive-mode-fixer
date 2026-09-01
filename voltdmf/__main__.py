@@ -15,10 +15,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="voltdmf", description=__doc__)
     p.add_argument("--config", required=True, help="path to config YAML")
     p.add_argument("--channel", default="can0", help="SocketCAN channel (default: can0)")
-    p.add_argument(
-        "--dry-run", action="store_true",
-        help="read and evaluate against the live bus but transmit nothing",
-    )
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
@@ -33,9 +29,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="disable the runtime control socket entirely",
     )
     ctl.add_argument(
-        "--armed", action="store_true",
-        help="start with transmission enabled instead of disarmed (ignored "
-             "under --dry-run)",
+        "--start-disarmed", action="store_true",
+        help="boot with transmission suppressed (bench use). The daemon "
+             "normally boots armed and enforces the setpoint immediately; "
+             "`voltdmf-ctl disarm` is the mid-drive stop.",
     )
     p.set_defaults(control=True)
 
@@ -65,13 +62,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    daemon = Daemon(config, channel=args.channel, dry_run=args.dry_run,
+    daemon = Daemon(config, channel=args.channel,
                     lcd=args.lcd, lcd_port=args.lcd_port, lcd_baud=args.lcd_baud,
                     lcd_backlight=args.lcd_backlight,
                     control_enabled=args.control,
                     control_socket_path=args.control_socket,
                     config_path=args.config,
-                    start_armed=args.armed)
+                    start_armed=not args.start_disarmed)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: daemon.request_stop())
 

@@ -1,7 +1,12 @@
 """Config loading and validation.
 
-Schema mirrors the YAML sketch in DESIGN.md ("Trigger strategies"). See
-``config.example.yaml``.
+Two sections, both required (see ``config.example.yaml``):
+
+* ``policy`` -- the reconciler's decision constants: the boot setpoint and the
+  SOC-HOLD floor's engage / release / failsafe thresholds.
+* ``soc_poll`` -- whether the daemon runs the ``22 005B`` UDS poll and how
+  often. Enabled by default; the goal is to trust a passive SOC signal later
+  and switch it off.
 """
 
 from __future__ import annotations
@@ -13,51 +18,58 @@ import yaml
 
 from .signals import DriveMode
 
+#: The setpoint toggle only moves between these two (HOLD is the floor's
+#: target, MOUNTAIN is charge-building). NORMAL / SPORT are never a setpoint.
+SETPOINT_MODES: tuple[DriveMode, ...] = (DriveMode.HOLD, DriveMode.MOUNTAIN)
+
 
 class ConfigError(ValueError):
     """Raised for a malformed or invalid config file."""
 
 
 @dataclass(frozen=True)
-class OnStartConfig:
-    enabled: bool
-    target_mode: DriveMode
+class PolicyConfig:
+    #: Boot value of the HOLD <-> MOUNTAIN setpoint. Not persisted.
+    default_setpoint: DriveMode
+    #: Diag SOC at/below which the floor forces HOLD.
+    hold_threshold_percent: float
+    #: Diag SOC at/above which the floor releases (hysteresis).
+    hold_reset_percent: float
+    #: 0x096 byte 3 at/below which HOLD is forced when the poll is stale.
+    bar_failsafe_raw: int
 
 
 @dataclass(frozen=True)
-class SocThresholdConfig:
+class SocPollConfig:
     enabled: bool
-    target_mode: DriveMode
-    threshold_percent: float
-    reset_percent: float
-
-
-@dataclass(frozen=True)
-class TripModeConfig:
-    enabled: bool
+    period_seconds: float
 
 
 @dataclass(frozen=True)
 class Config:
-    on_start: OnStartConfig
-    soc_threshold: SocThresholdConfig
-    trip_mode: TripModeConfig
+    policy: PolicyConfig
+    soc_poll: SocPollConfig
 
 
-def _require(mapping: dict, key: str, section: str):
+def _require(mapping, key: str, section: str):
+    if not isinstance(mapping, dict):
+        raise ConfigError(f"{section}: must be a mapping")
     if key not in mapping:
         raise ConfigError(f"{section}: missing required key '{key}'")
     return mapping[key]
 
 
-def _as_mode(value, section: str) -> DriveMode:
+def _as_setpoint(value, section: str) -> DriveMode:
     try:
-        return DriveMode(str(value).lower())
+        mode = DriveMode(str(value).lower())
     except ValueError:
-        allowed = ", ".join(m.value for m in DriveMode)
+        mode = None
+    if mode not in SETPOINT_MODES:
+        allowed = ", ".join(m.value for m in SETPOINT_MODES)
         raise ConfigError(
-            f"{section}: target_mode '{value}' is not one of: {allowed}"
-        ) from None
+            f"{section}: default_setpoint '{value}' is not one of: {allowed}"
+        )
+    return mode
 
 
 def _as_percent(value, section: str, key: str) -> float:
@@ -70,47 +82,59 @@ def _as_percent(value, section: str, key: str) -> float:
     return pct
 
 
+def _as_byte(value, section: str, key: str) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{section}: '{key}' must be an integer") from None
+    if not 0 <= n <= 255:
+        raise ConfigError(f"{section}: '{key}' must be between 0 and 255")
+    return n
+
+
 def parse_config(raw: dict) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("top level must be a mapping")
 
-    os_raw = _require(raw, "on_start", "on_start")
-    on_start = OnStartConfig(
-        enabled=bool(_require(os_raw, "enabled", "on_start")),
-        target_mode=_as_mode(_require(os_raw, "target_mode", "on_start"), "on_start"),
-    )
-
-    st_raw = _require(raw, "soc_threshold", "soc_threshold")
+    p_raw = _require(raw, "policy", "policy")
     threshold = _as_percent(
-        _require(st_raw, "threshold_percent", "soc_threshold"),
-        "soc_threshold", "threshold_percent",
+        _require(p_raw, "hold_threshold_percent", "policy"),
+        "policy", "hold_threshold_percent",
     )
     reset = _as_percent(
-        _require(st_raw, "reset_percent", "soc_threshold"),
-        "soc_threshold", "reset_percent",
+        _require(p_raw, "hold_reset_percent", "policy"),
+        "policy", "hold_reset_percent",
     )
     if reset <= threshold:
         raise ConfigError(
-            "soc_threshold: reset_percent must be greater than threshold_percent "
-            f"(got reset={reset}, threshold={threshold})"
+            "policy: hold_reset_percent must be greater than "
+            f"hold_threshold_percent (got reset={reset}, threshold={threshold})"
         )
-    soc_threshold = SocThresholdConfig(
-        enabled=bool(_require(st_raw, "enabled", "soc_threshold")),
-        target_mode=_as_mode(
-            _require(st_raw, "target_mode", "soc_threshold"), "soc_threshold"
+    policy = PolicyConfig(
+        default_setpoint=_as_setpoint(
+            _require(p_raw, "default_setpoint", "policy"), "policy"
         ),
-        threshold_percent=threshold,
-        reset_percent=reset,
+        hold_threshold_percent=threshold,
+        hold_reset_percent=reset,
+        bar_failsafe_raw=_as_byte(
+            _require(p_raw, "bar_failsafe_raw", "policy"),
+            "policy", "bar_failsafe_raw",
+        ),
     )
 
-    tm_raw = raw.get("trip_mode", {"enabled": False})
-    if bool(_require(tm_raw, "enabled", "trip_mode")):
-        raise ConfigError(
-            "trip_mode: not implemented yet (DR5, roadmap) -- set enabled: false"
-        )
-    trip_mode = TripModeConfig(enabled=False)
+    sp_raw = _require(raw, "soc_poll", "soc_poll")
+    try:
+        period = float(_require(sp_raw, "period_seconds", "soc_poll"))
+    except (TypeError, ValueError):
+        raise ConfigError("soc_poll: 'period_seconds' must be a number") from None
+    if period <= 0:
+        raise ConfigError("soc_poll: 'period_seconds' must be > 0")
+    soc_poll = SocPollConfig(
+        enabled=bool(_require(sp_raw, "enabled", "soc_poll")),
+        period_seconds=period,
+    )
 
-    return Config(on_start=on_start, soc_threshold=soc_threshold, trip_mode=trip_mode)
+    return Config(policy=policy, soc_poll=soc_poll)
 
 
 def load_config(path: str | Path) -> Config:

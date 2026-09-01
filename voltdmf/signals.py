@@ -56,12 +56,6 @@ class SignalId:
 
 
 SIGNAL_IDS: dict[str, SignalId] = {
-    "soc": SignalId(
-        "EV battery SOC",
-        0x206,
-        confirmed=False,
-        note="bytes 1-2; ~0.25 kWh/count per OVMS notes; scaling needs calibration",
-    ),
     "speed": SignalId(
         "Vehicle speed",
         0x3E9,
@@ -117,37 +111,76 @@ SIGNAL_IDS: dict[str, SignalId] = {
 _ALT_SHIFT_ADDR = 0x135
 
 
-# --- SOC (0x206) -------------------------------------------------------------
+# --- Battery pack SOC ------------------------------------------------------
 #
-# DESIGN.md: "Bytes 1-2, ~0.25 kWh/count granularity per OVMS notes. Needs
-# calibration against the vehicle's dash %/kWh readings."
-#
-# TODO_CALIBRATE: every constant below is a guess until watch_soc.py has been
-# run against the dash. Treat decode_soc_raw() output as *relative* until then.
-SOC_KWH_PER_COUNT = 0.25  # TODO_CALIBRATE
-GEN1_PACK_USABLE_KWH = 10.8  # TODO_CALIBRATE (rough Gen 1 usable capacity)
+# 0x206 (the opendbc Gen 2 candidate) is NOT on this Gen 1 HS-CAN bus
+# (confirmed absent, Sessions 6-9), and no broadcast frame carries pack SOC
+# at a usable resolution -- Session 9 falsified the Session-8 candidates
+# (0x3E3 / 0x228 / 0x186 are powertrain load, not charge). The only exact
+# read is the UDS diagnostic poll 22 005B; a coarse passive proxy lives in
+# 0x096 byte 3.
+
+# UDS "Hybrid/EV Battery Pack Remaining Charge", DID 0x005B, service 0x22.
+#   request   7E0#0322005B55555555  (try 7E4 then 7E0; lock onto the answerer)
+#   response  7E8#0462005B<XX>...    SOC% = XX * 100 / 255
+# Session 9 on-road: 185 replies / 186 requests over a 31-min drive, can0
+# ERROR-ACTIVE throughout; decode exact and linear (0xE5 -> 89.8 %,
+# 0x54 -> 32.9 %). Stays in the default diagnostic session, service 22 only
+# -- no session switch, no TesterPresent -- so it cannot suppress the normal
+# broadcasts.
+UDS_SOC_DID = 0x005B
+UDS_SOC_REQ_IDS: tuple[int, ...] = (0x7E4, 0x7E0)
+UDS_RESP_ID_LO = 0x7E8
+UDS_RESP_ID_HI = 0x7EF
 
 
-def decode_soc_raw(data: bytes) -> int | None:
-    """Raw 16-bit value from bytes 1-2 of frame 0x206, big-endian.
+def uds_soc_request_payload() -> bytes:
+    """The 8-byte ISO-TP single-frame request body for ``22 005B`` (0x55 pad)."""
+    return bytes((0x03, 0x22, UDS_SOC_DID >> 8, UDS_SOC_DID & 0xFF,
+                  0x55, 0x55, 0x55, 0x55))
 
-    Returns ``None`` if the frame is too short. Byte order and offset are
-    unverified -- see TODO_CALIBRATE above.
+
+def uds_soc_percent(raw: int) -> float:
+    """UDS pack-charge byte -> percent (``X * 100 / 255``)."""
+    return raw * 100.0 / 255.0
+
+
+def decode_uds_soc(data: bytes) -> tuple[str, int | None]:
+    """Classify a 0x7E8..0x7EF frame that may carry a ``22 005B`` reply.
+
+    Returns ``("ok", raw)`` for a positive response (``raw`` is the charge
+    byte -- convert with :func:`uds_soc_percent`), ``("nrc", None)`` for a
+    negative response to service 0x22, or ``("other", None)`` for anything
+    else (a different PID/service, or a short frame).
     """
-    if len(data) < 3:
+    if (len(data) >= 5 and data[0] >= 4 and data[1] == 0x62
+            and (data[2] << 8 | data[3]) == UDS_SOC_DID):
+        return ("ok", data[4])
+    if len(data) >= 3 and data[1] == 0x7F and data[2] == 0x22:
+        return ("nrc", None)
+    return ("other", None)
+
+
+# --- Coarse passive SOC proxy (0x096 byte 3) -----------------------------
+#
+# Session 9: in the "x F0 0A xx" mux frame (byte 1 == 0xF0 and byte 2 ==
+# 0x0A) byte 3 steps 13 -> 9 across the whole usable pack -- monotone with
+# charge (r = 0.95 vs the diag poll) and it flattens during HOLD like SOC
+# does, but only ~13 % SOC per count. So it is a sanity check / poll-failure
+# failsafe, not a control input: b3 <= 9 is roughly 2 gauge bars (~30 % SOC).
+SOC_BAR_ADDR = 0x096
+_SOC_BAR_MUX = (0xF0, 0x0A)
+
+
+def decode_soc_bar_raw(data: bytes) -> int | None:
+    """Byte 3 of the 0x096 ``x F0 0A xx`` mux frame, or ``None``.
+
+    0x096 is multiplexed and only these frames carry the slow byte-3 value;
+    returns ``None`` for a short frame or any non-mux 0x096 frame.
+    """
+    if len(data) < 4 or (data[1], data[2]) != _SOC_BAR_MUX:
         return None
-    return struct.unpack_from(">H", data, 1)[0]
-
-
-def soc_percent_from_raw(raw: int) -> float:
-    """Best-effort raw -> percent using the (uncalibrated) constants above."""
-    kwh = raw * SOC_KWH_PER_COUNT
-    return max(0.0, min(100.0, 100.0 * kwh / GEN1_PACK_USABLE_KWH))
-
-
-def decode_soc_percent(data: bytes) -> float | None:
-    raw = decode_soc_raw(data)
-    return None if raw is None else soc_percent_from_raw(raw)
+    return data[3]
 
 
 # --- Vehicle speed (0x3E9) -------------------------------------------------
@@ -276,7 +309,8 @@ def decode_shift(data: bytes) -> ShiftPosition:
 
 def is_signal_frame(addr: int) -> bool:
     """True if ``addr`` is one we know how to decode into VehicleState."""
-    known = {SIGNAL_IDS["soc"].addr, SIGNAL_IDS["speed"].addr,
-             SIGNAL_IDS["shift"].addr, SIGNAL_IDS["drive_mode_status"].addr,
-             _ALT_SHIFT_ADDR}
+    if addr == SOC_BAR_ADDR or UDS_RESP_ID_LO <= addr <= UDS_RESP_ID_HI:
+        return True
+    known = {SIGNAL_IDS["speed"].addr, SIGNAL_IDS["shift"].addr,
+             SIGNAL_IDS["drive_mode_status"].addr, _ALT_SHIFT_ADDR}
     return addr in known

@@ -1,16 +1,20 @@
 """Wire-up and main loop.
 
-    config -> CAN bus -> VehicleState (RX loop) -> triggers -> safety gate -> mode cycle
+    config -> CAN bus -> VehicleState (RX loop) -> reconciler -> safety gate -> mode cycle
 
 The loop only *reads* and *evaluates*; the safety gate is the sole route to a
-transmission, and any exception in the loop body is swallowed so the daemon
-stays passive rather than dying or retrying mid-burst (DESIGN.md "Safety model").
+mode-button transmission, and any exception in the loop body is swallowed so
+the daemon stays passive rather than dying or retrying mid-burst (DESIGN.md
+"Safety model"). The one other thing the loop transmits is the ``22 005B``
+SOC poll -- a read, sent armed or disarmed.
 
-The daemon runs permanently under systemd as root. Operators steer it from an
-unprivileged account through the control socket (:mod:`voltdmf.control`,
-``voltdmf-ctl``): ``status`` is answered read-only on the socket thread;
-``set-mode`` / ``arm`` / ``disarm`` / ``reload`` are queued and executed here on
-the single loop thread, so the transmit path stays single-threaded.
+The daemon runs permanently under systemd as root. It **boots armed** and
+immediately reconciles the car to the setpoint; ``voltdmf-ctl disarm`` is the
+mid-drive stop. Operators steer it from an unprivileged account through the
+control socket (:mod:`voltdmf.control`, ``voltdmf-ctl``): ``status`` is
+answered read-only on the socket thread; ``set-mode`` / ``setpoint`` / ``arm``
+/ ``disarm`` / ``reload`` are queued and executed here on the single loop
+thread, so the transmit path stays single-threaded.
 """
 
 from __future__ import annotations
@@ -25,33 +29,40 @@ from .canio import CanInterface
 from .config import Config, ConfigError, load_config
 from .lcddash import LcdDashboard
 from .modecycle import ModeCycleController
+from .reconciler import Reconciler, build_reconciler
 from .safety import SafetyGate
-from .signals import DriveMode
+from .signals import UDS_SOC_REQ_IDS, DriveMode
 from .state import VehicleState
-from .triggers import build_triggers
 
 log = logging.getLogger(__name__)
 
-#: How often to evaluate triggers.
+#: How often to run the reconciler / service the poller.
 LOOP_PERIOD_S = 1.0
 
-#: Wait this long for the bus to come alive before evaluating anything, so a
-#: crash-restart mid-drive reads real state before the on-start trigger fires.
+#: Wait this long for the bus to come alive before reconciling, so a
+#: crash-restart mid-drive reads real state before the first walk.
 BUS_WARMUP_TIMEOUT_S = 10.0
+
+#: Cadence of the periodic trip line to the journal (both armed and disarmed).
+TRIP_LOG_PERIOD_S = 30.0
+
+#: A poll reply older than this is treated as stale by the reconciler (it then
+#: leans on the 0x096 b3 failsafe).
+POLL_STALE_S = 45.0
+
 
 class Daemon:
     def __init__(self, config: Config, *, channel: str = "can0",
-                 dry_run: bool = False, lcd: bool = True,
+                 lcd: bool = True,
                  lcd_port: str = "/dev/serial0", lcd_baud: int = 9600,
                  lcd_backlight: int = 45,
                  control_enabled: bool = True,
                  control_socket_path: str | None = None,
                  config_path: str | None = None,
-                 start_armed: bool = False) -> None:
+                 start_armed: bool = True) -> None:
         self._config = config
         self._config_path = config_path
         self._channel = channel
-        self._dry_run = dry_run
         self._lcd = lcd
         self._lcd_opts = dict(port=lcd_port, baud=lcd_baud,
                               backlight=lcd_backlight)
@@ -63,21 +74,26 @@ class Daemon:
         self._wake = threading.Event()
         self._last_action: str | None = None
 
-        # Runtime transmit enable. Separate from --dry-run (the immutable
-        # session lock): a non-dry-run daemon still boots disarmed and an
-        # operator must `voltdmf-ctl arm` it. --dry-run wins regardless.
-        self._armed = bool(start_armed) and not dry_run
+        # The one transmit lock now that ``--dry-run`` is gone. The daemon
+        # boots armed; ``voltdmf-ctl disarm`` flips this off mid-drive.
+        self._armed = bool(start_armed)
 
-        # A manual `set-mode` sets this; it is informational only (shown in
-        # `status`). The next real trigger edge clears it and reclaims control.
+        # A manual `set-mode` sets this; informational only (shown in
+        # `status`). The reconciler owns the mode and walks a hand-change back.
         self._manual_target: DriveMode | None = None
 
         # Live objects, populated for the duration of run() so control-command
         # handlers and the status snapshot can reach them.
         self._state: VehicleState | None = None
-        self._triggers: list = build_triggers(config)
+        self._reconciler: Reconciler = build_reconciler(
+            config, poll_stale_s=POLL_STALE_S)
         self._gate: SafetyGate | None = None
         self._started = time.monotonic()
+
+        # SOC poller bookkeeping (see _service_soc_poll).
+        self._next_poll_at = 0.0
+        self._poll_req_cursor = 0
+        self._next_trip_log_at = 0.0
 
         self._cmd_queue: "queue.Queue[control.Command]" = queue.Queue()
 
@@ -88,25 +104,24 @@ class Daemon:
     # -- transmit gating --------------------------------------------------
     def _transmit_enabled(self) -> bool:
         """The live predicate the CAN layer consults before every press."""
-        return (not self._dry_run) and self._armed
+        return self._armed
 
     def run(self) -> None:
         state = VehicleState()
         self._state = state
-        self._triggers = build_triggers(self._config)
+        self._reconciler = build_reconciler(self._config, poll_stale_s=POLL_STALE_S)
         self._started = time.monotonic()
+        self._next_poll_at = time.monotonic()
+        self._next_trip_log_at = time.monotonic() + TRIP_LOG_PERIOD_S
 
-        with CanInterface(self._channel, dry_run=self._dry_run,
-                          tx_gate=self._transmit_enabled) as can_if:
+        with CanInterface(self._channel, tx_gate=self._transmit_enabled) as can_if:
             can_if.start_rx(state)
             # Current mode is read straight off the bus: the RX listener
             # decodes 0x1F4 byte 1 (the committed drive mode) into
             # state.drive_mode. It stays None until the first 0x1F4 frame
             # arrives, and ModeCycleController turns that into a
             # ModeUnknownError rather than injecting -- the fail-safe we want
-            # on a bus we cannot observe. This replaces PressCountingModeTracker,
-            # which blindly assumed NORMAL-on-start and drifted if the driver
-            # also touched the physical button.
+            # on a bus we cannot observe.
             controller = ModeCycleController(
                 can_if,
                 lambda: state.drive_mode,
@@ -116,23 +131,24 @@ class Daemon:
             server = self._start_control_server()
             dash = None
             if self._lcd:
-                # --dry-run gates CAN *transmission* only; the watch screen is
-                # a display, so it always drives the real panel. (The dry-run
-                # state still shows on it -- see the "DRY " tag in _lcd_status.)
+                # arm/disarm gates CAN *transmission* only; the watch screen is
+                # a display, so it always drives the real panel. The disarmed
+                # state still shows on it -- see the "OFF " tag in _lcd_status.
                 dash = LcdDashboard(state, self._lcd_status,
                                     channel=self._channel, **self._lcd_opts)
                 dash.start()
 
             try:
                 self._await_bus(state)
-                log.info("%d trigger(s) active; entering loop%s",
-                         len(self._triggers),
-                         self._mode_tag())
+                log.info("reconciler active (setpoint=%s); entering loop%s",
+                         self._reconciler.setpoint.value, self._mode_tag())
 
                 while not self._stop.is_set():
                     self._drain_commands()
                     try:
-                        self._scan_triggers()
+                        self._service_soc_poll(can_if)
+                        self._reconcile()
+                        self._maybe_log_trip()
                     except Exception:  # fail-passive
                         log.exception("loop iteration failed; continuing passively")
                     self._wait_next()
@@ -165,19 +181,82 @@ class Daemon:
         server.start()
         return server
 
-    def _scan_triggers(self) -> None:
-        """One pass over the triggers: the only place a trigger edge reaches
-        the gate. A real edge also clears any manual override."""
+    # -- SOC poll -------------------------------------------------------
+    def _service_soc_poll(self, can_if: CanInterface) -> None:
+        """Emit one ``22 005B`` request when the period is up.
+
+        Runs armed or disarmed (a poll is a read). Before an ECU has
+        answered, cycle 0x7E4 / 0x7E0; once ``state.uds_resp_id`` is set, pin
+        the id that replied (request id = response id - 8).
+        """
+        if not self._config.soc_poll.enabled:
+            return
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return
+        self._next_poll_at = now + self._config.soc_poll.period_seconds
+
+        assert self._state is not None
+        locked = self._state.uds_resp_id
+        if locked is not None:
+            req_id = locked - 8
+        else:
+            req_id = UDS_SOC_REQ_IDS[self._poll_req_cursor % len(UDS_SOC_REQ_IDS)]
+            self._poll_req_cursor += 1
+        try:
+            can_if.send_soc_poll(req_id)
+        except Exception:  # never let a poll TX failure stall the loop
+            log.exception("SOC poll transmit failed")
+
+    # -- reconcile ----------------------------------------------------
+    def _reconcile(self) -> None:
+        """One pass of the level-triggered reconciler: figure out the mode the
+        car should be in and, when armed, ask the gate to walk it there."""
         assert self._state is not None and self._gate is not None
-        for trigger in self._triggers:
-            target = trigger.evaluate(self._state)
-            if target is not None:
-                log.info("%s -> requesting %s", trigger.name, target.value)
-                self._manual_target = None  # a real edge reclaims control
-                self._last_action = (
-                    f"{self._action_prefix()}"
-                    f"{trigger.name[:9]} {target.value.upper()}")
-                self._gate.request(target, self._state)
+        state = self._state
+        desired = self._reconciler.desired_mode(state)
+        if desired == state.drive_mode:
+            return
+
+        floor = "floor" if self._reconciler.floor_latched else "set"
+        self._manual_target = None  # the reconciler owns the mode
+        actual = state.drive_mode.value if state.drive_mode else None
+        if self._armed:
+            self._last_action = (
+                f"{self._action_prefix()}{floor}->{desired.value.upper()}")
+            log.info("reconcile: %s -> %s (%s)", actual, desired.value, floor)
+            self._gate.request(desired, state)
+        else:
+            self._last_action = f"OFF {floor}->{desired.value.upper()}"
+            log.info("reconcile (disarmed): %s -> %s (%s) -- not acting",
+                     actual, desired.value, floor)
+
+    def _maybe_log_trip(self) -> None:
+        now = time.monotonic()
+        if now < self._next_trip_log_at:
+            return
+        self._next_trip_log_at = now + TRIP_LOG_PERIOD_S
+        self._log_trip_line()
+
+    def _log_trip_line(self) -> None:
+        st = self._state
+        if st is None:
+            return
+        age = st.soc_percent_age()
+        soc = ("--" if st.soc_percent is None
+               else f"{st.soc_percent:.1f}%")
+        raw = "--" if st.soc_raw is None else f"0x{st.soc_raw:02X}"
+        resp = "--" if st.uds_resp_id is None else f"0x{st.uds_resp_id:03X}"
+        age_s = "--" if age is None else f"{age:.0f}s"
+        b3 = "--" if st.soc_bar_raw is None else str(st.soc_bar_raw)
+        floor = "latched" if self._reconciler.floor_latched else "off"
+        mode = st.drive_mode.value if st.drive_mode else "?"
+        log.info(
+            "trip: soc=%s (%s @%s, age %s) b3=%s floor=%s setpoint=%s "
+            "mode=%s armed=%s replies=%d nrc=%d",
+            soc, raw, resp, age_s, b3, floor, self._reconciler.setpoint.value,
+            mode, self._armed, st.uds_replies, st.uds_nrcs,
+        )
 
     def _wait_next(self) -> None:
         """Sleep between iterations, but return at once if a command arrives
@@ -203,9 +282,6 @@ class Daemon:
 
     def _handle_command(self, name: str, args: dict) -> dict:
         if name == "arm":
-            if self._dry_run:
-                return {"ok": False,
-                        "error": "session is --dry-run; restart without it to arm"}
             self._armed = True
             log.warning("ARMED via control socket -- transmission enabled")
             return {"ok": True, "armed": True}
@@ -215,6 +291,8 @@ class Daemon:
             return {"ok": True, "armed": False}
         if name == "set-mode":
             return self._cmd_set_mode(args)
+        if name == "setpoint":
+            return self._cmd_setpoint(args)
         if name == "reload":
             return self._cmd_reload()
         return {"ok": False, "error": f"unhandled command {name!r}"}
@@ -227,9 +305,8 @@ class Daemon:
             return {"ok": False, "error": f"unknown mode {raw!r}"}
         force = bool(args.get("force", False))
         if not self._transmit_enabled():
-            why = "dry-run session" if self._dry_run else "daemon disarmed"
             return {"ok": False,
-                    "error": f"{why}; run `voltdmf-ctl arm` first",
+                    "error": "daemon disarmed; run `voltdmf-ctl arm` first",
                     "would_switch_to": mode.value}
         assert self._gate is not None and self._state is not None
         outcome = self._gate.request_verbose(mode, self._state, force=force)
@@ -244,37 +321,68 @@ class Daemon:
                            if self._state.drive_mode else None),
         }
 
+    def _cmd_setpoint(self, args: dict) -> dict:
+        raw = args.get("mode")
+        try:
+            mode = DriveMode(str(raw).lower())
+        except ValueError:
+            return {"ok": False, "error": f"unknown mode {raw!r}"}
+        try:
+            self._reconciler.set_setpoint(mode)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        log.warning("setpoint -> %s via control socket", mode.value)
+        self._last_action = f"SETPOINT {mode.value.upper()}"
+        self._wake.set()  # reconcile on the next tick, not after the full sleep
+        return {"ok": True, "setpoint": self._reconciler.setpoint.value}
+
     def _cmd_reload(self) -> dict:
         if self._config_path is None:
             return {"ok": False,
                     "error": "reload unavailable (daemon started without a config path)"}
         try:
             new_config = load_config(self._config_path)
-            new_triggers = build_triggers(new_config)
+            new_reconciler = build_reconciler(new_config, poll_stale_s=POLL_STALE_S)
         except (OSError, ConfigError) as exc:
             return {"ok": False, "error": f"reload failed: {exc}"}
+        # The setpoint is the driver's live choice -- carry it across the
+        # reload. The SOC-floor latch is in-memory state and is dropped.
+        new_reconciler.set_setpoint(self._reconciler.setpoint)
         self._config = new_config
-        self._triggers = new_triggers  # trigger latches reset -- on-start may re-fire
-        log.info("config reloaded via control socket: %d trigger(s)",
-                 len(new_triggers))
-        return {"ok": True, "triggers": [t.name for t in new_triggers]}
+        self._reconciler = new_reconciler
+        log.info("config reloaded via control socket (setpoint=%s, floor latch cleared)",
+                 new_reconciler.setpoint.value)
+        return {"ok": True, "setpoint": new_reconciler.setpoint.value,
+                "floor_latched": False}
 
     def _status_snapshot(self) -> dict:
         st = self._state
         gate = self._gate
+        rec = self._reconciler
+        age = st.soc_percent_age() if st is not None else None
         return {
             "armed": self._armed,
-            "dry_run": self._dry_run,
             "transmit_enabled": self._transmit_enabled(),
+            "setpoint": rec.setpoint.value,
+            "floor_latched": rec.floor_latched,
+            "reconciler": rec.snapshot(),
             "drive_mode": (st.drive_mode.value
                            if st is not None and st.drive_mode else None),
             "shift": st.shift.value if st is not None else None,
-            "soc_percent": st.soc_percent if st is not None else None,
+            "soc_percent": (round(st.soc_percent, 1)
+                            if st is not None and st.soc_percent is not None
+                            else None),
+            "soc_raw": st.soc_raw if st is not None else None,
+            "soc_bar_raw": st.soc_bar_raw if st is not None else None,
+            "soc_source": st.soc_source if st is not None else None,
+            "soc_age_s": round(age, 1) if age is not None else None,
+            "uds_replies": st.uds_replies if st is not None else None,
+            "uds_nrcs": st.uds_nrcs if st is not None else None,
+            "uds_resp_id": st.uds_resp_id if st is not None else None,
             "speed_mph": st.speed_mph if st is not None else None,
             "bus_active": bool(st is not None and st.bus_active),
             "manual_override": (self._manual_target.value
                                 if self._manual_target else None),
-            "triggers": [t.name for t in self._triggers],
             "cooldown_remaining_s": (round(gate.cooldown_remaining(), 1)
                                      if gate is not None else None),
             "last_action": self._last_action,
@@ -283,28 +391,20 @@ class Daemon:
 
     # -- labels -------------------------------------------------------------
     def _mode_tag(self) -> str:
-        if self._dry_run:
-            return " (dry-run)"
         return "" if self._armed else " (disarmed)"
 
     def _action_prefix(self) -> str:
-        if self._dry_run:
-            return "DRY "
         return "" if self._armed else "OFF "
 
     def _lcd_status(self) -> str:
         """One-line (<=20 char) summary of what the fixer is doing, for the
         watch screen's bottom row."""
-        p = self._action_prefix()
         if self._last_action is not None:
             return self._last_action
-        if self._config.on_start.enabled:
-            return f"{p}arm {self._config.on_start.target_mode.value.upper()} @start"
-        if self._config.soc_threshold.enabled:
-            st = self._config.soc_threshold
-            return (f"{p}arm {st.target_mode.value.upper()} "
-                    f"<{st.threshold_percent:.0f}%")
-        return f"{p}idle (no triggers)"
+        p = self._action_prefix()
+        if self._reconciler.floor_latched:
+            return f"{p}SOC-FLOOR -> HOLD"
+        return f"{p}hold {self._reconciler.setpoint.value.upper()}"
 
     def _await_bus(self, state: VehicleState) -> None:
         deadline = time.monotonic() + BUS_WARMUP_TIMEOUT_S

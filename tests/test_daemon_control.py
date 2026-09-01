@@ -1,5 +1,5 @@
-"""Daemon control-command handling: arm/disarm, manual set-mode, reload, and
-the transmit-enable gate that sits in front of the CAN layer."""
+"""Daemon control-command handling: arm/disarm, manual set-mode, setpoint,
+reload, and the transmit-enable gate that sits in front of the CAN layer."""
 
 import json
 
@@ -15,17 +15,16 @@ from voltdmf.state import VehicleState
 
 def _config(**over):
     raw = {
-        "on_start": {"enabled": True, "target_mode": "mountain"},
-        "soc_threshold": {"enabled": True, "target_mode": "hold",
-                          "threshold_percent": 25, "reset_percent": 40},
-        "trip_mode": {"enabled": False},
+        "policy": {"default_setpoint": "hold", "hold_threshold_percent": 33,
+                   "hold_reset_percent": 41, "bar_failsafe_raw": 9},
+        "soc_poll": {"enabled": True, "period_seconds": 10},
     }
     raw.update(over)
     return parse_config(raw)
 
 
-def _daemon(*, dry_run=False, start_armed=False, config_path=None):
-    return Daemon(_config(), lcd=False, dry_run=dry_run, start_armed=start_armed,
+def _daemon(*, start_armed=True, config_path=None):
+    return Daemon(_config(), lcd=False, start_armed=start_armed,
                   control_enabled=False, config_path=config_path)
 
 
@@ -54,38 +53,25 @@ def _active_state(**kw):
 
 
 # --- arm / disarm --------------------------------------------------------
-def test_boots_disarmed():
-    d = _daemon()
-    assert d._transmit_enabled() is False
+def test_boots_armed():
+    assert _daemon()._transmit_enabled() is True
 
 
-def test_start_armed_flag():
-    assert _daemon(start_armed=True)._transmit_enabled() is True
-
-
-def test_dry_run_overrides_start_armed():
-    assert _daemon(dry_run=True, start_armed=True)._transmit_enabled() is False
+def test_start_disarmed_flag():
+    assert _daemon(start_armed=False)._transmit_enabled() is False
 
 
 def test_arm_then_disarm():
-    d = _daemon()
+    d = _daemon(start_armed=False)
     assert d._handle_command("arm", {}) == {"ok": True, "armed": True}
     assert d._transmit_enabled() is True
     assert d._handle_command("disarm", {}) == {"ok": True, "armed": False}
     assert d._transmit_enabled() is False
 
 
-def test_arm_refused_under_dry_run():
-    d = _daemon(dry_run=True)
-    reply = d._handle_command("arm", {})
-    assert reply["ok"] is False
-    assert "dry-run" in reply["error"]
-    assert d._transmit_enabled() is False
-
-
 # --- set-mode ----------------------------------------------------------
 def test_set_mode_refused_when_disarmed():
-    d = _daemon()
+    d = _daemon(start_armed=False)
     d._state = _active_state()
     reply = d._handle_command("set-mode", {"mode": "hold"})
     assert reply["ok"] is False
@@ -93,7 +79,7 @@ def test_set_mode_refused_when_disarmed():
 
 
 def test_set_mode_unknown_mode():
-    d = _daemon(start_armed=True)
+    d = _daemon()
     d._state = _active_state()
     reply = d._handle_command("set-mode", {"mode": "ludicrous"})
     assert reply["ok"] is False
@@ -101,7 +87,7 @@ def test_set_mode_unknown_mode():
 
 
 def test_set_mode_calls_gate_and_sets_manual_override():
-    d = _daemon(start_armed=True)
+    d = _daemon()
     d._state = _active_state(shift=ShiftPosition.DRIVE)
     d._gate = _FakeGate(RequestOutcome(True, 3, False, "switched toward hold"))
     reply = d._handle_command("set-mode", {"mode": "hold", "force": True})
@@ -112,7 +98,7 @@ def test_set_mode_calls_gate_and_sets_manual_override():
 
 
 def test_set_mode_blocked_outcome_is_not_ok_and_no_override():
-    d = _daemon(start_armed=True)
+    d = _daemon()
     d._state = _active_state()
     d._gate = _FakeGate(RequestOutcome(False, 0, True, "blocked: shift is park"))
     reply = d._handle_command("set-mode", {"mode": "sport"})
@@ -121,40 +107,80 @@ def test_set_mode_blocked_outcome_is_not_ok_and_no_override():
     assert d._manual_target is None
 
 
-def test_trigger_edge_clears_manual_override():
-    d = _daemon(start_armed=True)
-    d._state = _active_state()
+# --- setpoint --------------------------------------------------------
+def test_setpoint_moves_the_reconciler_toggle():
+    d = _daemon()
+    assert d._reconciler.setpoint is DriveMode.HOLD
+    reply = d._handle_command("setpoint", {"mode": "mountain"})
+    assert reply == {"ok": True, "setpoint": "mountain"}
+    assert d._reconciler.setpoint is DriveMode.MOUNTAIN
+
+
+@pytest.mark.parametrize("bad", ["normal", "sport", "ludicrous"])
+def test_setpoint_rejects_non_setpoint_modes(bad):
+    d = _daemon()
+    reply = d._handle_command("setpoint", {"mode": bad})
+    assert reply["ok"] is False
+    assert d._reconciler.setpoint is DriveMode.HOLD
+
+
+# --- reconcile -----------------------------------------------------
+def test_reconcile_acts_when_armed_and_clears_manual_override():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._manual_target = DriveMode.SPORT
-    # on_start trigger fires once on an active bus -> override must clear
-    d._scan_triggers()
+    d._reconcile()
+    # default setpoint is HOLD, car reads NORMAL -> a walk is requested
+    assert d._gate.request_calls == [DriveMode.HOLD]
     assert d._manual_target is None
 
 
+def test_reconcile_is_logging_only_when_disarmed():
+    d = _daemon(start_armed=False)
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []
+
+
+def test_reconcile_noop_when_already_in_desired_mode():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.HOLD)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []
+
+
 # --- reload ----------------------------------------------------------
+_RELOAD_YAML = (
+    "policy:\n  default_setpoint: hold\n  hold_threshold_percent: 20\n"
+    "  hold_reset_percent: 35\n  bar_failsafe_raw: 8\n"
+    "soc_poll:\n  enabled: true\n  period_seconds: 15\n"
+)
+
+
 def test_reload_without_path():
     reply = _daemon()._handle_command("reload", {})
     assert reply["ok"] is False
     assert "reload unavailable" in reply["error"]
 
 
-def test_reload_rereads_file(tmp_path):
+def test_reload_rereads_file_and_keeps_setpoint(tmp_path):
     cfg = tmp_path / "c.yaml"
-    cfg.write_text(
-        "on_start:\n  enabled: false\n  target_mode: normal\n"
-        "soc_threshold:\n  enabled: true\n  target_mode: hold\n"
-        "  threshold_percent: 20\n  reset_percent: 35\n"
-        "trip_mode:\n  enabled: false\n"
-    )
+    cfg.write_text(_RELOAD_YAML)
     d = _daemon(config_path=str(cfg))
+    d._handle_command("setpoint", {"mode": "mountain"})  # driver's live choice
     reply = d._handle_command("reload", {})
     assert reply["ok"] is True
-    assert reply["triggers"] == ["soc_threshold"]
+    assert reply["setpoint"] == "mountain"  # survives the reload
+    assert reply["floor_latched"] is False
+    assert d._config.policy.hold_threshold_percent == 20
 
 
 def test_reload_bad_config_reports_error(tmp_path):
     cfg = tmp_path / "bad.yaml"
-    cfg.write_text("on_start: {enabled: true, target_mode: banana}\n")
+    cfg.write_text("policy: {default_setpoint: banana}\n")
     d = _daemon(config_path=str(cfg))
     reply = d._handle_command("reload", {})
     assert reply["ok"] is False
@@ -163,7 +189,7 @@ def test_reload_bad_config_reports_error(tmp_path):
 
 # --- status snapshot -------------------------------------------------
 def test_status_snapshot_is_json_serialisable():
-    d = _daemon(start_armed=True)
+    d = _daemon()
     d._state = _active_state(soc_percent=42, speed_mph=15,
                              drive_mode=DriveMode.NORMAL,
                              shift=ShiftPosition.DRIVE)
@@ -173,7 +199,9 @@ def test_status_snapshot_is_json_serialisable():
     assert snap["armed"] is True
     assert snap["transmit_enabled"] is True
     assert snap["drive_mode"] == "normal"
-    assert snap["triggers"] == ["on_start", "soc_threshold"]
+    assert snap["setpoint"] == "hold"
+    assert snap["floor_latched"] is False
+    assert "dry_run" not in snap
 
 
 def test_unhandled_command_name():
@@ -183,9 +211,7 @@ def test_unhandled_command_name():
 
 # --- CanInterface transmit gate ------------------------------------
 def test_can_tx_gate_suppresses_when_false():
-    calls = []
     iface = CanInterface.__new__(CanInterface)
-    iface._dry_run = False
     iface._tx_gate = lambda: False
     iface._bus = None
     assert iface._tx_suppressed() is True
@@ -195,14 +221,12 @@ def test_can_tx_gate_suppresses_when_false():
 
 def test_can_tx_gate_allows_when_true():
     iface = CanInterface.__new__(CanInterface)
-    iface._dry_run = False
     iface._tx_gate = lambda: True
     iface._bus = None
     assert iface._tx_suppressed() is False
 
 
-def test_can_dry_run_still_wins_over_tx_gate():
+def test_can_tx_gate_absent_means_enabled():
     iface = CanInterface.__new__(CanInterface)
-    iface._dry_run = True
-    iface._tx_gate = lambda: True
-    assert iface._tx_suppressed() is True
+    iface._tx_gate = None
+    assert iface._tx_suppressed() is False

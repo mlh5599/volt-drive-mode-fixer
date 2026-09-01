@@ -157,7 +157,7 @@ def main() -> None:
     else:
         plan = [_MODE_BY_NAME[args.target]] * max(1, args.repeat)
 
-    with CanInterface(args.channel, dry_run=args.dry_run) as can_if:
+    with CanInterface(args.channel, tx_gate=lambda: not args.dry_run) as can_if:
         if can_if.read_drive_mode(timeout=2.0) is None and not args.dry_run:
             sys.exit("no decodable 0x1F4 seen -- is the car in full READY?")
 
@@ -187,8 +187,8 @@ def main() -> None:
                       "adjust --walk-gap (1.0, 1.5) if the menu times out mid-walk "
                       "or presses merge. Check can0 for error frames.")
 
-    print("\nScan for new DTCs before any driving; keep the daemon in --dry-run "
-          "until the walk reliably reaches every mode.")
+    print("\nScan for new DTCs before any driving; keep the daemon disarmed "
+          "(voltdmf-ctl disarm) until the walk reliably reaches every mode.")
 
 
 if __name__ == "__main__":

@@ -1,19 +1,18 @@
 # Volt Drive Mode Fixer -- example config.
-# Schema and rationale: see DESIGN.md "Trigger strategies".
+# Schema and rationale: see DESIGN.md "Mode policy".
 #
-# Strategies 1 and 2 are meant to run together: Mountain conserves the pack
-# from the start of every drive, and the SOC-threshold trigger is the backstop
-# that engages Hold if the pack still gets low.
+# The daemon boots armed and runs a level-triggered reconciler: it holds the
+# car at `default_setpoint` (the driver flips HOLD <-> MOUNTAIN with the panel
+# button), and the SOC-HOLD floor overrides that to HOLD whenever the pack is
+# low. `voltdmf-ctl disarm` is the mid-drive stop.
 
-on_start:
-  enabled: true
-  target_mode: mountain
+policy:
+  default_setpoint: hold        # hold | mountain -- boot value, not persisted
+  hold_threshold_percent: 33    # floor forces HOLD at/below this diag SOC
+  hold_reset_percent: 41        # floor releases at/above this (hysteresis)
+  bar_failsafe_raw: 9           # 0x096 b3 <= this forces HOLD if the poll is stale
+                                # (~2 gauge bars; Session-9 calibration)
 
-soc_threshold:
-  enabled: true
-  target_mode: hold
-  threshold_percent: 25       # calibrate against dash % -- see DESIGN.md "Open items"
-  reset_percent: 40           # SOC must rise back above this to re-arm
-
-trip_mode:
-  enabled: false              # DR5, roadmap -- not implemented; must stay false
+soc_poll:
+  enabled: true                 # run the 22 005B UDS poll for ground-truth SOC
+  period_seconds: 10            # request cadence

@@ -549,7 +549,7 @@ def main() -> None:
 
     summaries: list[dict] = []
     try:
-        with CanInterface(args.channel, dry_run=False) as can_if:
+        with CanInterface(args.channel) as can_if:
             source = lambda: can_if.read_drive_mode(timeout=2.0)  # noqa: E731
             cursor = lambda: can_if.read_menu_cursor(timeout=0.6)  # noqa: E731
             controller = ModeCycleController(

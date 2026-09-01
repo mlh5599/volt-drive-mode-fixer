@@ -52,16 +52,29 @@ class _CannedServer:
 
 def test_status_ok_prints_summary_and_exits_zero(tmp_path, capsys):
     reply = {"ok": True, "state": {"armed": True, "transmit_enabled": True,
+                                   "setpoint": "mountain", "floor_latched": False,
                                    "drive_mode": "hold", "shift": "drive",
-                                   "soc_percent": 30, "speed_mph": None,
-                                   "bus_active": True, "triggers": ["on_start"],
-                                   "manual_override": None}}
+                                   "soc_percent": 30, "soc_source": "poll",
+                                   "soc_age_s": 4.0, "speed_mph": None,
+                                   "uds_replies": 12, "uds_nrcs": 0,
+                                   "bus_active": True, "manual_override": None}}
     with _CannedServer(tmp_path, reply) as srv:
         rc = ctl.main(["--socket", srv.path, "status"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "ARMED" in out
-    assert "hold" in out
+    assert "mountain" in out  # setpoint line
+    assert "hold" in out      # drive mode
+
+
+def test_status_shows_floor_latch(tmp_path, capsys):
+    reply = {"ok": True, "state": {"armed": True, "transmit_enabled": True,
+                                   "setpoint": "mountain", "floor_latched": True,
+                                   "drive_mode": "hold", "shift": "drive",
+                                   "bus_active": True}}
+    with _CannedServer(tmp_path, reply) as srv:
+        ctl.main(["--socket", srv.path, "status"])
+    assert "floor latched" in capsys.readouterr().out.lower()
 
 
 def test_set_mode_request_shape(tmp_path):
@@ -81,6 +94,20 @@ def test_arm_request_shape(tmp_path):
     with _CannedServer(tmp_path, {"ok": True, "armed": True}) as srv:
         ctl.main(["--socket", srv.path, "arm"])
     assert srv.request == {"cmd": "arm"}
+
+
+def test_setpoint_request_shape_and_output(tmp_path, capsys):
+    with _CannedServer(tmp_path, {"ok": True, "setpoint": "mountain"}) as srv:
+        rc = ctl.main(["--socket", srv.path, "setpoint", "mountain"])
+    assert rc == 0
+    assert srv.request == {"cmd": "setpoint", "mode": "mountain"}
+    assert "setpoint = mountain" in capsys.readouterr().out
+
+
+def test_setpoint_rejects_non_setpoint_mode_at_argparse(tmp_path):
+    with pytest.raises(SystemExit) as ei:
+        ctl.main(["--socket", str(tmp_path / "x"), "setpoint", "normal"])
+    assert ei.value.code == 2
 
 
 def test_ok_false_reply_exits_one(tmp_path, capsys):

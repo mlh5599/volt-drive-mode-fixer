@@ -7,6 +7,7 @@ RX backlog -- ``recv()`` hands back the oldest queued frame first, and the
 socket buffers 0x1F4 at ~40 Hz while ``send_mode_button_press`` runs.
 """
 
+from voltdmf import signals
 from voltdmf.canio import MODE_STATUS_ADDR, CanInterface, _DecodeListener
 from voltdmf.signals import DriveMode, ShiftPosition
 from voltdmf.state import VehicleState
@@ -112,5 +113,74 @@ def test_decode_listener_ignores_non_signal_frames():
     state = VehicleState()
     listener = _DecodeListener(state)
     listener.on_message_received(_Frame(0x1E1, bytes(7)))
+    listener.on_message_received(_Frame(0x206, bytes(8)))  # not on this bus
     assert state.drive_mode is None
     assert state.shift is ShiftPosition.UNKNOWN
+    assert state.soc_percent is None
+
+
+# -- _DecodeListener: SOC poll reply (0x7E8..0x7EF) --------------------
+def test_decode_listener_folds_in_a_uds_soc_reply():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    # 7E8#04 62 005B 54 ...  -> raw 0x54 == 32.9 %
+    listener.on_message_received(
+        _Frame(0x7E8, bytes((0x04, 0x62, 0x00, 0x5B, 0x54, 0, 0, 0))))
+    assert state.soc_raw == 0x54
+    assert state.soc_percent == signals.uds_soc_percent(0x54)
+    assert state.soc_source == "poll"
+    assert state.uds_resp_id == 0x7E8
+    assert state.uds_replies == 1
+    assert state.soc_percent_monotonic is not None
+
+
+def test_decode_listener_counts_a_negative_response():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(
+        _Frame(0x7E8, bytes((0x03, 0x7F, 0x22, 0x31, 0, 0, 0, 0))))
+    assert state.uds_nrcs == 1
+    assert state.soc_percent is None
+
+
+# -- _DecodeListener: 0x096 byte 3 coarse proxy ---------------------
+def test_decode_listener_reads_the_soc_bar_proxy():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(
+        _Frame(0x096, bytes((0x00, 0xF0, 0x0A, 0x09, 0, 0, 0, 0))))
+    assert state.soc_bar_raw == 9
+    # a non-mux 0x096 frame must not clobber it
+    listener.on_message_received(
+        _Frame(0x096, bytes((0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0))))
+    assert state.soc_bar_raw == 9
+
+
+# -- send_soc_poll: the second (ungated) transmit path -----------------
+class _SendBus:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, msg, timeout=None):
+        self.sent.append(msg)
+
+
+def test_send_soc_poll_emits_the_fixed_request_frame():
+    iface = CanInterface.__new__(CanInterface)
+    iface._bus = bus = _SendBus()
+    iface._tx_gate = lambda: True
+    iface.send_soc_poll(0x7E0)
+    assert len(bus.sent) == 1
+    msg = bus.sent[0]
+    assert msg.arbitration_id == 0x7E0
+    assert bytes(msg.data) == bytes.fromhex("0322005B55555555")
+    assert msg.is_extended_id is False
+
+
+def test_send_soc_poll_runs_even_while_disarmed():
+    iface = CanInterface.__new__(CanInterface)
+    iface._bus = bus = _SendBus()
+    iface._tx_gate = lambda: False  # disarmed
+    iface.send_soc_poll(0x7E4)
+    assert len(bus.sent) == 1
+    assert bus.sent[0].arbitration_id == 0x7E4

@@ -7,6 +7,7 @@ surface over an ``AF_UNIX`` stream socket:
 
     voltdmf-ctl status
     voltdmf-ctl set-mode hold
+    voltdmf-ctl setpoint hold | mountain
     voltdmf-ctl arm | disarm | reload
 
 The privilege boundary is the socket's file mode: ``0660 root:voltdmf`` (set by
@@ -21,9 +22,9 @@ gets one newline-terminated JSON reply, then the server closes. Requests are
 **Threading.** ``ControlServer`` runs an accept loop on a daemon thread. Reads
 (``status``) are answered straight from a caller-supplied snapshot callback.
 Anything that can transmit or mutate daemon state (``set-mode``/``arm``/
-``disarm``/``reload``) is pushed onto a :class:`queue.Queue` and executed by the
-daemon's single main-loop thread -- the CAN transmit path and :class:`SafetyGate`
-stay strictly single-threaded, exactly as when triggers were the only caller.
+``disarm``/``setpoint``/``reload``) is pushed onto a :class:`queue.Queue` and
+executed by the daemon's single main-loop thread -- the CAN transmit path and :class:`SafetyGate`
+stay strictly single-threaded, exactly as when the reconciler was the only caller.
 
 **systemd socket activation.** When started by systemd the listening socket is
 passed as fd 3 with ``$LISTEN_FDS`` / ``$LISTEN_PID`` set;
@@ -53,7 +54,7 @@ SD_LISTEN_FDS_START = 3
 DEFAULT_SOCKET_PATH = "/run/voltdmf/control.sock"
 
 #: Commands that mutate state / can transmit -- routed through the daemon loop.
-_QUEUED_COMMANDS = frozenset({"set-mode", "arm", "disarm", "reload"})
+_QUEUED_COMMANDS = frozenset({"set-mode", "setpoint", "arm", "disarm", "reload"})
 
 _ACCEPT_TIMEOUT_S = 0.5      # so stop() is responsive
 _RECV_TIMEOUT_S = 5.0        # a client that opens and stalls must not wedge us

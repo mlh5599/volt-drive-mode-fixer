@@ -1,9 +1,15 @@
-"""SocketCAN I/O: the RX decode loop and the *single* transmit path.
+"""SocketCAN I/O: the RX decode loop and the transmit paths.
 
-There is exactly one function in this whole project that puts a frame on the
-bus -- :meth:`CanInterface.send_mode_button_press`. It hard-codes the one
-address and payload the project needs. There is no "send arbitrary frame"
-path anywhere (DESIGN.md "Safety model").
+Exactly two functions in this whole project put a frame on the bus, each
+hard-coding its one address and payload:
+
+* :meth:`CanInterface.send_mode_button_press` -- the drive-mode button tap on
+  0x1E1. Gated: only transmits while the daemon is armed.
+* :meth:`CanInterface.send_soc_poll` -- one ``22 005B`` UDS request. Ungated:
+  it is a read, runs armed or disarmed, and every drive wants ground-truth
+  SOC.
+
+There is no "send arbitrary frame" path anywhere (DESIGN.md "Safety model").
 """
 
 from __future__ import annotations
@@ -66,8 +72,9 @@ log = logging.getLogger(__name__)
 # from an idle menu only lights it up). Both are the caller's problem
 # (ModeCycleController / tools/inject_test.py), not this function's.
 #
-# INJECTION EFFICACY IS NOT YET CONFIRMED -- tools/inject_test.py (Phase C.5)
-# is the gate. Until it passes, the daemon must stay in --dry-run.
+# Injection efficacy is on-road-confirmed: the tracking-echo press drove a
+# closed-loop walk to all four modes (2026-08-29, see the 0x1E1 note in
+# signals.py). tools/inject_test.py remains the bench harness for the TX path.
 MODE_STATUS_ADDR = 0x1F4
 MODE_BUTTON_ADDR = 0x1E1
 PRESS_BYTE4 = 0x80               # 0x1E1 byte 4 bit 7 = button pressed
@@ -96,26 +103,25 @@ class CanInterface:
         self,
         channel: str = "can0",
         *,
-        dry_run: bool = False,
         tx_gate: Callable[[], bool] | None = None,
     ) -> None:
         self._channel = channel
-        self._dry_run = dry_run
-        # Runtime transmit enable, checked live on every press. ``--dry-run`` is
-        # the immutable session lock; this is the toggle the control socket's
-        # arm/disarm flips. When it returns False we take the same no-op path as
-        # dry-run (log the intended press, transmit nothing).
+        # Runtime transmit enable, checked live on every button press. This is
+        # the toggle the control socket's arm/disarm flips -- the project's one
+        # and only TX lock now (``--dry-run`` is gone). When it returns False
+        # ``send_mode_button_press`` logs the intended press and transmits
+        # nothing. ``send_soc_poll`` ignores this -- a poll is a read.
         self._tx_gate = tx_gate
         self._bus: can.BusABC | None = None
         self._notifier: can.Notifier | None = None
 
     def _tx_suppressed(self) -> bool:
-        return self._dry_run or (self._tx_gate is not None and not self._tx_gate())
+        return self._tx_gate is not None and not self._tx_gate()
 
     # -- lifecycle --------------------------------------------------------
     def open(self) -> None:
         self._bus = can.Bus(interface="socketcan", channel=self._channel)
-        log.info("opened %s (dry_run=%s)", self._channel, self._dry_run)
+        log.info("opened %s", self._channel)
 
     def start_rx(self, state: VehicleState) -> None:
         if self._bus is None:
@@ -214,10 +220,9 @@ class CanInterface:
         comment. The car commits the new mode ~2-3 s later.
         """
         if self._tx_suppressed():
-            why = "dry-run" if self._dry_run else "disarmed"
-            log.info("[%s] would inject 0x1E1 press: track module + "
+            log.info("[disarmed] would inject 0x1E1 press: track module + "
                      "byte4|=0x%02x x%d, then stop TX for >=%.2fs",
-                     why, PRESS_BYTE4, PRESS_TRACK_FRAMES, RELEASE_GAP_S)
+                     PRESS_BYTE4, PRESS_TRACK_FRAMES, RELEASE_GAP_S)
             return
         if self._bus is None:
             raise RuntimeError("open() first")
@@ -256,13 +261,33 @@ class CanInterface:
                       sent, PRESS_TRACK_FRAMES)
         # No explicit release frame -- the module's own bit-7-clear stream is it.
 
+    def send_soc_poll(self, req_id: int) -> None:
+        """Transmit ONE ``22 005B`` UDS request -- the only other frame this
+        project puts on the bus.
+
+        A fixed 8-byte ISO-TP single frame (``03 22 00 5B 55 55 55 55``) to
+        ``req_id``. The caller cycles 0x7E4 / 0x7E0 until an ECU answers, then
+        pins the id that did. Runs regardless of arm state -- a poll is a read,
+        and every drive wants ground-truth SOC. Stays in the default
+        diagnostic session, service 0x22 only (no session control, no
+        TesterPresent), so it never suppresses the normal broadcasts.
+        """
+        if self._bus is None:
+            raise RuntimeError("open() first")
+        frame = can.Message(arbitration_id=req_id,
+                            data=signals.uds_soc_request_payload(),
+                            is_extended_id=False)
+        try:
+            self._bus.send(frame, timeout=_TX_SEND_TIMEOUT_S)
+        except can.CanError as exc:
+            log.warning("SOC poll: TX failed for 0x%03X (%s)", req_id, exc)
+
 
 class _DecodeListener(can.Listener):
     """Decodes the handful of known frames into the shared VehicleState."""
 
     def __init__(self, state: VehicleState) -> None:
         self._state = state
-        self._soc_addr = SIGNAL_IDS["soc"].addr
         self._speed_addr = SIGNAL_IDS["speed"].addr
         self._shift_addr = SIGNAL_IDS["shift"].addr  # 0x1F5 (0x135 not decoded)
         self._status_addr = MODE_STATUS_ADDR  # 0x1F4 byte 1 = committed mode
@@ -272,11 +297,12 @@ class _DecodeListener(can.Listener):
         if not signals.is_signal_frame(addr):
             return
         data = bytes(msg.data)
-        if addr == self._soc_addr:
-            raw = signals.decode_soc_raw(data)
+        if addr == signals.SOC_BAR_ADDR:  # 0x096 -- coarse passive SOC proxy
+            raw = signals.decode_soc_bar_raw(data)
             if raw is not None:
-                self._state.soc_raw = raw
-                self._state.soc_percent = signals.soc_percent_from_raw(raw)
+                self._state.soc_bar_raw = raw
+        elif signals.UDS_RESP_ID_LO <= addr <= signals.UDS_RESP_ID_HI:
+            self._ingest_uds_soc(addr, data)
         elif addr == self._speed_addr:
             mph = signals.decode_speed_mph(data)
             if mph is not None:
@@ -290,3 +316,16 @@ class _DecodeListener(can.Listener):
         # 0x135 is a known signal frame (keeps mark_signal_seen fresh) but its
         # shifter encoding is messier than 0x1F5 -- not decoded.
         self._state.mark_signal_seen()
+
+    def _ingest_uds_soc(self, addr: int, data: bytes) -> None:
+        """Fold a 0x7E8..0x7EF frame (our ``22 005B`` poll reply) into state."""
+        kind, raw = signals.decode_uds_soc(data)
+        if kind == "ok" and raw is not None:
+            self._state.soc_raw = raw
+            self._state.soc_percent = signals.uds_soc_percent(raw)
+            self._state.soc_percent_monotonic = time.monotonic()
+            self._state.soc_source = "poll"
+            self._state.uds_resp_id = addr
+            self._state.uds_replies += 1
+        elif kind == "nrc":
+            self._state.uds_nrcs += 1
