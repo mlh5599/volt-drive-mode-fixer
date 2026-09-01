@@ -8,9 +8,10 @@ exact pack percent (`raw·100/255`) and the gauge↔SOC curve is near-linear
 (`SOC% ≈ 7.07·bars + 19.6`, r = 0.999), so the level-triggered reconciler in
 "Mode policy" — with the SOC-HOLD floor keyed off that poll and `0x096`
 byte 3 as a coarse failsafe — is now **implemented**. `--dry-run` is gone:
-the daemon boots **armed** and `voltdmf-ctl disarm` is the mid-drive stop.
-The out-of-repo `roles/voltdmf` still needs its ExecStart / `config.yaml`
-migrated to match. Progress and per-drive procedures live in
+the daemon boots **armed** but passive (`default_setpoint: auto` → no target
+until a driver selection or the SOC floor), and `voltdmf-ctl disarm` is the
+mid-drive stop. The out-of-repo `roles/voltdmf` still needs its ExecStart /
+`config.yaml` migrated to match. Progress and per-drive procedures live in
 `docs/phase-c-field-checklist.md`; the on-vehicle narrative in
 `docs/field-session-log.md`.
 
@@ -84,20 +85,31 @@ per mode. See "Mode policy" and "Software architecture" below.
 > without separate configurable triggers.
 
 **Desired mode = f(setpoint, SOC).** One loop pass computes the mode the car
-*should* be in; the result is always concrete (never "none"). If
-`state.drive_mode` (read from `0x1F4` byte 1) differs and the daemon is armed,
-it asks the safety gate to walk the menu there — so a hand-picked mode change
-gets walked back, at most once per 60 s cooldown.
+*should* be in. The result is concrete (HOLD / MOUNTAIN) **or `None`** — `None`
+means "no target, leave the car alone", which is what the passive `auto`
+setpoint yields above the floor. If a concrete desired mode differs from
+`state.drive_mode` (read from `0x1F4` byte 1) and the daemon is armed, it asks
+the safety gate to walk the menu there — so a hand-picked mode change gets
+walked back, at most once per 60 s cooldown. The reconcile is also skipped
+entirely until `0x1F4` decodes a current mode (a fresh boot on a quiet or
+just-woken bus does nothing until it can see where the menu cursor is).
 
 | | SOC above `hold_reset_percent` | SOC at/below `hold_threshold_percent` |
 | --- | --- | --- |
-| **setpoint = HOLD** (default) | desired = **HOLD** — enforce it | desired = **HOLD** |
-| **setpoint = MOUNTAIN** | desired = **MOUNTAIN** | desired = **HOLD** (floor wins) |
+| **setpoint = `auto`** (default) | desired = **None** — leave the car alone | desired = **HOLD** (floor wins) |
+| **setpoint = HOLD** (driver-selected) | desired = **HOLD** — enforce it | desired = **HOLD** |
+| **setpoint = MOUNTAIN** (driver-selected) | desired = **MOUNTAIN** | desired = **HOLD** (floor wins) |
 
-- **Armed = enforce the setpoint.** Above the floor the daemon actively holds
-  the car in the setpoint mode; it does not "leave the car alone". Flip the
-  panel button to HOLD (or `voltdmf-ctl disarm`) to stop it asserting
-  MOUNTAIN.
+- **Passive by default.** The shipped config boots at `default_setpoint: auto`
+  — the daemon is armed but has no target, so a mid-drive restart on a healthy
+  pack leaves the car exactly where the driver had it. Enforcement starts only
+  when the driver picks HOLD or MOUNTAIN (panel SW1 / `voltdmf-ctl setpoint`),
+  or the SOC-HOLD floor engages.
+- **Armed = enforce a *selected* setpoint.** Once HOLD or MOUNTAIN is
+  selected, above the floor the daemon actively holds the car in that mode; it
+  does not "leave the car alone". Flip the panel button (or `voltdmf-ctl
+  disarm`) to stop it asserting MOUNTAIN. There is no way back to `auto` at
+  runtime — only a restart returns to the passive default.
 - **The SOC-HOLD floor is always active** and always wins. There is no
   "off" / suspend — the whole point of the device is that the pack never
   sags, so the worst case is always "hold at the current SOC".
@@ -116,11 +128,12 @@ gets walked back, at most once per 60 s cooldown.
   while 2 bars still show. Session 9 pinned the numbers: `SOC% ≈
   7.07·bars + 19.6` (r = 0.999); the 3→2 bar drop is **33.7 %** (raw 0x56),
   the 4→3 bar mark **41.2 %** (raw 0x69) — hence 33 / 41.
-- **Setpoint** is a two-state toggle, **HOLD ⇄ MOUNTAIN**, changed by one
-  panel button (see "Runtime control" / "Hardware design"). It is *not*
-  persisted — the Pi runs a read-only root with an overlay filesystem, so
-  there is nothing to write to, and **every boot starts in HOLD**. A fresh
-  key cycle is a fresh drive; re-selecting MOUNTAIN each time is acceptable.
+- **Setpoint** is `auto` at boot, then a two-state toggle, **HOLD ⇄
+  MOUNTAIN**, changed by one panel button (see "Runtime control" / "Hardware
+  design"). It is *not* persisted — the Pi runs a read-only root with an
+  overlay filesystem, so there is nothing to write to, and **every boot
+  starts at `auto`** (no target). A fresh key cycle is a fresh drive;
+  re-selecting HOLD or MOUNTAIN each time is acceptable.
 - **Reconcile cadence vs. the driver.** The reconcile runs every loop but
   every switch still goes through `SafetyGate` (preconditions + the 60 s
   cooldown), so if the driver fights the setpoint the daemon re-asserts at
@@ -143,7 +156,8 @@ Config (`config.example.yaml`; parsed by `voltdmf/config.py`):
 
 ```yaml
 policy:
-  default_setpoint: hold        # hold | mountain — boot value, not persisted
+  default_setpoint: auto        # auto | hold | mountain — boot value, not persisted
+                                # (auto = no target until a driver selection or the floor)
   hold_threshold_percent: 33    # floor forces HOLD at/below this diag SOC
   hold_reset_percent: 41        # floor releases at/above this (hysteresis)
   bar_failsafe_raw: 9           # 0x096 b3 <= this forces HOLD if the poll is stale
@@ -154,8 +168,8 @@ soc_poll:
 ```
 
 `parse_config` validates `hold_reset_percent > hold_threshold_percent`,
-`default_setpoint ∈ {hold, mountain}`, `0 ≤ bar_failsafe_raw ≤ 255`, and
-`period_seconds > 0`. The button GPIO pins live in the `button_helper.py`
+`default_setpoint ∈ {auto, hold, mountain}` (`auto` parses to `None`),
+`0 ≤ bar_failsafe_raw ≤ 255`, and `period_seconds > 0`. The button GPIO pins live in the `button_helper.py`
 unit, not here.
 
 ## Prior art (reuse this, don't rebuild it)
@@ -370,8 +384,9 @@ this project needs. Tighten that:
   transmitting — never get stuck mid-loop retrying a send. Run it under a
   process supervisor (e.g. `systemd` with restart-on-failure). The daemon
   keeps **no persisted state** (read-only overlay root): a fresh start boots
-  armed at `default_setpoint` with the floor latch clear and re-derives
-  everything from the live bus, so there is no stale latch to re-fire.
+  armed at `default_setpoint` (`auto` on the shipped config → no target) with
+  the floor latch clear and re-derives everything from the live bus, so there
+  is no stale latch to re-fire and — absent a low pack — nothing to walk.
 - **Physical kill switch**: unplugging the OBD connector fully removes the
   device from the bus — keep it physically easy to reach for exactly this
   reason during early testing.
@@ -398,7 +413,7 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | --- | --- | --- |
 | `status` | daemon + vehicle snapshot | answered read-only on the socket thread |
 | `arm` / `disarm` | flip the runtime transmit-enable | queued → loop thread |
-| `setpoint <hold\|mountain>` | move the reconciler setpoint (the panel button is a `setpoint` caller) | queued → loop thread |
+| `setpoint <hold\|mountain>` | select the reconciler setpoint — first selection also leaves `auto` (the panel button is a `setpoint` caller) | queued → loop thread |
 | `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
 | `reload` | re-read the config file, rebuild the policy | queued → loop thread |
 
@@ -419,18 +434,20 @@ invocations. State changes come in over an `AF_UNIX` stream socket
   `queue.Queue` and executed by the daemon's one loop thread — the CAN TX
   path and `SafetyGate` are never touched from the socket thread.
 - **One gate: armed / disarmed.** There is no `--dry-run`. The service boots
-  **armed** and immediately enforces the setpoint — injection efficacy is
-  on-road-confirmed, so there is no reason to hold it back a key cycle at a
-  time. `voltdmf-ctl disarm` is the mid-drive stop; `voltdmf-ctl arm` undoes
-  it. While disarmed the reconciler still runs and logs what it *would* do,
-  and the `22 005B` SOC poll still transmits (it is a read-only diagnostic
-  request, not a mode change). `--start-disarmed` boots into the stopped
-  state for bench work.
-- **`setpoint` is the normal control.** It moves the reconciler's HOLD ⇄
-  MOUNTAIN toggle; the reconciler then drives the car toward the desired mode
-  and holds it there, self-healing if the driver bumps the stalk. The setpoint
-  lives in memory only — every boot starts at `hold` (no persisted state; see
-  "Mode policy").
+  **armed** — injection efficacy is on-road-confirmed, so there is no reason
+  to hold it back a key cycle at a time — but with `default_setpoint: auto` it
+  has no target and enforces nothing until the driver selects HOLD/MOUNTAIN or
+  the SOC floor engages (see "Mode policy"). `voltdmf-ctl disarm` is the
+  mid-drive stop; `voltdmf-ctl arm` undoes it. While disarmed the reconciler
+  still runs and logs what it *would* do, and the `22 005B` SOC poll still
+  transmits (it is a read-only diagnostic request, not a mode change).
+  `--start-disarmed` boots into the stopped state for bench work.
+- **`setpoint` is the normal control.** It selects the reconciler's HOLD ⇄
+  MOUNTAIN toggle (the first selection also leaves the passive `auto` state);
+  the reconciler then drives the car toward the desired mode and holds it
+  there, self-healing if the driver bumps the stalk. The setpoint lives in
+  memory only — every boot starts at `auto` (no persisted state; see "Mode
+  policy").
 - **`set-mode` is a soft, out-of-band nudge.** It asks the mode-cycle
   controller for one switch now without moving the setpoint, so the reconciler
   will pull the mode back on its next pass (after the cooldown). Use it for

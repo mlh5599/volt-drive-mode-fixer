@@ -39,9 +39,41 @@ def test_reset_must_exceed_threshold():
         _rec(hold_threshold_percent=40, hold_reset_percent=40)
 
 
-def test_default_setpoint_must_be_hold_or_mountain():
+def test_default_setpoint_must_be_hold_mountain_or_none():
     with pytest.raises(ValueError):
         _rec(default_setpoint=DriveMode.NORMAL)
+    with pytest.raises(ValueError):
+        _rec(default_setpoint=DriveMode.SPORT)
+
+
+# -- passive (auto) default -------------------------------------------
+
+def test_passive_default_has_no_target_on_a_healthy_pack():
+    rec = _rec(default_setpoint=None)
+    assert rec.setpoint is None
+    assert rec.setpoint_label == "auto"
+    assert rec.desired_mode(_state(pct=80)) is None
+    assert rec.snapshot()["setpoint"] == "auto"
+
+
+def test_passive_default_still_yields_to_the_soc_floor():
+    rec = _rec(default_setpoint=None)
+    assert rec.desired_mode(_state(pct=30)) is DriveMode.HOLD
+    assert rec.floor_latched is True
+    # floor releases -> back to no target, not to HOLD
+    assert rec.desired_mode(_state(pct=45)) is None
+
+
+def test_passive_default_falls_back_to_bar_failsafe_when_poll_stale():
+    rec = _rec(default_setpoint=None)
+    assert rec.desired_mode(_state(bar=9)) is DriveMode.HOLD
+
+
+def test_driver_selection_activates_enforcement_from_passive():
+    rec = _rec(default_setpoint=None)
+    assert rec.desired_mode(_state(pct=80)) is None
+    rec.set_setpoint(DriveMode.MOUNTAIN)
+    assert rec.desired_mode(_state(pct=80)) is DriveMode.MOUNTAIN
 
 
 def test_build_from_config():
@@ -53,6 +85,17 @@ def test_build_from_config():
     rec = build_reconciler(cfg)
     assert rec.setpoint is DriveMode.MOUNTAIN
     assert rec.desired_mode(_state(pct=50)) is DriveMode.MOUNTAIN
+
+
+def test_build_from_config_auto():
+    cfg = parse_config({
+        "policy": {"default_setpoint": "auto", "hold_threshold_percent": 33,
+                   "hold_reset_percent": 41, "bar_failsafe_raw": 9},
+        "soc_poll": {"enabled": True, "period_seconds": 10},
+    })
+    rec = build_reconciler(cfg)
+    assert rec.setpoint is None
+    assert rec.desired_mode(_state(pct=50)) is None
 
 
 # -- setpoint toggle ---------------------------------------------------

@@ -152,6 +152,26 @@ def test_reconcile_noop_when_already_in_desired_mode():
     assert d._gate.request_calls == []
 
 
+def test_reconcile_noop_with_passive_default_on_a_healthy_pack():
+    cfg = _config(policy={"default_setpoint": "auto", "hold_threshold_percent": 33,
+                          "hold_reset_percent": 41, "bar_failsafe_raw": 9})
+    d = Daemon(cfg, lcd=False, control_enabled=False)
+    assert d._reconciler.setpoint is None
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.NORMAL, soc_percent=80)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []          # auto + healthy -> no target
+
+
+def test_reconcile_waits_for_a_decodable_current_mode():
+    d = _daemon()  # default_setpoint hold
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=None)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []          # no 0x1F4 yet -> don't walk
+
+
 # --- reload ----------------------------------------------------------
 _RELOAD_YAML = (
     "policy:\n  default_setpoint: hold\n  hold_threshold_percent: 20\n"

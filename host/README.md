@@ -13,8 +13,9 @@ Pi 3B. They are checked in so the box is reproducible.
 > user with `AmbientCapabilities=CAP_NET_RAW` instead of as root. Gate the
 > whole thing behind a per-host enable flag, and **never let the automation
 > reboot the device** — if applying the overlay needs a reboot, stop and let
-> a human do it while the vehicle is parked. The daemon boots armed; put
-> `--start-disarmed` in `ExecStart` for a host that should come up stopped.
+> a human do it while the vehicle is parked. The daemon boots armed but
+> passive (`default_setpoint: auto`); put `--start-disarmed` in `ExecStart`
+> for a host that should come up fully stopped.
 
 ## Phase A -- bring up `can0`
 
@@ -83,15 +84,18 @@ must be in the `voltdmf` group, see above). No `sudo`:
 voltdmf-ctl status                 # daemon + vehicle snapshot
 voltdmf-ctl disarm                 # mid-drive stop: stop transmitting, keep reading/evaluating
 voltdmf-ctl arm                    # resume transmission
-voltdmf-ctl setpoint mountain      # move the reconciler setpoint (HOLD <-> MOUNTAIN)
+voltdmf-ctl setpoint mountain      # select the reconciler setpoint (leaves 'auto'; HOLD <-> MOUNTAIN)
 voltdmf-ctl set-mode hold          # request one switch now, out of band (safety gate still applies)
 voltdmf-ctl reload                 # re-read /etc/voltdmf/config.yaml
 ```
 
-The daemon **boots armed** and enforces the setpoint immediately; there is no
-`--dry-run`. `voltdmf-ctl disarm` is the mid-drive stop, `systemctl restart
-voltdmf` re-arms. Start the service with `--start-disarmed` for a host that
-should come up stopped. `voltdmf.socket` is socket-activated: `voltdmf-ctl`
+The daemon **boots armed** but passive: the shipped `config.yaml` sets
+`default_setpoint: auto`, so it enforces nothing until the driver selects
+HOLD/MOUNTAIN (panel SW1 / `voltdmf-ctl setpoint`) or the SOC-HOLD floor
+engages — a mid-drive `systemctl restart` on a healthy pack leaves the car
+where it is. There is no `--dry-run`. `voltdmf-ctl disarm` is the mid-drive
+stop, `voltdmf-ctl arm` (or `systemctl restart voltdmf`) resumes. Start the
+service with `--start-disarmed` for a host that should come up stopped. `voltdmf.socket` is socket-activated: `voltdmf-ctl`
 works even if the service is momentarily down (the command queues briefly).
 
 For bench work without the units, run the daemon with an explicit path:

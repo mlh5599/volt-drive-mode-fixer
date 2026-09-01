@@ -32,6 +32,12 @@ def test_default_setpoint_mountain_is_ok():
     assert parse_config(raw).policy.default_setpoint is DriveMode.MOUNTAIN
 
 
+def test_default_setpoint_auto_parses_to_none():
+    raw = _valid()
+    raw["policy"]["default_setpoint"] = "auto"
+    assert parse_config(raw).policy.default_setpoint is None
+
+
 def test_reset_must_exceed_threshold():
     raw = _valid()
     raw["policy"]["hold_reset_percent"] = 33
@@ -91,7 +97,7 @@ def test_load_the_example_config():
 
     example = pathlib.Path(__file__).parent.parent / "config.example.yaml"
     cfg = load_config(example)
-    assert cfg.policy.default_setpoint in (DriveMode.HOLD, DriveMode.MOUNTAIN)
+    assert cfg.policy.default_setpoint in (None, DriveMode.HOLD, DriveMode.MOUNTAIN)
     assert cfg.policy.hold_reset_percent > cfg.policy.hold_threshold_percent
     assert cfg.soc_poll.enabled is True
 

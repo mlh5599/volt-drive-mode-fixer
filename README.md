@@ -10,9 +10,10 @@ desired mode:
 - **SOC-HOLD floor** — always active. When SOC falls to a configurable
   percentage (target: ~2 gauge bars) the reconciler holds the car in Hold
   Mode until the pack recovers. This floor always wins.
-- **Setpoint** — a panel button toggles the reconciler between **HOLD**
-  (leave the car alone above the floor) and **MOUNTAIN** (hold Mountain Mode
-  above the floor). Not persisted; every boot starts in HOLD.
+- **Setpoint** — `auto` at boot (no target; the daemon leaves the car alone
+  above the floor). A panel button then selects **HOLD** or **MOUNTAIN**,
+  which the reconciler enforces above the floor. Not persisted; every boot
+  starts back at `auto`.
 - *(Roadmap)* **Trip Mode** — a speed-based setpoint that banks EV range on
   the highway, based on
   [vix597/chevy-volt-trip-mode](https://github.com/vix597/chevy-volt-trip-mode).
@@ -31,10 +32,12 @@ status signal (`0x1F4` byte 1, the daemon's mode source), and shift/PRNDL
 (`0x1F5` byte 3); the closed-loop menu walk has an on-road PASS. Session 9
 resolved SOC — the `22 005B` UDS poll gives exact pack percent and the
 gauge↔SOC curve is near-linear — so the reconciler and its SOC-HOLD floor are
-now **implemented**. `--dry-run` is gone: the daemon boots **armed** and
-`voltdmf-ctl disarm` is the mid-drive stop. Still to do: migrate the
-out-of-repo `roles/voltdmf` ExecStart / `config.yaml`, then validate the
-33 % floor timing over several drives. Progress and next steps:
+now **implemented**. `--dry-run` is gone: the daemon boots **armed** but
+passive (`default_setpoint: auto` — no target until the driver picks a
+setpoint or the SOC floor engages), and `voltdmf-ctl disarm` is the mid-drive
+stop. Still to do: migrate the out-of-repo `roles/voltdmf` ExecStart /
+`config.yaml`, then validate the 33 % floor timing over several drives.
+Progress and next steps:
 [`docs/phase-c-field-checklist.md`](docs/phase-c-field-checklist.md) and
 [`docs/field-session-log.md`](docs/field-session-log.md).
 
@@ -62,7 +65,9 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 `--start-disarmed` boots with transmission suppressed (the reconciler still
 runs and logs what it *would* do, and the `22 005B` SOC poll still transmits)
-— the safe mode for bench work. Normally the daemon boots **armed**.
+— the safe mode for bench work. Normally the daemon boots **armed** but
+passive: with `default_setpoint: auto` it has no target and walks the car
+nowhere until the driver selects HOLD/MOUNTAIN or the SOC-HOLD floor engages.
 
 The daemon runs permanently as root under systemd; change modes and daemon
 state from an unprivileged account with `voltdmf-ctl` (`status` / `arm` /

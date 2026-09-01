@@ -8,9 +8,11 @@ the daemon stays passive rather than dying or retrying mid-burst (DESIGN.md
 "Safety model"). The one other thing the loop transmits is the ``22 005B``
 SOC poll -- a read, sent armed or disarmed.
 
-The daemon runs permanently under systemd as root. It **boots armed** and
-immediately reconciles the car to the setpoint; ``voltdmf-ctl disarm`` is the
-mid-drive stop. Operators steer it from an unprivileged account through the
+The daemon runs permanently under systemd as root. It **boots armed**, but the
+shipped config's ``default_setpoint: auto`` means it enforces nothing until
+the driver picks HOLD/MOUNTAIN (panel SW1) or the SOC-HOLD floor engages -- a
+restart on a healthy pack leaves the car where it is. ``voltdmf-ctl disarm``
+is the mid-drive stop. Operators steer it from an unprivileged account through the
 control socket (:mod:`voltdmf.control`, ``voltdmf-ctl``): ``status`` is
 answered read-only on the socket thread; ``set-mode`` / ``setpoint`` / ``arm``
 / ``disarm`` / ``reload`` are queued and executed here on the single loop
@@ -141,7 +143,7 @@ class Daemon:
             try:
                 self._await_bus(state)
                 log.info("reconciler active (setpoint=%s); entering loop%s",
-                         self._reconciler.setpoint.value, self._mode_tag())
+                         self._reconciler.setpoint_label, self._mode_tag())
 
                 while not self._stop.is_set():
                     self._drain_commands()
@@ -214,8 +216,16 @@ class Daemon:
         car should be in and, when armed, ask the gate to walk it there."""
         assert self._state is not None and self._gate is not None
         state = self._state
+        # No decodable current mode yet -- bus quiet, or only just up. There is
+        # nothing to compare against and ModeCycleController would not know
+        # where the menu cursor is, so the reconciler waits. (Fresh boot on a
+        # healthy pack lands here until the first 0x1F4 frame decodes.)
+        if state.drive_mode is None:
+            return
         desired = self._reconciler.desired_mode(state)
-        if desired == state.drive_mode:
+        # desired is None => passive setpoint (auto) and the floor is clear:
+        # enforce nothing, leave the car wherever the driver has it.
+        if desired is None or desired == state.drive_mode:
             return
 
         floor = "floor" if self._reconciler.floor_latched else "set"
@@ -254,7 +264,7 @@ class Daemon:
         log.info(
             "trip: soc=%s (%s @%s, age %s) b3=%s floor=%s setpoint=%s "
             "mode=%s armed=%s replies=%d nrc=%d",
-            soc, raw, resp, age_s, b3, floor, self._reconciler.setpoint.value,
+            soc, raw, resp, age_s, b3, floor, self._reconciler.setpoint_label,
             mode, self._armed, st.uds_replies, st.uds_nrcs,
         )
 
@@ -334,7 +344,7 @@ class Daemon:
         log.warning("setpoint -> %s via control socket", mode.value)
         self._last_action = f"SETPOINT {mode.value.upper()}"
         self._wake.set()  # reconcile on the next tick, not after the full sleep
-        return {"ok": True, "setpoint": self._reconciler.setpoint.value}
+        return {"ok": True, "setpoint": self._reconciler.setpoint_label}
 
     def _cmd_reload(self) -> dict:
         if self._config_path is None:
@@ -346,13 +356,17 @@ class Daemon:
         except (OSError, ConfigError) as exc:
             return {"ok": False, "error": f"reload failed: {exc}"}
         # The setpoint is the driver's live choice -- carry it across the
-        # reload. The SOC-floor latch is in-memory state and is dropped.
-        new_reconciler.set_setpoint(self._reconciler.setpoint)
+        # reload. The SOC-floor latch is in-memory state and is dropped. If the
+        # driver never picked one (still passive), leave the new reconciler at
+        # its own default_setpoint.
+        carried = self._reconciler.setpoint
+        if carried is not None:
+            new_reconciler.set_setpoint(carried)
         self._config = new_config
         self._reconciler = new_reconciler
         log.info("config reloaded via control socket (setpoint=%s, floor latch cleared)",
-                 new_reconciler.setpoint.value)
-        return {"ok": True, "setpoint": new_reconciler.setpoint.value,
+                 new_reconciler.setpoint_label)
+        return {"ok": True, "setpoint": new_reconciler.setpoint_label,
                 "floor_latched": False}
 
     def _status_snapshot(self) -> dict:
@@ -363,7 +377,7 @@ class Daemon:
         return {
             "armed": self._armed,
             "transmit_enabled": self._transmit_enabled(),
-            "setpoint": rec.setpoint.value,
+            "setpoint": rec.setpoint_label,
             "floor_latched": rec.floor_latched,
             "reconciler": rec.snapshot(),
             "drive_mode": (st.drive_mode.value
@@ -404,7 +418,10 @@ class Daemon:
         p = self._action_prefix()
         if self._reconciler.floor_latched:
             return f"{p}SOC-FLOOR -> HOLD"
-        return f"{p}hold {self._reconciler.setpoint.value.upper()}"
+        sp = self._reconciler.setpoint
+        if sp is None:
+            return f"{p}auto (no target)"
+        return f"{p}hold {sp.value.upper()}"
 
     def _await_bus(self, state: VehicleState) -> None:
         deadline = time.monotonic() + BUS_WARMUP_TIMEOUT_S

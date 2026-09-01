@@ -2,18 +2,22 @@
 
 One object holds the two pieces of runtime policy state:
 
-* **setpoint** -- a HOLD <-> MOUNTAIN toggle the driver moves with the panel
-  button (``voltdmf-ctl setpoint``). Not persisted; every boot starts at
-  ``default_setpoint``.
+* **setpoint** -- ``None`` (passive / ``auto``) or a HOLD <-> MOUNTAIN toggle
+  the driver moves with the panel button (``voltdmf-ctl setpoint``). Not
+  persisted; every boot starts at ``default_setpoint``, which is ``auto`` on
+  the shipped config -- the reconciler then enforces *nothing* until the
+  driver picks HOLD or MOUNTAIN, or the SOC-HOLD floor engages.
 * **floor latch** -- the SOC-HOLD floor. Engages when the pack drops to
   ``hold_threshold_percent`` and stays latched (in memory only) until a fresh
   poll reads back above ``hold_reset_percent``.
 
 :meth:`Reconciler.desired_mode` runs every loop pass and returns the mode the
-car *should* be in right now: the setpoint normally, or HOLD whenever the
-floor is latched (the floor always wins). The daemon compares that to the
-live ``0x1F4`` mode and, when armed, asks :class:`voltdmf.safety.SafetyGate`
-to walk the menu there.
+car *should* be in right now: HOLD whenever the floor is latched (the floor
+always wins), otherwise the setpoint -- which may be ``None``, meaning "no
+target, leave the car wherever the driver has it". The daemon compares a
+concrete result to the live ``0x1F4`` mode and, when armed, asks
+:class:`voltdmf.safety.SafetyGate` to walk the menu there; ``None`` is a
+no-op.
 
 Session 9 calibration: the 3->2 gauge-bar drop sits at ~33.7 % diag SOC and
 HOLD is charge-sustaining there, so the floor targets "don't fall below
@@ -28,8 +32,11 @@ from .config import Config
 from .signals import DriveMode
 from .state import VehicleState
 
-#: The only two modes the setpoint toggle can take.
+#: The only two modes the setpoint toggle can take (``None`` = passive/auto).
 SETPOINTS: tuple[DriveMode, ...] = (DriveMode.HOLD, DriveMode.MOUNTAIN)
+
+#: Config / wire string for the passive (no-target) setpoint.
+AUTO = "auto"
 
 #: A poll reply older than this is "stale" -- fall back to the b3 failsafe.
 DEFAULT_POLL_STALE_S = 45.0
@@ -46,25 +53,31 @@ class Reconciler:
         hold_threshold_percent: float,
         hold_reset_percent: float,
         bar_failsafe_raw: int,
-        default_setpoint: DriveMode = DriveMode.HOLD,
+        default_setpoint: DriveMode | None = None,
         poll_stale_s: float = DEFAULT_POLL_STALE_S,
     ) -> None:
         if hold_reset_percent <= hold_threshold_percent:
             raise ValueError("hold_reset_percent must be > hold_threshold_percent")
-        if default_setpoint not in SETPOINTS:
-            raise ValueError("default_setpoint must be hold or mountain")
+        if default_setpoint is not None and default_setpoint not in SETPOINTS:
+            raise ValueError("default_setpoint must be hold, mountain, or None (auto)")
         self._hold_threshold = hold_threshold_percent
         self._hold_reset = hold_reset_percent
         self._bar_failsafe = bar_failsafe_raw
         self._poll_stale_s = poll_stale_s
-        self._setpoint = default_setpoint
+        self._setpoint: DriveMode | None = default_setpoint
         self._floor_latched = False
         self._floor_source: str | None = None  # "poll" | "bar" while latched
 
     # -- setpoint -------------------------------------------------------------
     @property
-    def setpoint(self) -> DriveMode:
+    def setpoint(self) -> DriveMode | None:
+        """The driver's selected setpoint, or ``None`` when passive (auto)."""
         return self._setpoint
+
+    @property
+    def setpoint_label(self) -> str:
+        """``"hold"`` / ``"mountain"`` / ``"auto"`` -- safe for logs and JSON."""
+        return self._setpoint.value if self._setpoint is not None else AUTO
 
     @property
     def floor_latched(self) -> bool:
@@ -80,12 +93,16 @@ class Reconciler:
         self._setpoint = mode
 
     # -- the decision ------------------------------------------------------
-    def desired_mode(self, state: VehicleState) -> DriveMode:
+    def desired_mode(self, state: VehicleState) -> DriveMode | None:
         """The mode the car should be in now: HOLD if the floor is latched,
-        otherwise the current setpoint. Always concrete -- the daemon decides
-        whether to act on it (armed) or just log it (disarmed)."""
+        otherwise the current setpoint -- which is ``None`` when passive
+        (``auto``), meaning "no target, leave the car alone". The daemon
+        decides whether to act on a concrete result (armed) or just log it
+        (disarmed); ``None`` it ignores."""
         self._update_floor(state)
-        return DriveMode.HOLD if self._floor_latched else self._setpoint
+        if self._floor_latched:
+            return DriveMode.HOLD
+        return self._setpoint
 
     def _update_floor(self, state: VehicleState) -> None:
         # Preferred input: a fresh exact reading from the 22 005B poll.
@@ -113,7 +130,7 @@ class Reconciler:
     # -- introspection --------------------------------------------------
     def snapshot(self) -> dict:
         return {
-            "setpoint": self._setpoint.value,
+            "setpoint": self.setpoint_label,
             "floor_latched": self._floor_latched,
             "floor_source": self._floor_source,
             "hold_threshold_percent": self._hold_threshold,
