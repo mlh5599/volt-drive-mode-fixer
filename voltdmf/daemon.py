@@ -52,6 +52,25 @@ TRIP_LOG_PERIOD_S = 30.0
 #: leans on the 0x096 b3 failsafe).
 POLL_STALE_S = 45.0
 
+#: After a walk goes on the wire, skip re-evaluating for this long. 0x1F4
+#: byte 1 (the committed mode the reconciler compares against) lags the menu
+#: commit by ~3 s, so without this the level-triggered loop re-requests the
+#: same target every tick until the commit lands -- log spam, and a needless
+#: second trip through the walk machinery. The 60 s SafetyGate cooldown is
+#: still the hard rate limit; this just quiets the gap.
+WALK_SETTLE_S = 5.0
+
+#: Panel walk-test (``voltdmf-ctl walk-test`` / SW1 solo hold >= 8 s): the
+#: drive modes it steps the closed-loop walk through, in order. After the last
+#: it walks back to whatever mode the car started in.
+WALK_TEST_ORDER = (DriveMode.NORMAL, DriveMode.SPORT,
+                   DriveMode.MOUNTAIN, DriveMode.HOLD)
+
+#: Pause after each walk-test leg so the ~3 s 0x1F4 byte-1 commit lands before
+#: the leg is scored. The test drives its own cooldown-free SafetyGate, so
+#: this doubles as the inter-leg spacing; the real 60 s gate is untouched.
+WALK_TEST_LEG_SETTLE_S = 4.0
+
 
 class Daemon:
     def __init__(self, config: Config, *, channel: str = "can0",
@@ -90,12 +109,25 @@ class Daemon:
         self._reconciler: Reconciler = build_reconciler(
             config, poll_stale_s=POLL_STALE_S)
         self._gate: SafetyGate | None = None
+        # The controller the real gate wraps -- kept so _run_walk_test_cycle can
+        # build its own short-lived gate around the same (single) TX path.
+        self._controller: ModeCycleController | None = None
         self._started = time.monotonic()
+
+        # Panel walk-test: a queued `walk-test` command just sets the flag; the
+        # loop thread runs the ~1 min cycle inline on its next pass (so the TX
+        # path stays single-threaded and the reconciler is naturally skipped).
+        self._walk_test_pending = False
+        self._walk_test_result: dict | None = None
 
         # SOC poller bookkeeping (see _service_soc_poll).
         self._next_poll_at = 0.0
         self._poll_req_cursor = 0
         self._next_trip_log_at = 0.0
+
+        # monotonic() before which _reconcile() holds off after a dispatched
+        # walk -- see WALK_SETTLE_S.
+        self._walk_settle_until = 0.0
 
         self._cmd_queue: "queue.Queue[control.Command]" = queue.Queue()
 
@@ -118,17 +150,8 @@ class Daemon:
 
         with CanInterface(self._channel, tx_gate=self._transmit_enabled) as can_if:
             can_if.start_rx(state)
-            # Current mode is read straight off the bus: the RX listener
-            # decodes 0x1F4 byte 1 (the committed drive mode) into
-            # state.drive_mode. It stays None until the first 0x1F4 frame
-            # arrives, and ModeCycleController turns that into a
-            # ModeUnknownError rather than injecting -- the fail-safe we want
-            # on a bus we cannot observe.
-            controller = ModeCycleController(
-                can_if,
-                lambda: state.drive_mode,
-            )
-            self._gate = SafetyGate(controller)
+            self._controller = self._build_controller(can_if, state)
+            self._gate = SafetyGate(self._controller)
 
             server = self._start_control_server()
             dash = None
@@ -149,7 +172,10 @@ class Daemon:
                     self._drain_commands()
                     try:
                         self._service_soc_poll(can_if)
-                        self._reconcile()
+                        if self._walk_test_pending:
+                            self._run_walk_test_cycle()
+                        else:
+                            self._reconcile()
                         self._maybe_log_trip()
                     except Exception:  # fail-passive
                         log.exception("loop iteration failed; continuing passively")
@@ -162,7 +188,30 @@ class Daemon:
 
         self._state = None
         self._gate = None
+        self._controller = None
         log.info("daemon stopped")
+
+    def _build_controller(self, can_if: CanInterface,
+                          state: VehicleState) -> ModeCycleController:
+        """Wire the mode-cycle controller to the two 0x1F4 readbacks.
+
+        Both come off the RX listener -- the ``can.Notifier`` owns the bus, so
+        a second manual ``recv()`` would fight it:
+
+        * ``state.drive_mode`` -- 0x1F4 byte 1, the *committed* mode. ``None``
+          until the first 0x1F4 frame; :class:`ModeCycleController` turns that
+          into a ``ModeUnknownError`` rather than injecting blind.
+        * ``state.menu_cursor`` -- 0x1F4 byte 4, the *live* menu cursor.
+          Passing it makes ``switch_to()`` run the closed loop: tap, let the
+          cursor settle, stop the instant it reads the target. Without it the
+          walk is open-loop ``index+1``, only correct from a cold NORMAL menu
+          and wrong from any other current mode.
+        """
+        return ModeCycleController(
+            can_if,
+            lambda: state.drive_mode,
+            menu_cursor_source=lambda: state.menu_cursor,
+        )
 
     # -- control plane --------------------------------------------------
     def _start_control_server(self) -> control.ControlServer | None:
@@ -216,6 +265,10 @@ class Daemon:
         car should be in and, when armed, ask the gate to walk it there."""
         assert self._state is not None and self._gate is not None
         state = self._state
+        # Just dispatched a walk -- give the ~3 s byte-1 commit lag time to
+        # resolve before comparing again (see WALK_SETTLE_S).
+        if time.monotonic() < self._walk_settle_until:
+            return
         # No decodable current mode yet -- bus quiet, or only just up. There is
         # nothing to compare against and ModeCycleController would not know
         # where the menu cursor is, so the reconciler waits. (Fresh boot on a
@@ -235,7 +288,8 @@ class Daemon:
             self._last_action = (
                 f"{self._action_prefix()}{floor}->{desired.value.upper()}")
             log.info("reconcile: %s -> %s (%s)", actual, desired.value, floor)
-            self._gate.request(desired, state)
+            if self._gate.request(desired, state):
+                self._walk_settle_until = time.monotonic() + WALK_SETTLE_S
         else:
             self._last_action = f"OFF {floor}->{desired.value.upper()}"
             log.info("reconcile (disarmed): %s -> %s (%s) -- not acting",
@@ -305,6 +359,8 @@ class Daemon:
             return self._cmd_setpoint(args)
         if name == "reload":
             return self._cmd_reload()
+        if name == "walk-test":
+            return self._cmd_walk_test()
         return {"ok": False, "error": f"unhandled command {name!r}"}
 
     def _cmd_set_mode(self, args: dict) -> dict:
@@ -343,6 +399,7 @@ class Daemon:
             return {"ok": False, "error": str(exc)}
         log.warning("setpoint -> %s via control socket", mode.value)
         self._last_action = f"SETPOINT {mode.value.upper()}"
+        self._walk_settle_until = 0.0  # an explicit choice acts now
         self._wake.set()  # reconcile on the next tick, not after the full sleep
         return {"ok": True, "setpoint": self._reconciler.setpoint_label}
 
@@ -364,10 +421,94 @@ class Daemon:
             new_reconciler.set_setpoint(carried)
         self._config = new_config
         self._reconciler = new_reconciler
+        self._walk_settle_until = 0.0  # re-evaluate against the new policy now
         log.info("config reloaded via control socket (setpoint=%s, floor latch cleared)",
                  new_reconciler.setpoint_label)
         return {"ok": True, "setpoint": new_reconciler.setpoint_label,
                 "floor_latched": False}
+
+    # -- walk-test (panel self-test of the closed-loop mode walk) ---------
+    def _cmd_walk_test(self) -> dict:
+        """Queue the closed-loop mode-walk self-test. Returns immediately; the
+        loop thread runs the cycle on its next pass (see _run_walk_test_cycle)
+        and reports progress/result on the LCD watch screen + the journal."""
+        if not self._transmit_enabled():
+            return {"ok": False,
+                    "error": "daemon disarmed; run `voltdmf-ctl arm` first"}
+        if self._walk_test_pending:
+            return {"ok": False, "error": "walk-test already queued"}
+        st = self._state
+        if st is None or st.drive_mode is None:
+            return {"ok": False,
+                    "error": "no drive mode decoded yet (bus quiet / car off?)"}
+        self._walk_test_pending = True
+        self._wake.set()
+        log.warning("walk-test queued (origin=%s) -- reconciler paused ~1 min",
+                    st.drive_mode.value)
+        return {"ok": True, "started": True, "origin": st.drive_mode.value}
+
+    def _run_walk_test_cycle(self) -> None:
+        """Step the closed-loop walk through every drive mode, score each
+        landing off 0x1F4 byte 1, then walk back to the starting mode. Runs on
+        the loop thread with the reconciler skipped; drives its own
+        cooldown-free, Park-tolerant :class:`SafetyGate` around the shared
+        controller so the real 60 s gate and single TX path are untouched."""
+        self._walk_test_pending = False
+        st = self._state
+        if st is None or self._controller is None or st.drive_mode is None:
+            self._walk_test_result = {"ok": False, "summary": "walk-test: aborted"}
+            self._last_action = "WALK-TEST ABORT"
+            log.warning("walk-test: aborted before start (no mode / no controller)")
+            return
+
+        origin = st.drive_mode
+        gate = SafetyGate(self._controller, cooldown_s=0.0, allow_park=True)
+        log.warning("walk-test: start (origin=%s)", origin.value)
+
+        sequence = list(WALK_TEST_ORDER) + [origin]  # cycle every mode, then restore
+        legs: list[dict] = []
+        for i, target in enumerate(sequence, start=1):
+            restore = i == len(sequence)
+            self._last_action = f"WALK TEST {i}/{len(sequence)}"
+            legs.append(self._walk_test_leg(gate, target, st, restore=restore))
+            if self._stop.is_set():
+                log.warning("walk-test: interrupted by shutdown")
+                break
+
+        self._manual_target = None
+        scored = [leg for leg in legs if not leg["restore"]]
+        passed = sum(1 for leg in scored if leg["ok"])
+        all_ok = bool(legs) and all(leg["ok"] for leg in legs)
+        summary = (f"walk-test {passed}/{len(scored)} legs OK"
+                   + ("" if all_ok else " -- see journal"))
+        self._walk_test_result = {"ok": all_ok, "summary": summary,
+                                  "origin": origin.value, "legs": legs}
+        self._last_action = (f"WALK-TEST {passed}/{len(scored)} OK" if all_ok
+                             else f"WALK-TEST {passed}/{len(scored)} FAIL")
+        (log.info if all_ok else log.warning)("walk-test: done -- %s", summary)
+        self._walk_settle_until = 0.0  # let the reconciler re-evaluate at once
+        self._wake.set()
+
+    def _walk_test_leg(self, gate: SafetyGate, target: DriveMode,
+                       st: VehicleState, *, restore: bool) -> dict:
+        before = st.drive_mode
+        outcome = gate.request_verbose(target, st, force=True)
+        self._stop.wait(WALK_TEST_LEG_SETTLE_S)  # let 0x1F4 byte 1 commit
+        landed = st.drive_mode
+        ok = (not outcome.blocked) and landed is target
+        tag = "restore" if restore else "leg"
+        (log.info if ok else log.warning)(
+            "walk-test %s: %s -> %s  taps=%d  landed=%s  %s%s",
+            tag, before.value if before else "?", target.value, outcome.presses,
+            landed.value if landed else "?", "OK" if ok else "FAIL",
+            "" if not outcome.blocked else f"  [{outcome.reason}]")
+        return {"target": target.value,
+                "from": before.value if before else None,
+                "taps": outcome.presses,
+                "landed": landed.value if landed else None,
+                "blocked": outcome.blocked,
+                "ok": ok,
+                "restore": restore}
 
     def _status_snapshot(self) -> dict:
         st = self._state
@@ -383,6 +524,8 @@ class Daemon:
             "drive_mode": (st.drive_mode.value
                            if st is not None and st.drive_mode else None),
             "shift": st.shift.value if st is not None else None,
+            "menu_cursor": (st.menu_cursor.value
+                            if st is not None and st.menu_cursor else None),
             "soc_percent": (round(st.soc_percent, 1)
                             if st is not None and st.soc_percent is not None
                             else None),
@@ -400,6 +543,8 @@ class Daemon:
             "cooldown_remaining_s": (round(gate.cooldown_remaining(), 1)
                                      if gate is not None else None),
             "last_action": self._last_action,
+            "walk_test": self._walk_test_result,
+            "walk_test_running": self._walk_test_pending,
             "uptime_s": round(time.monotonic() - self._started, 1),
         }
 

@@ -71,11 +71,13 @@ nowhere until the driver selects HOLD/MOUNTAIN or the SOC-HOLD floor engages.
 
 The daemon runs permanently as root under systemd; change modes and daemon
 state from an unprivileged account with `voltdmf-ctl` (`status` / `arm` /
-`disarm` / `setpoint <hold|mountain>` / `set-mode <mode>` / `reload`) over its
-control socket. `voltdmf-ctl disarm` is the mid-drive stop. See `host/README.md`
-§"Runtime control" and DESIGN.md §"Runtime control". The panel SW1 tap drives
-`setpoint`; the SOC-HOLD floor overrides the setpoint to HOLD whenever the
-pack is low.
+`disarm` / `setpoint <hold|mountain>` / `set-mode <mode>` / `reload` /
+`walk-test`) over its control socket. `voltdmf-ctl disarm` is the mid-drive
+stop. See `host/README.md` §"Runtime control" and DESIGN.md §"Runtime
+control". The panel SW1 tap drives `setpoint` and an SW1 solo-hold (≥ 8 s)
+drives `walk-test` — a closed-loop mode-walk self-test that cycles every mode
+and restores the start mode. The SOC-HOLD floor overrides the setpoint to HOLD
+whenever the pack is low.
 
 **Hardware:** PiCAN2 (Raspberry Pi CAN-bus HAT) + Raspberry Pi 3B, connected
 to the OBD-II port via an off-the-shelf OBD-II-to-DB9 cable, powered from

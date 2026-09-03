@@ -328,6 +328,11 @@ The custom code needed is small and specific to this project:
    that owns the two PiCAN2 pads (SW1 = BCM 24, SW2 = BCM 23) and dispatches
    by gesture:
    - **SW1 tap** → `voltdmf-ctl setpoint …` to toggle HOLD ⇄ MOUNTAIN.
+   - **SW1 held alone ≥ 8 s, then released** → `voltdmf-ctl walk-test`: the
+     daemon cycles the closed-loop mode walk through every drive mode, scores
+     each landing off `0x1F4`, and walks back to the starting mode. The 5–8 s
+     SW1-solo window is a dead zone so a slow reach for the combo can't trip
+     it; result shows on the LCD watch screen.
    - **SW2 held ~5 s alone, then released** → launch the charge-current
      setpoint capture (`voltdmf-chargelog.service`; checklist §2e). Fires on
      release with SW1 never joined, so a hand travelling toward the combo
@@ -416,10 +421,14 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | `setpoint <hold\|mountain>` | select the reconciler setpoint — first selection also leaves `auto` (the panel button is a `setpoint` caller) | queued → loop thread |
 | `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
 | `reload` | re-read the config file, rebuild the policy | queued → loop thread |
+| `walk-test` | self-test the closed-loop mode walk: cycle every drive mode, score each landing, restore the start mode | queued → sets a flag; the loop thread runs the ~1 min cycle inline (reconciler skipped) and reports on the LCD + journal |
 
-> **All five commands are implemented.** `setpoint` and the reconciler it
+> **All commands are implemented.** `setpoint` and the reconciler it
 > feeds landed in Session 9; `tools/button_helper.py`'s SW1 tap now drives a
-> real toggle.
+> real toggle. `walk-test` (SW1 solo hold ≥ 8 s) drives its own cooldown-free,
+> Park-tolerant `SafetyGate` around the shared controller, so the real 60 s
+> gate and the single-threaded TX path are untouched; it needs the daemon
+> armed and refuses if a run is already queued.
 
 - **Privilege boundary = file mode.** The `.socket` unit binds it
   `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no

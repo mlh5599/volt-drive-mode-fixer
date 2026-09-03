@@ -10,6 +10,13 @@ into three actions:
            setpoint (DESIGN.md design item 4). A no-op until `setpoint` lands
            in voltdmf-ctl; the failing call is logged and swallowed.
 
+    SW1 held alone >= --selftest-hold-secs, then released  (SW2 never joined)
+        -> ``voltdmf-ctl walk-test`` -- the daemon cycles the closed-loop mode
+           walk through every drive mode, verifies each landing off 0x1F4, and
+           walks back to the starting mode. Deliberately long (default 8 s, and
+           the 5-8 s window is a dead zone) so a slow reach for the SW1+SW2
+           combo cannot trip it. Progress/result show on the LCD watch screen.
+
     SW2 held alone >= --single-hold-secs, then released  (SW1 never joined)
         -> launch the charge-current-setpoint capture (phase-c checklist
            section 2e -- force 12 A Level 1 charging). Same launch / hand-off
@@ -79,6 +86,10 @@ class _Gestures:
         ``"setpoint"``       SW1 tapped alone: released after
                              ``min_tap <= held < launch_hold`` with SW2 never
                              joined during the hold.
+        ``"walk_test"``      SW1 held alone >= ``selftest_hold`` then released,
+                             SW2 never joined. Fires on release. The
+                             ``launch_hold..selftest_hold`` window is a dead
+                             zone (neither a tap nor the test).
         ``"launch_charge"``  SW2 held alone >= ``single_hold`` then released,
                              SW1 never joined. Fires on release.
         ``"launch_soc"``     SW1 and SW2 both held >= ``launch_hold``. Fires
@@ -89,10 +100,11 @@ class _Gestures:
     """
 
     def __init__(self, *, min_tap: float, single_hold: float,
-                 launch_hold: float) -> None:
+                 launch_hold: float, selftest_hold: float = float("inf")) -> None:
         self._min_tap = min_tap
         self._single_hold = single_hold
         self._launch_hold = launch_hold
+        self._selftest_hold = selftest_hold
         self.reset()
 
     def reset(self) -> None:
@@ -113,9 +125,12 @@ class _Gestures:
             self._sw1_saw_sw2 = True
         if not a and self._sw1_at is not None:
             held = now - self._sw1_at
-            if (not self._sw1_saw_sw2 and not self._launched
-                    and self._min_tap <= held < self._launch_hold):
-                action = "setpoint"
+            if not self._sw1_saw_sw2 and not self._launched:
+                if self._min_tap <= held < self._launch_hold:
+                    action = "setpoint"
+                elif held >= self._selftest_hold:
+                    action = "walk_test"
+                # launch_hold..selftest_hold: dead zone, no action
             self._sw1_at, self._sw1_saw_sw2 = None, False
 
         # --- SW2 held alone -> charge-mode capture (fires on release) ---
@@ -155,6 +170,7 @@ class ButtonHelper:
         self._min_tap = args.min_tap_ms / 1000.0
         self._launch_hold = args.launch_hold_secs
         self._single_hold = args.single_hold_secs
+        self._selftest_hold = args.selftest_hold_secs
         self._unit = args.soclog_unit
         self._chargelog_unit = args.chargelog_unit
         self._ctl = args.ctl
@@ -166,7 +182,8 @@ class ButtonHelper:
 
         self._gestures = _Gestures(min_tap=self._min_tap,
                                    single_hold=self._single_hold,
-                                   launch_hold=self._launch_hold)
+                                   launch_hold=self._launch_hold,
+                                   selftest_hold=self._selftest_hold)
         self._stop = threading.Event()
         self._sw1 = None  # gpiozero.Button once acquired
         self._sw2 = None
@@ -184,9 +201,10 @@ class ButtonHelper:
                 self._wait_out_unit(unit)
         self._acquire_with_retry()
         log.info("watching: SW1 tap = setpoint toggle (%s), "
+                 "SW1 hold %.0fs = walk-test, "
                  "SW2 hold %.0fs = launch %s, "
                  "SW1+SW2 hold %.0fs = launch %s",
-                 "/".join(self._setpoints),
+                 "/".join(self._setpoints), self._selftest_hold,
                  self._single_hold, self._chargelog_unit,
                  self._launch_hold, self._unit)
         try:
@@ -204,6 +222,8 @@ class ButtonHelper:
                                          time.monotonic())
             if action == "setpoint":
                 self._toggle_setpoint()
+            elif action == "walk_test":
+                self._run_walk_test()
             elif action == "launch_charge":
                 self._do_launch(self._chargelog_unit, "CHARGE CAPTURE")
                 self._drain_until_released()
@@ -241,6 +261,24 @@ class ButtonHelper:
             log.warning("  voltdmf-ctl rc=%d: %s  "
                         "(expected until `setpoint` lands in voltdmf-ctl)",
                         r.returncode, msg)
+
+    # -- action: closed-loop mode-walk self-test ------------------------
+    def _run_walk_test(self) -> None:
+        """SW1 solo hold: kick off ``voltdmf-ctl walk-test``. The daemon
+        returns at once and runs the ~1 min cycle itself, reporting on the LCD
+        watch screen -- so this just fires the command and logs the ack."""
+        argv = [self._ctl, "walk-test"]
+        log.info("SW1 hold >=%.0fs -> %s", self._selftest_hold, " ".join(argv))
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("  walk-test call did not run: %s", exc)
+            return
+        out = (r.stdout or r.stderr).strip()
+        if r.returncode == 0:
+            log.info("  %s", out or "started")
+        else:
+            log.warning("  voltdmf-ctl rc=%d: %s", r.returncode, out)
 
     # -- action: launch a capture -------------------------------------
     def _do_launch(self, unit: str, lcd_title: str) -> None:
@@ -401,6 +439,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="hold SW2 ALONE this long (SW1 untouched), then "
                          "release, to launch the charge-mode capture "
                          "(default 5)")
+    ap.add_argument("--selftest-hold-secs", type=float, default=8.0, metavar="S",
+                    help="hold SW1 ALONE this long (SW2 untouched), then "
+                         "release, to run the closed-loop mode-walk self-test "
+                         "(`voltdmf-ctl walk-test`). Must exceed "
+                         "--launch-hold-secs; the gap is a dead zone "
+                         "(default 8)")
     ap.add_argument("--bounce-ms", type=float, default=50.0)
     ap.add_argument("--min-tap-ms", type=float, default=40.0,
                     help="ignore an SW1 blip shorter than this as noise")
@@ -429,7 +473,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.selftest_hold_secs <= args.launch_hold_secs:
+        parser.error("--selftest-hold-secs must exceed --launch-hold-secs "
+                     f"({args.selftest_hold_secs} <= {args.launch_hold_secs})")
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(levelname)s %(message)s")
@@ -440,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
               f"debounce {args.bounce_ms:.0f} ms")
         print(f"  SW1 tap         -> {args.ctl} setpoint "
               f"<{'/'.join(args.setpoints)}>  (start {args.setpoint_start})")
+        print(f"  SW1 solo {args.selftest_hold_secs:.0f}s  -> {args.ctl} "
+              f"walk-test  (daemon runs the ~1 min cycle, LCD shows result)")
         print(f"  SW2 solo {args.single_hold_secs:.0f}s  -> systemctl start "
               f"{args.chargelog_unit}  (blocks until it finishes)")
         print(f"  SW1+SW2 {args.launch_hold_secs:.0f}s   -> systemctl start "

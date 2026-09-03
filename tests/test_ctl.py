@@ -104,6 +104,17 @@ def test_setpoint_request_shape_and_output(tmp_path, capsys):
     assert "setpoint = mountain" in capsys.readouterr().out
 
 
+def test_walk_test_request_shape_and_output(tmp_path, capsys):
+    with _CannedServer(tmp_path, {"ok": True, "started": True,
+                                  "origin": "hold"}) as srv:
+        rc = ctl.main(["--socket", srv.path, "walk-test"])
+    assert rc == 0
+    assert srv.request == {"cmd": "walk-test"}
+    out = capsys.readouterr().out
+    assert "walk-test started" in out
+    assert "hold" in out  # origin
+
+
 def test_setpoint_rejects_non_setpoint_mode_at_argparse(tmp_path):
     with pytest.raises(SystemExit) as ei:
         ctl.main(["--socket", str(tmp_path / "x"), "setpoint", "normal"])

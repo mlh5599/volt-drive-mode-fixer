@@ -54,7 +54,9 @@ SD_LISTEN_FDS_START = 3
 DEFAULT_SOCKET_PATH = "/run/voltdmf/control.sock"
 
 #: Commands that mutate state / can transmit -- routed through the daemon loop.
-_QUEUED_COMMANDS = frozenset({"set-mode", "setpoint", "arm", "disarm", "reload"})
+_QUEUED_COMMANDS = frozenset(
+    {"set-mode", "setpoint", "arm", "disarm", "reload", "walk-test"}
+)
 
 _ACCEPT_TIMEOUT_S = 0.5      # so stop() is responsive
 _RECV_TIMEOUT_S = 5.0        # a client that opens and stalls must not wedge us

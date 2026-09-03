@@ -313,6 +313,13 @@ class _DecodeListener(can.Listener):
             mode = signals.decode_drive_mode(data)
             if mode is not None:
                 self._state.drive_mode = mode
+            # byte 4 = the LIVE menu cursor (steps ~40 ms after each tap), but
+            # 0x00 doubles as "menu idle/closed", so only trust it while byte 5
+            # bit 7 says the menu is open. Feeds the reconciler's closed loop.
+            self._state.menu_cursor = (
+                signals.decode_menu_cursor(data)
+                if signals.menu_is_open(data) else None
+            )
         # 0x135 is a known signal frame (keeps mark_signal_seen fresh) but its
         # shifter encoding is messier than 0x1F5 -- not decoded.
         self._state.mark_signal_seen()

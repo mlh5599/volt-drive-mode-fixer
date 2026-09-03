@@ -66,6 +66,22 @@ def test_allow_unknown_shift_opt_in():
     assert ctl.calls == 1
 
 
+def test_allow_park_opt_in_lets_park_through():
+    # the panel walk-test builds its gate with allow_park=True
+    ctl = FakeController()
+    gate = SafetyGate(ctl, allow_park=True)
+    assert gate.request(DriveMode.HOLD, _state(shift=ShiftPosition.PARK)) is True
+    assert ctl.calls == 1
+
+
+@pytest.mark.parametrize("shift", [ShiftPosition.REVERSE, ShiftPosition.NEUTRAL])
+def test_allow_park_still_blocks_reverse_and_neutral(shift):
+    ctl = FakeController()
+    gate = SafetyGate(ctl, allow_park=True)
+    assert gate.request(DriveMode.HOLD, _state(shift=shift)) is False
+    assert ctl.calls == 0
+
+
 def test_blocks_on_implausible_speed():
     ctl = FakeController()
     gate = SafetyGate(ctl)

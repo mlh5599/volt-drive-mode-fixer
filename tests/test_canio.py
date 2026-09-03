@@ -109,6 +109,42 @@ def test_decode_listener_leaves_drive_mode_alone_on_unknown_byte1():
     assert state.drive_mode is DriveMode.HOLD  # undecodable -> unchanged
 
 
+# -- _DecodeListener: 0x1F4 byte 4 feeds VehicleState.menu_cursor -------
+#
+# byte 4 codes: 00 N / 80 S / 40 M / 20 H. byte 5 bit 7 = menu open. An idle
+# frame carries byte 4 == 0x00 (would read as NORMAL), so the cursor is only
+# trusted while the menu-open bit is set.
+_OPEN = 0x80   # 0x1F4 byte 5 bit 7
+
+
+def test_decode_listener_populates_menu_cursor_while_menu_open():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    assert state.menu_cursor is None
+
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x00, 0, 0, 0x40, _OPEN, 0, 0))))
+    assert state.menu_cursor is DriveMode.MOUNTAIN
+
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x00, 0, 0, 0x20, _OPEN, 0, 0))))
+    assert state.menu_cursor is DriveMode.HOLD
+
+
+def test_decode_listener_clears_menu_cursor_when_menu_closed():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x00, 0, 0, 0x80, _OPEN, 0, 0))))
+    assert state.menu_cursor is DriveMode.SPORT
+
+    # menu-open bit clear -> cursor is stale, even though byte 4 is non-zero
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x08, 0, 0, 0x80, 0x00, 0, 0))))
+    assert state.menu_cursor is None
+    assert state.drive_mode is DriveMode.HOLD  # byte 1 still decoded
+
+
 def test_decode_listener_ignores_non_signal_frames():
     state = VehicleState()
     listener = _DecodeListener(state)

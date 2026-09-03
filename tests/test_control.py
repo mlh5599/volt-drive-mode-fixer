@@ -144,6 +144,7 @@ def test_status_provider_failure_is_reported(server):
     ({"cmd": "arm"}, "arm"),
     ({"cmd": "disarm"}, "disarm"),
     ({"cmd": "reload"}, "reload"),
+    ({"cmd": "walk-test"}, "walk-test"),
 ])
 def test_mutating_commands_go_through_the_queue(server, request_obj, expect_name):
     srv, q, path = server()

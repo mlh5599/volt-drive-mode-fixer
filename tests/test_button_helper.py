@@ -9,6 +9,8 @@ assert which actions come back. ``ButtonHelper`` construction is checked too
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools"))
 
 import button_helper  # noqa: E402
@@ -16,9 +18,11 @@ import button_helper  # noqa: E402
 _DT = 0.05
 
 
-def _mk(*, min_tap=0.04, single_hold=1.0, launch_hold=1.0):
+def _mk(*, min_tap=0.04, single_hold=1.0, launch_hold=1.0,
+        selftest_hold=float("inf")):
     return button_helper._Gestures(min_tap=min_tap, single_hold=single_hold,
-                                   launch_hold=launch_hold)
+                                   launch_hold=launch_hold,
+                                   selftest_hold=selftest_hold)
 
 
 def _frames(*segments):
@@ -60,6 +64,33 @@ def test_sw1_long_hold_alone_is_not_a_tap():
     # held past launch_hold with SW2 untouched -> neither a tap nor a combo
     hits = _play(_mk(), _frames((True, False, 2.0), (False, False, 0.2)))
     assert hits == []
+
+
+# --- SW1 solo long hold -> walk-test ------------------------------------
+def test_sw1_solo_hold_past_selftest_emits_walk_test_on_release():
+    g = _mk(launch_hold=1.0, selftest_hold=1.5)
+    hits = _play(g, _frames((True, False, 1.7), (False, False, 0.2)))
+    assert _acts(hits) == ["walk_test"]
+    assert hits[0][0] >= 1.65  # fires on release, not at the threshold
+
+
+def test_sw1_solo_hold_in_the_dead_zone_does_nothing():
+    g = _mk(launch_hold=1.0, selftest_hold=1.5)
+    hits = _play(g, _frames((True, False, 1.2), (False, False, 0.2)))
+    assert hits == []
+
+
+def test_sw1_short_tap_is_still_setpoint_with_selftest_configured():
+    g = _mk(launch_hold=1.0, selftest_hold=1.5)
+    hits = _play(g, _frames((True, False, 0.3), (False, False, 0.2)))
+    assert _acts(hits) == ["setpoint"]
+
+
+def test_sw1_long_hold_with_sw2_joining_is_soc_not_walk_test():
+    g = _mk(launch_hold=1.0, selftest_hold=1.5)
+    hits = _play(g, _frames((True, False, 0.4), (True, True, 1.3),
+                            (True, False, 0.2), (False, False, 0.2)))
+    assert _acts(hits) == ["launch_soc"]  # SW2 joined -> not a solo hold
 
 
 # --- SW2 solo hold -> charge capture ------------------------------------
@@ -119,12 +150,14 @@ def test_parser_defaults_carry_the_new_flags():
     assert ns.chargelog_unit == "voltdmf-chargelog.service"
     assert ns.soclog_unit == "voltdmf-soclog.service"
     assert ns.launch_hold_secs == 5.0
+    assert ns.selftest_hold_secs == 8.0
 
 
 def test_parser_help_renders_and_lists_the_new_gesture():
     txt = button_helper._build_parser().format_help()
     assert "--single-hold-secs" in txt
     assert "--chargelog-unit" in txt
+    assert "--selftest-hold-secs" in txt
 
 
 def test_helper_wires_the_chargelog_unit_into_the_fsm():
@@ -134,3 +167,16 @@ def test_helper_wires_the_chargelog_unit_into_the_fsm():
     assert h._chargelog_unit == "x.service"
     assert h._single_hold == 3.0
     assert h._gestures._single_hold == 3.0
+
+
+def test_helper_wires_the_selftest_hold_into_the_fsm():
+    ns = button_helper._build_parser().parse_args(["--selftest-hold-secs", "9"])
+    h = button_helper.ButtonHelper(ns)
+    assert h._selftest_hold == 9.0
+    assert h._gestures._selftest_hold == 9.0
+
+
+def test_selftest_hold_must_exceed_launch_hold():
+    with pytest.raises(SystemExit) as ei:
+        button_helper.main(["--launch-hold-secs", "5", "--selftest-hold-secs", "5"])
+    assert ei.value.code == 2

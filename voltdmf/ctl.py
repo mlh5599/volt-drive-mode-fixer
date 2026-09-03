@@ -6,6 +6,7 @@
     voltdmf-ctl arm
     voltdmf-ctl disarm
     voltdmf-ctl reload
+    voltdmf-ctl walk-test
 
 Socket path: ``--socket`` > ``$VOLTDMF_CONTROL_SOCKET`` > the systemd default
 (:data:`voltdmf.control.DEFAULT_SOCKET_PATH`).
@@ -111,6 +112,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="re-read the config file and rebuild the reconciler "
                         "(keeps the setpoint, drops the SOC-floor latch)",
                    parents=[common])
+    sub.add_parser("walk-test",
+                   help="self-test the closed-loop mode walk: cycle every "
+                        "drive mode, verify each landing, restore the start "
+                        "mode. Returns at once -- watch the LCD / journal.",
+                   parents=[common])
     return ap
 
 
@@ -181,6 +187,10 @@ def _print_human(cmd: str, reply: dict) -> None:
     elif cmd == "reload":
         print(f"reloaded; setpoint = {reply.get('setpoint', '?')} "
               f"(SOC-floor latch cleared)")
+    elif cmd == "walk-test":
+        origin = reply.get("origin", "?")
+        print(f"walk-test started (origin {origin}); reconciler paused ~1 min. "
+              "Watch the LCD or `voltdmf-ctl status`.")
     else:
         print("ok")
 

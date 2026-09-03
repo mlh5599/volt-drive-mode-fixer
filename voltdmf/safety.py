@@ -54,6 +54,7 @@ class SafetyGate:
         *,
         cooldown_s: float = MODE_SWITCH_COOLDOWN_S,
         allow_unknown_shift: bool = False,
+        allow_park: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._controller = controller
@@ -63,13 +64,20 @@ class SafetyGate:
         # missing decoder -- treat it as blocking. Callers that genuinely have
         # no shift signal (bench rigs without 0x1F5) can still pass True.
         self._allow_unknown_shift = allow_unknown_shift
+        # The panel walk-test (SW1 solo hold) passes allow_park=True so the
+        # driver can run it fully stopped in Park; REVERSE / NEUTRAL stay
+        # blocking, and the bus + speed checks are unchanged.
+        self._blocking_shifts = (
+            _BLOCKING_SHIFTS - {ShiftPosition.PARK} if allow_park
+            else _BLOCKING_SHIFTS
+        )
         self._monotonic = monotonic
         self._last_switch: float | None = None
 
     def _precondition_failure(self, state: VehicleState) -> str | None:
         if not state.bus_active:
             return "bus is quiet (car off?)"
-        if state.shift in _BLOCKING_SHIFTS:
+        if state.shift in self._blocking_shifts:
             return f"shift is {state.shift.value}"
         if state.shift is ShiftPosition.UNKNOWN and not self._allow_unknown_shift:
             return "shift position unknown"

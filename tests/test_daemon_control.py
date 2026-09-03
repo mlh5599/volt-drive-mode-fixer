@@ -2,9 +2,11 @@
 reload, and the transmit-enable gate that sits in front of the CAN layer."""
 
 import json
+import time
 
 import pytest
 
+from voltdmf import daemon as daemon_mod
 from voltdmf.canio import CanInterface
 from voltdmf.config import parse_config
 from voltdmf.daemon import Daemon
@@ -172,6 +174,126 @@ def test_reconcile_waits_for_a_decodable_current_mode():
     assert d._gate.request_calls == []          # no 0x1F4 yet -> don't walk
 
 
+# --- post-walk settle guard --------------------------------------------
+def test_reconcile_arms_walk_settle_after_a_sent_walk():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
+    d._gate = _FakeGate(RequestOutcome(True, 3, False, "ok"))  # request() -> sent
+    d._reconcile()
+    assert d._gate.request_calls == [DriveMode.HOLD]
+    assert d._walk_settle_until > time.monotonic()
+
+
+def test_reconcile_holds_off_while_walk_settle_is_active():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
+    d._gate = _FakeGate(RequestOutcome(True, 3, False, "ok"))
+    d._reconcile()                              # walk 1 -> settle armed
+    d._reconcile()                              # byte-1 still NORMAL (commit lag)
+    assert d._gate.request_calls == [DriveMode.HOLD]   # not re-requested
+
+
+def test_reconcile_does_not_arm_settle_when_no_walk_went_out():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
+    d._gate = _FakeGate(RequestOutcome(False, 0, True, "blocked"))  # request() -> False
+    d._reconcile()
+    assert d._walk_settle_until == 0.0
+
+
+def test_setpoint_command_clears_walk_settle():
+    d = _daemon()
+    d._walk_settle_until = time.monotonic() + 999
+    d._handle_command("setpoint", {"mode": "mountain"})
+    assert d._walk_settle_until == 0.0
+
+
+# --- walk-test (panel mode-walk self-test) ----------------------------
+class _FakeController:
+    """Stands in for ModeCycleController: each switch_to lands the mode."""
+
+    def __init__(self, state, *, land=True):
+        self._state = state
+        self._land = land
+        self.calls = []
+
+    def switch_to(self, target, force=False):
+        self.calls.append((target, force))
+        if self._land:
+            self._state.drive_mode = target   # simulate the committed byte-1
+        return 1
+
+
+def test_walk_test_refused_when_disarmed():
+    d = _daemon(start_armed=False)
+    d._state = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.HOLD)
+    reply = d._handle_command("walk-test", {})
+    assert reply["ok"] is False
+    assert d._walk_test_pending is False
+
+
+def test_walk_test_refused_without_a_decoded_mode():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.PARK, drive_mode=None)
+    reply = d._handle_command("walk-test", {})
+    assert reply["ok"] is False
+    assert d._walk_test_pending is False
+
+
+def test_walk_test_queues_and_returns_started():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.SPORT)
+    reply = d._handle_command("walk-test", {})
+    assert reply == {"ok": True, "started": True, "origin": "sport"}
+    assert d._walk_test_pending is True
+    # a second request while one is queued is refused
+    assert d._handle_command("walk-test", {})["ok"] is False
+
+
+def test_walk_test_cycle_walks_every_mode_then_restores(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.SPORT)
+    d._state = st
+    d._controller = _FakeController(st)
+    d._walk_test_pending = True
+
+    d._run_walk_test_cycle()
+
+    assert d._walk_test_pending is False
+    assert [c[0] for c in d._controller.calls] == [
+        DriveMode.NORMAL, DriveMode.SPORT, DriveMode.MOUNTAIN,
+        DriveMode.HOLD, DriveMode.SPORT,          # 4-mode cycle + restore origin
+    ]
+    assert all(force for _, force in d._controller.calls)
+    res = d._walk_test_result
+    assert res["ok"] is True
+    assert res["origin"] == "sport"
+    assert len(res["legs"]) == 5
+    assert res["legs"][-1]["restore"] is True
+    assert st.drive_mode is DriveMode.SPORT       # left where it started
+    assert "OK" in d._last_action
+    json.dumps(d._status_snapshot())              # result stays serialisable
+
+
+def test_walk_test_cycle_reports_fail_when_a_leg_lands_wrong(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.SPORT)
+    d._state = st
+    d._controller = _FakeController(st, land=False)  # walk never commits
+    d._walk_test_pending = True
+
+    d._run_walk_test_cycle()
+
+    res = d._walk_test_result
+    assert res["ok"] is False
+    assert "FAIL" in d._last_action
+    # the SPORT legs still "land" (state never left SPORT); N/M/H do not
+    scored = [leg for leg in res["legs"] if not leg["restore"]]
+    assert [leg["ok"] for leg in scored] == [False, True, False, False]
+
+
 # --- reload ----------------------------------------------------------
 _RELOAD_YAML = (
     "policy:\n  default_setpoint: hold\n  hold_threshold_percent: 20\n"
@@ -191,11 +313,13 @@ def test_reload_rereads_file_and_keeps_setpoint(tmp_path):
     cfg.write_text(_RELOAD_YAML)
     d = _daemon(config_path=str(cfg))
     d._handle_command("setpoint", {"mode": "mountain"})  # driver's live choice
+    d._walk_settle_until = time.monotonic() + 999
     reply = d._handle_command("reload", {})
     assert reply["ok"] is True
     assert reply["setpoint"] == "mountain"  # survives the reload
     assert reply["floor_latched"] is False
     assert d._config.policy.hold_threshold_percent == 20
+    assert d._walk_settle_until == 0.0  # re-evaluate against the new policy now
 
 
 def test_reload_bad_config_reports_error(tmp_path):
