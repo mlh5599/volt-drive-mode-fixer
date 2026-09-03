@@ -161,6 +161,15 @@ socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
   walked N→S→M cleanly at 1.2 s spacing.
 - New decoders: `signals.decode_menu_cursor()`, `signals.menu_is_open()`;
   new reader `CanInterface.read_menu_cursor()`.
+- **Do NOT gate the cursor feed on `menu_is_open()`.** Session 10 wired the
+  daemon's closed loop to `state.menu_cursor` and populated it only on
+  frames with byte-5 bit 7 set (nulling it otherwise). That bit flickers off
+  many times per second mid-walk on the injected path, so the cursor read
+  back `None` at almost every check and every non-NORMAL walk-test leg hit
+  `ModeSwitchFailed` after the full 8 taps. Fix: `_DecodeListener` now sets
+  `state.menu_cursor` from byte 4 on every `0x1F4`, ungated — matching
+  `read_menu_cursor()`, the path session 4 validated on-road. Byte 4 `00`
+  → NORMAL is harmless because the cursor is only read mid-walk.
 
 ### On-road validation (2026-08-29, session 4 — `tools/drive_log.py`)
 

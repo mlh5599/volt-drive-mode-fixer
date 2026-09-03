@@ -432,16 +432,23 @@ class Daemon:
         """Queue the closed-loop mode-walk self-test. Returns immediately; the
         loop thread runs the cycle on its next pass (see _run_walk_test_cycle)
         and reports progress/result on the LCD watch screen + the journal."""
+        # Surface every refusal on the LCD watch screen too -- the panel
+        # gesture is the whole point of this command, and the driver has no
+        # other feedback channel in the car.
         if not self._transmit_enabled():
+            self._last_action = "WALK-TEST: DISARMED"
             return {"ok": False,
                     "error": "daemon disarmed; run `voltdmf-ctl arm` first"}
         if self._walk_test_pending:
+            # already running -- the LCD is already showing WALK TEST n/N
             return {"ok": False, "error": "walk-test already queued"}
         st = self._state
         if st is None or st.drive_mode is None:
+            self._last_action = "WALK-TEST: NO BUS"
             return {"ok": False,
                     "error": "no drive mode decoded yet (bus quiet / car off?)"}
         self._walk_test_pending = True
+        self._last_action = "WALK-TEST QUEUED"
         self._wake.set()
         log.warning("walk-test queued (origin=%s) -- reconciler paused ~1 min",
                     st.drive_mode.value)

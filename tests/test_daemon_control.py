@@ -230,6 +230,7 @@ def test_walk_test_refused_when_disarmed():
     reply = d._handle_command("walk-test", {})
     assert reply["ok"] is False
     assert d._walk_test_pending is False
+    assert d._last_action == "WALK-TEST: DISARMED"  # driver sees it on the LCD
 
 
 def test_walk_test_refused_without_a_decoded_mode():
@@ -238,6 +239,7 @@ def test_walk_test_refused_without_a_decoded_mode():
     reply = d._handle_command("walk-test", {})
     assert reply["ok"] is False
     assert d._walk_test_pending is False
+    assert d._last_action == "WALK-TEST: NO BUS"
 
 
 def test_walk_test_queues_and_returns_started():
@@ -246,8 +248,11 @@ def test_walk_test_queues_and_returns_started():
     reply = d._handle_command("walk-test", {})
     assert reply == {"ok": True, "started": True, "origin": "sport"}
     assert d._walk_test_pending is True
-    # a second request while one is queued is refused
+    assert d._last_action == "WALK-TEST QUEUED"
+    # a second request while one is queued is refused, and does NOT stomp the
+    # LCD (it is already showing progress)
     assert d._handle_command("walk-test", {})["ok"] is False
+    assert d._last_action == "WALK-TEST QUEUED"
 
 
 def test_walk_test_cycle_walks_every_mode_then_restores(monkeypatch):

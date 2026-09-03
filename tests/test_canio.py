@@ -111,13 +111,15 @@ def test_decode_listener_leaves_drive_mode_alone_on_unknown_byte1():
 
 # -- _DecodeListener: 0x1F4 byte 4 feeds VehicleState.menu_cursor -------
 #
-# byte 4 codes: 00 N / 80 S / 40 M / 20 H. byte 5 bit 7 = menu open. An idle
-# frame carries byte 4 == 0x00 (would read as NORMAL), so the cursor is only
-# trusted while the menu-open bit is set.
+# byte 4 codes: 00 N / 80 S / 40 M / 20 H. byte 5 bit 7 = menu open. The feed
+# is UNGATED by that bit: it flickers mid-walk on the injected path, and
+# gating on it stranded state.menu_cursor at None so the closed-loop walk
+# never matched (session 10 regression). byte 4 == 0x00 -> NORMAL is fine:
+# the cursor is read only mid-walk, right after a tap.
 _OPEN = 0x80   # 0x1F4 byte 5 bit 7
 
 
-def test_decode_listener_populates_menu_cursor_while_menu_open():
+def test_decode_listener_populates_menu_cursor_from_byte4():
     state = VehicleState()
     listener = _DecodeListener(state)
     assert state.menu_cursor is None
@@ -131,18 +133,25 @@ def test_decode_listener_populates_menu_cursor_while_menu_open():
     assert state.menu_cursor is DriveMode.HOLD
 
 
-def test_decode_listener_clears_menu_cursor_when_menu_closed():
+def test_decode_listener_tracks_cursor_regardless_of_menu_open_bit():
+    """The session-10 regression: a menu-closed frame must NOT null the
+    cursor. byte 5 bit 7 flickers off mid-walk on the injected path; the
+    on-road-validated path (read_menu_cursor) never consulted it."""
     state = VehicleState()
     listener = _DecodeListener(state)
     listener.on_message_received(
         _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x00, 0, 0, 0x80, _OPEN, 0, 0))))
     assert state.menu_cursor is DriveMode.SPORT
 
-    # menu-open bit clear -> cursor is stale, even though byte 4 is non-zero
+    # menu-open bit clear -> the cursor holds its last reading, not None
     listener.on_message_received(
-        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x08, 0, 0, 0x80, 0x00, 0, 0))))
-    assert state.menu_cursor is None
-    assert state.drive_mode is DriveMode.HOLD  # byte 1 still decoded
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x08, 0, 0, 0x40, 0x00, 0, 0))))
+    assert state.menu_cursor is DriveMode.MOUNTAIN  # byte 4 still tracked
+    assert state.drive_mode is DriveMode.HOLD       # byte 1 still decoded
+
+    # a short frame (no byte 4) leaves the last reading intact
+    listener.on_message_received(_Frame(MODE_STATUS_ADDR, bytes((0x00, 0x08))))
+    assert state.menu_cursor is DriveMode.MOUNTAIN
 
 
 def test_decode_listener_ignores_non_signal_frames():

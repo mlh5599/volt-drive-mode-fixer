@@ -34,10 +34,12 @@ class VehicleState:
     shift: ShiftPosition = ShiftPosition.UNKNOWN
     #: Current drive mode -- stays ``None`` until the first 0x1F4 frame.
     drive_mode: DriveMode | None = None
-    #: Live drive-mode menu cursor (0x1F4 byte 4). Set only while the menu is
-    #: open (byte 5 bit 7); ``None`` when it is closed -- an idle frame carries
-    #: byte 4 == 0x00, which would otherwise read as NORMAL. The reconciler's
-    #: mode walk closes its loop on this (``ModeCycleController`` cursor source).
+    #: Live drive-mode menu cursor (0x1F4 byte 4), newest decode, NOT gated on
+    #: the byte-5 menu-open hint (it flickers mid-walk on the injected path --
+    #: gating stranded this at None and broke the closed loop, session 10).
+    #: 0x00 reads as NORMAL and is also byte 4's resting value, so this is
+    #: only meaningful right after a tap -- which is the only time
+    #: ``ModeCycleController``'s closed loop reads it.
     menu_cursor: DriveMode | None = None
     last_signal_monotonic: float | None = field(default=None)
 

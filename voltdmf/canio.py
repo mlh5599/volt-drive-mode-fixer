@@ -313,13 +313,18 @@ class _DecodeListener(can.Listener):
             mode = signals.decode_drive_mode(data)
             if mode is not None:
                 self._state.drive_mode = mode
-            # byte 4 = the LIVE menu cursor (steps ~40 ms after each tap), but
-            # 0x00 doubles as "menu idle/closed", so only trust it while byte 5
-            # bit 7 says the menu is open. Feeds the reconciler's closed loop.
-            self._state.menu_cursor = (
-                signals.decode_menu_cursor(data)
-                if signals.menu_is_open(data) else None
-            )
+            # byte 4 = the LIVE menu cursor (steps ~40 ms after each tap).
+            # Feed it UNGATED by byte 5 bit 7 (menu-open): that bit flickers
+            # mid-walk on the injected path, so gating on it strands the
+            # cursor at None and the closed-loop walk never matches (session
+            # 10 regression). This mirrors CanInterface.read_menu_cursor --
+            # the source the on-road-validated walk (session 4) used. 0x00
+            # reads as NORMAL and is also byte 4's resting value; harmless,
+            # because menu_cursor is consumed only by _walk_closed_loop and
+            # only while it is actively tapping, where byte 4 is the cursor.
+            cursor = signals.decode_menu_cursor(data)
+            if cursor is not None:
+                self._state.menu_cursor = cursor
         # 0x135 is a known signal frame (keeps mark_signal_seen fresh) but its
         # shifter encoding is messier than 0x1F5 -- not decoded.
         self._state.mark_signal_seen()
