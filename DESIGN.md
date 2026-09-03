@@ -422,13 +422,19 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
 | `reload` | re-read the config file, rebuild the policy | queued → loop thread |
 | `walk-test` | self-test the closed-loop mode walk: cycle every drive mode, score each landing, restore the start mode | queued → sets a flag; the loop thread runs the ~1 min cycle inline (reconciler skipped) and reports on the LCD + journal |
+| `test-mode <on\|off>` | suspend / resume the reconciler for an interactive probe session (in memory — a restart brings protection back) | queued → loop thread sets a flag; the reconcile pass is skipped while on |
+| `probe <mode>` | one operator-chosen closed-loop walk to `<mode>`, densely tracing the `0x1F4` cursor; records a `LANDED` / `CURSOR_ONLY` / `MISS` / `BLOCKED` verdict in `status` + the journal | queued → sets a flag; the loop thread runs it inline with a ~50 ms cursor sampler thread |
 
 > **All commands are implemented.** `setpoint` and the reconciler it
 > feeds landed in Session 9; `tools/button_helper.py`'s SW1 tap now drives a
 > real toggle. `walk-test` (SW1 solo hold ≥ 8 s) drives its own cooldown-free,
 > Park-tolerant `SafetyGate` around the shared controller, so the real 60 s
 > gate and the single-threaded TX path are untouched; it needs the daemon
-> armed and refuses if a run is already queued.
+> armed and refuses if a run is already queued. `test-mode` + `probe`
+> (Session 10) are the focused replacement for blind walk-test debugging: an
+> operator suspends the reconciler, sets a known start mode by hand, asks for
+> one target, and reads the per-tap + dense-sample cursor trace back — see
+> `docs/analysis/session10-walk-probe.md`.
 
 - **Privilege boundary = file mode.** The `.socket` unit binds it
   `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no

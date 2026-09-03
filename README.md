@@ -72,7 +72,8 @@ nowhere until the driver selects HOLD/MOUNTAIN or the SOC-HOLD floor engages.
 The daemon runs permanently as root under systemd; change modes and daemon
 state from an unprivileged account with `voltdmf-ctl` (`status` / `arm` /
 `disarm` / `setpoint <hold|mountain>` / `set-mode <mode>` / `reload` /
-`walk-test`) over its control socket. `voltdmf-ctl disarm` is the mid-drive
+`walk-test` / `test-mode <on|off>` / `probe <mode>`) over its control socket.
+`voltdmf-ctl disarm` is the mid-drive
 stop. See `host/README.md` §"Runtime control" and DESIGN.md §"Runtime
 control". The panel SW1 tap drives `setpoint` and an SW1 solo-hold (≥ 8 s)
 drives `walk-test` — a closed-loop mode-walk self-test that cycles every mode

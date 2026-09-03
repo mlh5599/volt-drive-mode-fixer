@@ -115,6 +115,62 @@ def test_walk_test_request_shape_and_output(tmp_path, capsys):
     assert "hold" in out  # origin
 
 
+def test_test_mode_request_shape_and_output(tmp_path, capsys):
+    with _CannedServer(tmp_path, {"ok": True, "test_mode": True,
+                                  "setpoint": "auto"}) as srv:
+        rc = ctl.main(["--socket", srv.path, "test-mode", "on"])
+    assert rc == 0
+    assert srv.request == {"cmd": "test-mode", "on": True}
+    out = capsys.readouterr().out
+    assert "test-mode ON" in out
+    assert "reconciler suspended" in out
+
+
+def test_test_mode_off_request_shape(tmp_path, capsys):
+    with _CannedServer(tmp_path, {"ok": True, "test_mode": False,
+                                  "setpoint": "auto"}) as srv:
+        rc = ctl.main(["--socket", srv.path, "test-mode", "off"])
+    assert rc == 0
+    assert srv.request == {"cmd": "test-mode", "on": False}
+    assert "test-mode OFF" in capsys.readouterr().out
+
+
+def test_test_mode_rejects_bad_state_at_argparse(tmp_path):
+    with pytest.raises(SystemExit) as ei:
+        ctl.main(["--socket", str(tmp_path / "x"), "test-mode", "maybe"])
+    assert ei.value.code == 2
+
+
+def test_probe_request_shape_and_output(tmp_path, capsys):
+    with _CannedServer(tmp_path, {"ok": True, "started": True, "target": "mountain",
+                                  "origin": "normal", "test_mode": True}) as srv:
+        rc = ctl.main(["--socket", srv.path, "probe", "mountain"])
+    assert rc == 0
+    assert srv.request == {"cmd": "probe", "mode": "mountain"}
+    out = capsys.readouterr().out
+    assert "probe started" in out
+    assert "mountain" in out
+
+
+def test_probe_rejects_bad_mode_at_argparse(tmp_path):
+    with pytest.raises(SystemExit) as ei:
+        ctl.main(["--socket", str(tmp_path / "x"), "probe", "turbo"])
+    assert ei.value.code == 2
+
+
+def test_status_shows_test_mode_and_probe_verdict(tmp_path, capsys):
+    state = {"transmit_enabled": True, "setpoint": "auto", "drive_mode": "normal",
+             "test_mode": True,
+             "probe": {"target": "hold", "verdict": "CURSOR_ONLY", "taps": 4,
+                       "cursor_reached": True, "byte1_after": "normal"}}
+    with _CannedServer(tmp_path, {"ok": True, "state": state}) as srv:
+        rc = ctl.main(["--socket", srv.path, "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "test-mode:  ON" in out
+    assert "hold -> CURSOR_ONLY" in out
+
+
 def test_setpoint_rejects_non_setpoint_mode_at_argparse(tmp_path):
     with pytest.raises(SystemExit) as ei:
         ctl.main(["--socket", str(tmp_path / "x"), "setpoint", "normal"])

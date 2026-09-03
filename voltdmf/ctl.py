@@ -7,6 +7,8 @@
     voltdmf-ctl disarm
     voltdmf-ctl reload
     voltdmf-ctl walk-test
+    voltdmf-ctl test-mode on | off
+    voltdmf-ctl probe normal | sport | mountain | hold
 
 Socket path: ``--socket`` > ``$VOLTDMF_CONTROL_SOCKET`` > the systemd default
 (:data:`voltdmf.control.DEFAULT_SOCKET_PATH`).
@@ -117,6 +119,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         "drive mode, verify each landing, restore the start "
                         "mode. Returns at once -- watch the LCD / journal.",
                    parents=[common])
+    tm = sub.add_parser("test-mode",
+                        help="suspend (on) / resume (off) the reconciler for an "
+                             "interactive probe session. In memory -- a restart "
+                             "brings protection back.",
+                        parents=[common])
+    tm.add_argument("state", choices=["on", "off"])
+    pr = sub.add_parser("probe",
+                        help="one focused closed-loop walk to <mode>, densely "
+                             "tracing the 0x1F4 cursor. Returns at once -- read "
+                             "the verdict from `status` / the journal.",
+                        parents=[common])
+    pr.add_argument("mode", choices=_MODES)
     return ap
 
 
@@ -127,6 +141,10 @@ def _request_for(args: argparse.Namespace) -> dict:
         req["force"] = args.force
     elif args.cmd == "setpoint":
         req["mode"] = args.mode
+    elif args.cmd == "probe":
+        req["mode"] = args.mode
+    elif args.cmd == "test-mode":
+        req["on"] = args.state == "on"
     return req
 
 
@@ -163,6 +181,15 @@ def _print_status(state: dict) -> None:
     cd = state.get("cooldown_remaining_s")
     if cd:
         print(f"cooldown:   {cd}s left")
+    if state.get("test_mode"):
+        print("test-mode:  ON (reconciler suspended)")
+    probe = state.get("probe")
+    if probe:
+        line = (f"probe:      {probe.get('target', '?')} -> {probe.get('verdict', '?')}"
+                f"  (taps={probe.get('taps', '?')}, "
+                f"cursor_reached={probe.get('cursor_reached')}, "
+                f"byte1_after={probe.get('byte1_after')})")
+        print(line)
     if state.get("last_action"):
         print(f"last action:{state['last_action']}")
     if state.get("uptime_s") is not None:
@@ -191,6 +218,15 @@ def _print_human(cmd: str, reply: dict) -> None:
         origin = reply.get("origin", "?")
         print(f"walk-test started (origin {origin}); reconciler paused ~1 min. "
               "Watch the LCD or `voltdmf-ctl status`.")
+    elif cmd == "test-mode":
+        on = reply.get("test_mode")
+        print(f"test-mode {'ON -- reconciler suspended' if on else 'OFF -- reconciler resumed'}"
+              f" (setpoint {reply.get('setpoint', '?')})")
+    elif cmd == "probe":
+        print(f"probe started (target {reply.get('target', '?')}, "
+              f"origin {reply.get('origin', '?')}, "
+              f"test_mode={reply.get('test_mode')}). "
+              "Verdict in `voltdmf-ctl status` / the journal.")
     else:
         print("ok")
 

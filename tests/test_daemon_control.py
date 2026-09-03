@@ -299,6 +299,171 @@ def test_walk_test_cycle_reports_fail_when_a_leg_lands_wrong(monkeypatch):
     assert [leg["ok"] for leg in scored] == [False, True, False, False]
 
 
+# --- test-mode / focused probe -------------------------------------------
+class _ProbeController:
+    """Stands in for ModeCycleController inside _run_probe: switch_to lands
+    the cursor (byte 4), the committed mode (byte 1), both, or neither."""
+
+    def __init__(self, state, *, land_cursor=True, land_byte1=True, taps=3):
+        self._state = state
+        self._land_cursor = land_cursor
+        self._land_byte1 = land_byte1
+        self._taps = taps
+        self.calls = []
+
+    def switch_to(self, target, force=False):
+        self.calls.append((target, force))
+        if self._land_cursor:
+            self._state.menu_cursor = target
+        if self._land_byte1:
+            self._state.drive_mode = target
+        return self._taps
+
+
+def test_test_mode_on_off_toggles_flag_and_suspends_reconcile():
+    d = _daemon()
+    d._reconciler.set_setpoint(DriveMode.HOLD)
+    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+
+    reply = d._handle_command("test-mode", {"on": True})
+    assert reply["ok"] is True and reply["test_mode"] is True
+    assert d._test_mode is True
+    d._reconcile()                       # suspended -> gate untouched
+    assert d._gate.request_calls == []
+
+    assert d._handle_command("test-mode", {"on": False})["test_mode"] is False
+    d._reconcile()                       # resumed -> acts
+    assert d._gate.request_calls == [DriveMode.HOLD]
+
+
+def test_probe_refused_when_disarmed():
+    d = _daemon(start_armed=False)
+    d._state = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    reply = d._handle_command("probe", {"mode": "hold"})
+    assert reply["ok"] is False
+    assert d._probe_pending is None
+    assert d._last_action == "PROBE: DISARMED"
+
+
+def test_probe_refused_without_a_decoded_mode():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.PARK, drive_mode=None)
+    reply = d._handle_command("probe", {"mode": "hold"})
+    assert reply["ok"] is False
+    assert d._last_action == "PROBE: NO BUS"
+    assert d._probe_pending is None
+
+
+def test_probe_unknown_mode_is_rejected():
+    d = _daemon()
+    d._state = _active_state(drive_mode=DriveMode.NORMAL)
+    reply = d._handle_command("probe", {"mode": "ludicrous"})
+    assert reply["ok"] is False
+    assert "unknown mode" in reply["error"]
+
+
+def test_probe_queues_and_refuses_a_second():
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    reply = d._handle_command("probe", {"mode": "mountain"})
+    assert reply == {"ok": True, "started": True, "target": "mountain",
+                     "origin": "normal", "test_mode": False}
+    assert d._probe_pending is DriveMode.MOUNTAIN
+    assert d._handle_command("probe", {"mode": "hold"})["ok"] is False
+    assert d._probe_pending is DriveMode.MOUNTAIN
+
+
+def test_run_probe_landed_when_cursor_and_byte1_reach_target(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+    d._controller = _ProbeController(st)
+
+    d._run_probe(DriveMode.HOLD)
+
+    res = d._probe_result
+    assert res["verdict"] == "LANDED"
+    assert res["ok"] is True
+    assert res["target"] == "hold" and res["origin"] == "normal"
+    assert res["cursor_reached"] is True
+    assert res["byte1_after"] == "hold"
+    assert d._probe_pending is None
+    assert d._last_action == "PROBE HOLD LANDED"
+    json.dumps(d._status_snapshot())         # probe result stays serialisable
+
+
+def test_run_probe_cursor_only_when_byte1_never_commits(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+    d._controller = _ProbeController(st, land_byte1=False)  # parked-car case
+
+    d._run_probe(DriveMode.MOUNTAIN)
+
+    res = d._probe_result
+    assert res["verdict"] == "CURSOR_ONLY"
+    assert res["ok"] is True
+    assert res["cursor_reached"] is True
+    assert res["byte1_after"] == "normal"
+
+
+def test_run_probe_miss_when_cursor_never_arrives(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+    d._controller = _ProbeController(st, land_cursor=False, land_byte1=False)
+
+    d._run_probe(DriveMode.HOLD)
+
+    res = d._probe_result
+    assert res["verdict"] == "MISS"
+    assert res["ok"] is False
+    assert res["cursor_reached"] is False
+
+
+def test_run_probe_blocked_by_precondition(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    # REVERSE is blocking even with allow_park=True
+    st = _active_state(shift=ShiftPosition.REVERSE, drive_mode=DriveMode.NORMAL)
+    d._state = st
+    d._controller = _ProbeController(st)
+
+    d._run_probe(DriveMode.HOLD)
+
+    res = d._probe_result
+    assert res["verdict"] == "BLOCKED"
+    assert res["ok"] is False
+    assert d._controller.calls == []         # never tapped
+
+
+def test_run_probe_arms_and_disarms_the_per_tap_trace(monkeypatch):
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+
+    seen = []
+
+    class _TracingController(_ProbeController):
+        def switch_to(self, target, force=False):
+            d._log_walk_tap(1, target)       # emulate the real tap_observer
+            seen.append(d._trace_active)
+            return super().switch_to(target, force)
+
+    d._controller = _TracingController(st)
+    d._run_probe(DriveMode.SPORT)
+
+    assert seen == [True]                    # trace live during the walk
+    assert d._trace_active is False          # cleared afterwards
+    assert d._trace_tag == "probe"
+    assert d._probe_result["taps_trace"][0]["tap"] == 1
+
+
 # --- reload ----------------------------------------------------------
 _RELOAD_YAML = (
     "policy:\n  default_setpoint: hold\n  hold_threshold_percent: 20\n"

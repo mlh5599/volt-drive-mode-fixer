@@ -71,6 +71,67 @@ WALK_TEST_ORDER = (DriveMode.NORMAL, DriveMode.SPORT,
 #: this doubles as the inter-leg spacing; the real 60 s gate is untouched.
 WALK_TEST_LEG_SETTLE_S = 4.0
 
+#: Focused probe (``voltdmf-ctl probe``): tick of the background cursor
+#: sampler. Fast enough to catch the byte-4 cursor stepping between the 0.2 s
+#: post-tap reads the closed loop actually consults.
+PROBE_SAMPLE_PERIOD_S = 0.05
+
+
+class _CursorSampler(threading.Thread):
+    """Background dense sampler for one :meth:`Daemon._run_probe`.
+
+    Snapshots the two 0x1F4 readbacks (``menu_cursor`` / ``menu_cursor_raw``
+    byte 4, ``drive_mode`` byte 1) plus the menu-open hint every
+    ``PROBE_SAMPLE_PERIOD_S`` and keeps a row whenever any of them changes,
+    with a 1 s heartbeat, timestamped from sampler start. Read-only against
+    :class:`VehicleState` -- it never drives anything; it just puts the whole
+    cursor trajectory on the record so a probe that "searched" is diagnosable
+    from the journal alone. Stops on :meth:`stop`.
+    """
+
+    def __init__(self, state: VehicleState) -> None:
+        super().__init__(name="probe-sampler", daemon=True)
+        self._st = state
+        # NB: not ``self._stop`` -- that name is a method on threading.Thread
+        # and shadowing it breaks join().
+        self._halt = threading.Event()
+        self.samples: list[dict] = []
+        self._t0 = time.monotonic()
+
+    def _row(self, t: float) -> dict:
+        st = self._st
+        return {
+            "t": round(t, 3),
+            "cursor": st.menu_cursor.value if st.menu_cursor else None,
+            "raw": st.menu_cursor_raw,
+            "byte1": st.drive_mode.value if st.drive_mode else None,
+            "open": st.menu_open_hint,
+        }
+
+    def run(self) -> None:
+        last_key: tuple | None = None
+        next_hb = 0.0
+        while not self._halt.is_set():
+            t = time.monotonic() - self._t0
+            row = self._row(t)
+            key = (row["cursor"], row["raw"], row["byte1"], row["open"])
+            if key != last_key or t >= next_hb:
+                self.samples.append(row)
+                if key != last_key:
+                    raw = row["raw"]
+                    log.warning(
+                        "probe sample t=+%.2fs cursor=%s raw=%s byte1=%s open=%s",
+                        t, row["cursor"],
+                        f"0x{raw:02x}" if raw is not None else None,
+                        row["byte1"], row["open"])
+                last_key = key
+                next_hb = t + 1.0
+            self._halt.wait(PROBE_SAMPLE_PERIOD_S)
+
+    def stop(self) -> None:
+        self._halt.set()
+        self.join(timeout=1.0)
+
 
 class Daemon:
     def __init__(self, config: Config, *, channel: str = "can0",
@@ -118,11 +179,24 @@ class Daemon:
         # loop thread runs the ~1 min cycle inline on its next pass (so the TX
         # path stays single-threaded and the reconciler is naturally skipped).
         self._walk_test_pending = False
-        # True only while _run_walk_test_cycle is executing -- gates the
-        # per-tap 0x1F4 trace (_log_walk_tap) so a normal reconcile walk does
-        # not spam the journal.
-        self._walk_test_active = False
         self._walk_test_result: dict | None = None
+
+        # Per-tap 0x1F4 trace shared by the walk-test and the focused probe.
+        # _trace_active gates _log_walk_tap so a normal reconcile walk does not
+        # spam the journal; _trace_tag labels the lines; _trace collects the
+        # structured rows for the status snapshot.
+        self._trace_active = False
+        self._trace_tag = "walk-test"
+        self._trace: list[dict] = []
+
+        # Interactive focused walk probe (voltdmf-ctl test-mode / probe).
+        # test-mode suspends the reconciler so nothing re-asserts a setpoint
+        # between probes; it is in-memory, so a daemon restart resumes
+        # protection on its own. _probe_pending is set by the queued command
+        # and run inline on the loop's next pass (like the walk-test).
+        self._test_mode = False
+        self._probe_pending: DriveMode | None = None
+        self._probe_result: dict | None = None
 
         # SOC poller bookkeeping (see _service_soc_poll).
         self._next_poll_at = 0.0
@@ -178,7 +252,9 @@ class Daemon:
                         self._service_soc_poll(can_if)
                         if self._walk_test_pending:
                             self._run_walk_test_cycle()
-                        else:
+                        elif self._probe_pending is not None:
+                            self._run_probe(self._probe_pending)
+                        elif not self._test_mode:
                             self._reconcile()
                         self._maybe_log_trip()
                     except Exception:  # fail-passive
@@ -219,23 +295,31 @@ class Daemon:
         )
 
     def _log_walk_tap(self, tap: int, target: DriveMode) -> None:
-        """Per-tap 0x1F4 trace, emitted only during a walk-test. The
-        closed-loop match is blind on the injected path -- this line shows what
-        the cursor readback actually did after each tap so a failing leg is
-        diagnosable from the journal alone."""
-        if not self._walk_test_active:
+        """Per-tap 0x1F4 trace, emitted only while a walk-test or focused probe
+        is running. The closed-loop match is blind on the injected path -- this
+        line shows what the cursor readback actually did after each tap so a
+        failing leg is diagnosable from the journal alone. Rows are also kept
+        on ``self._trace`` for the status snapshot."""
+        if not self._trace_active:
             return
         st = self._state
         if st is None:
             return
         raw = st.menu_cursor_raw
+        row = {
+            "tap": tap,
+            "target": target.value,
+            "cursor": st.menu_cursor.value if st.menu_cursor else None,
+            "raw": raw,
+            "byte1": st.drive_mode.value if st.drive_mode else None,
+            "open": st.menu_open_hint,
+        }
+        self._trace.append(row)
         log.warning(
-            "walk-test tap %d -> %s: cursor=%s raw=%s byte1=%s open=%s",
-            tap, target.value,
-            st.menu_cursor.value if st.menu_cursor else None,
+            "%s tap %d -> %s: cursor=%s raw=%s byte1=%s open=%s",
+            self._trace_tag, tap, target.value, row["cursor"],
             f"0x{raw:02x}" if raw is not None else None,
-            st.drive_mode.value if st.drive_mode else None,
-            st.menu_open_hint,
+            row["byte1"], row["open"],
         )
 
     # -- control plane --------------------------------------------------
@@ -290,6 +374,11 @@ class Daemon:
         car should be in and, when armed, ask the gate to walk it there."""
         assert self._state is not None and self._gate is not None
         state = self._state
+        # An interactive probe session owns the mode -- do not re-assert a
+        # setpoint between probes. (The loop already skips this call while
+        # test-mode is on; this guard also covers a direct call.)
+        if self._test_mode:
+            return
         # Just dispatched a walk -- give the ~3 s byte-1 commit lag time to
         # resolve before comparing again (see WALK_SETTLE_S).
         if time.monotonic() < self._walk_settle_until:
@@ -342,9 +431,10 @@ class Daemon:
         mode = st.drive_mode.value if st.drive_mode else "?"
         log.info(
             "trip: soc=%s (%s @%s, age %s) b3=%s floor=%s setpoint=%s "
-            "mode=%s armed=%s replies=%d nrc=%d",
+            "mode=%s armed=%s replies=%d nrc=%d%s",
             soc, raw, resp, age_s, b3, floor, self._reconciler.setpoint_label,
             mode, self._armed, st.uds_replies, st.uds_nrcs,
+            " TEST-MODE" if self._test_mode else "",
         )
 
     def _wait_next(self) -> None:
@@ -386,6 +476,10 @@ class Daemon:
             return self._cmd_reload()
         if name == "walk-test":
             return self._cmd_walk_test()
+        if name == "test-mode":
+            return self._cmd_test_mode(args)
+        if name == "probe":
+            return self._cmd_probe(args)
         return {"ok": False, "error": f"unhandled command {name!r}"}
 
     def _cmd_set_mode(self, args: dict) -> dict:
@@ -499,7 +593,9 @@ class Daemon:
 
         sequence = list(WALK_TEST_ORDER) + [origin]  # cycle every mode, then restore
         legs: list[dict] = []
-        self._walk_test_active = True  # arm the per-tap 0x1F4 trace
+        self._trace = []
+        self._trace_tag = "walk-test"
+        self._trace_active = True  # arm the per-tap 0x1F4 trace
         try:
             for i, target in enumerate(sequence, start=1):
                 restore = i == len(sequence)
@@ -509,7 +605,7 @@ class Daemon:
                     log.warning("walk-test: interrupted by shutdown")
                     break
         finally:
-            self._walk_test_active = False
+            self._trace_active = False
 
         self._manual_target = None
         scored = [leg for leg in legs if not leg["restore"]]
@@ -546,6 +642,142 @@ class Daemon:
                 "ok": ok,
                 "restore": restore}
 
+    # -- focused interactive walk probe (voltdmf-ctl test-mode / probe) -----
+    def _cmd_test_mode(self, args: dict) -> dict:
+        """Suspend or resume the reconciler for an interactive probe session.
+
+        In memory only: a daemon restart comes back with protection live. The
+        SOC poll and the trip log keep running while it is on -- only the
+        mode-enforcing reconcile pass is skipped, so nothing walks the car
+        between probes.
+        """
+        on = bool(args.get("on"))
+        self._test_mode = on
+        self._last_action = "TEST-MODE ON" if on else "TEST-MODE OFF"
+        log.warning("TEST-MODE %s via control socket -- reconciler %s",
+                    "ON" if on else "OFF",
+                    "suspended (probes only)" if on else "resumed")
+        if not on:
+            self._walk_settle_until = 0.0  # let the reconciler re-assert now
+            self._wake.set()
+        return {"ok": True, "test_mode": on,
+                "setpoint": self._reconciler.setpoint_label}
+
+    def _cmd_probe(self, args: dict) -> dict:
+        """Queue one operator-chosen closed-loop walk to ``mode`` with the
+        dense 0x1F4 trace armed. Fire-and-forget: the loop thread runs it on
+        the next pass and records the result in ``status`` (``probe``) + the
+        journal. Independent of test-mode, but meant to be run with test-mode
+        on so the reconciler does not walk the car back between probes."""
+        raw = args.get("mode")
+        try:
+            target = DriveMode(str(raw).lower())
+        except ValueError:
+            return {"ok": False, "error": f"unknown mode {raw!r}"}
+        if not self._transmit_enabled():
+            self._last_action = "PROBE: DISARMED"
+            return {"ok": False,
+                    "error": "daemon disarmed; run `voltdmf-ctl arm` first"}
+        if self._walk_test_pending or self._probe_pending is not None:
+            return {"ok": False, "error": "a walk-test or probe is already queued"}
+        st = self._state
+        if st is None or st.drive_mode is None:
+            self._last_action = "PROBE: NO BUS"
+            return {"ok": False,
+                    "error": "no drive mode decoded yet (bus quiet / car off?)"}
+        self._probe_pending = target
+        self._last_action = f"PROBE {target.value.upper()} QUEUED"
+        self._wake.set()
+        log.warning("probe queued: target=%s origin=%s test_mode=%s",
+                    target.value, st.drive_mode.value, self._test_mode)
+        return {"ok": True, "started": True, "target": target.value,
+                "origin": st.drive_mode.value, "test_mode": self._test_mode}
+
+    def _run_probe(self, target: DriveMode) -> None:
+        """One focused closed-loop walk to ``target``, densely traced. Runs on
+        the loop thread with its own cooldown-free, Park-tolerant SafetyGate
+        around the shared controller -- like a one-leg walk-test, but with a
+        background ~50 ms cursor sampler so the whole byte-4 trajectory is on
+        record, not just the 0.2 s post-tap snapshots the closed loop reads.
+
+        Verdicts:
+
+        * ``LANDED``      -- cursor reached the target during the walk *and*
+          0x1F4 byte 1 reads the target after the commit-watch window.
+        * ``CURSOR_ONLY`` -- cursor reached the target but byte 1 did not
+          commit / reverted (expected on a parked car).
+        * ``MISS``        -- MAX_WALK_TAPS taps, the cursor never got there.
+        * ``BLOCKED``     -- a SafetyGate precondition stopped the walk.
+        """
+        self._probe_pending = None
+        st = self._state
+        if st is None or self._controller is None or st.drive_mode is None:
+            self._probe_result = {"ok": False, "verdict": "ABORT",
+                                  "target": target.value}
+            self._last_action = "PROBE ABORT"
+            log.warning("probe: aborted before start (no mode / no controller)")
+            return
+
+        origin = st.drive_mode
+        gate = SafetyGate(self._controller, cooldown_s=0.0, allow_park=True)
+        self._trace = []
+        self._trace_tag = "probe"
+        sampler = _CursorSampler(st)
+        log.warning("probe: start target=%s origin=%s test_mode=%s",
+                    target.value, origin.value, self._test_mode)
+        self._trace_active = True
+        sampler.start()
+        try:
+            outcome = gate.request_verbose(target, st, force=True)
+        finally:
+            self._trace_active = False
+        cursor_at_end = st.menu_cursor
+        cursor_reached = (
+            (cursor_at_end is not None and cursor_at_end == target)
+            or any(r["cursor"] == target.value for r in self._trace)
+            or any(s["cursor"] == target.value for s in sampler.samples)
+        )
+        log.warning("probe: walk returned taps=%d blocked=%s cursor_reached=%s [%s]",
+                    outcome.presses, outcome.blocked, cursor_reached, outcome.reason)
+        self._stop.wait(WALK_TEST_LEG_SETTLE_S)  # watch byte 1 for a commit
+        sampler.stop()
+        landed = st.drive_mode
+        self._manual_target = None
+
+        if outcome.reason.startswith("blocked:"):
+            verdict = "BLOCKED"
+        elif landed is target and cursor_reached:
+            verdict = "LANDED"
+        elif cursor_reached:
+            verdict = "CURSOR_ONLY"
+        else:
+            verdict = "MISS"
+
+        self._probe_result = {
+            "ok": verdict in ("LANDED", "CURSOR_ONLY"),
+            "verdict": verdict,
+            "target": target.value,
+            "origin": origin.value,
+            "taps": outcome.presses,
+            "blocked": outcome.blocked,
+            "reason": outcome.reason,
+            "cursor_reached": cursor_reached,
+            "cursor_at_walk_end": cursor_at_end.value if cursor_at_end else None,
+            "byte1_after": landed.value if landed else None,
+            "settle_s": WALK_TEST_LEG_SETTLE_S,
+            "taps_trace": list(self._trace),
+            "samples": sampler.samples,
+        }
+        self._last_action = f"PROBE {target.value.upper()} {verdict}"
+        (log.info if verdict == "LANDED" else log.warning)(
+            "probe: DONE target=%s verdict=%s taps=%d cursor_reached=%s "
+            "byte1_after=%s samples=%d",
+            target.value, verdict, outcome.presses, cursor_reached,
+            landed.value if landed else "?", len(sampler.samples),
+        )
+        self._walk_settle_until = 0.0
+        self._wake.set()
+
     def _status_snapshot(self) -> dict:
         st = self._state
         gate = self._gate
@@ -581,6 +813,9 @@ class Daemon:
             "last_action": self._last_action,
             "walk_test": self._walk_test_result,
             "walk_test_running": self._walk_test_pending,
+            "test_mode": self._test_mode,
+            "probe": self._probe_result,
+            "probe_running": self._probe_pending is not None,
             "uptime_s": round(time.monotonic() - self._started, 1),
         }
 
