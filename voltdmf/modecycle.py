@@ -55,11 +55,19 @@ MAX_WALK_PRESSES = 4
 #: Back-compat alias for the pre-menu-model name.
 MAX_PRESSES_PER_BURST = MAX_WALK_PRESSES
 
-#: Hard cap on taps the closed loop will send for one switch: the 4 of the
-#: longest walk plus one recovery lap. Hitting this raises ``ModeSwitchFailed``
-#: rather than hammering the cluster (sustained sub-2 s injection drives the
-#: CAN TEC up and the cluster starts ignoring us).
-MAX_WALK_TAPS = 8
+#: Hard cap on taps the closed loop will send for one switch. Hitting this
+#: raises ``ModeSwitchFailed`` rather than hammering the cluster (sustained
+#: sub-2 s injection drives the CAN TEC up and the cluster starts ignoring us).
+#:
+#: Sized against the measured dropped-tap rate, not just the clean walk. A
+#: single injected frame is occasionally not registered, so a 4-tap walk to
+#: HOLD needs 4 *successes*, not 4 taps. In the 2026-09-03 12-probe run (at a
+#: ~21% drop rate, before the Notifier-race fix) HOLD twice needed 6 and 7
+#: taps -- 8 left almost no headroom, ~1.3% of HOLD walks would have failed.
+#: 12 puts that under 1e-6 even at that drop rate, and costs nothing on a
+#: clean walk because the loop stops the moment the cursor reads the target.
+#: At ~1.6 s per tap the worst case is ~19 s.
+MAX_WALK_TAPS = 12
 
 #: Silence left between the presses *within* a walk -- the "walk-gap".
 #: Bounded on both sides, and the reason the walk used to overshoot:

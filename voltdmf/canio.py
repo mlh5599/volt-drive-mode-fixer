@@ -150,6 +150,11 @@ class CanInterface:
         self._tx_gate = tx_gate
         self._bus: can.BusABC | None = None
         self._notifier: can.Notifier | None = None
+        #: Set by :meth:`start_rx`. While a Notifier is running it owns the
+        #: socket, so the press path reads the live 0x1E1 from here instead of
+        #: racing it with its own ``recv()`` -- see ``_next_button_frame``.
+        self._rx_state: VehicleState | None = None
+        self._last_button_stamp = 0.0
 
     def _tx_suppressed(self) -> bool:
         return self._tx_gate is not None and not self._tx_gate()
@@ -163,11 +168,16 @@ class CanInterface:
         if self._bus is None:
             raise RuntimeError("open() first")
         self._notifier = can.Notifier(self._bus, [_DecodeListener(state)])
+        # From here on the Notifier owns the socket; the press path must take
+        # its live 0x1E1 from the state, not from a competing recv().
+        self._rx_state = state
+        self._last_button_stamp = 0.0
 
     def close(self) -> None:
         if self._notifier is not None:
             self._notifier.stop()
             self._notifier = None
+        self._rx_state = None
         if self._bus is not None:
             self._bus.shutdown()
             self._bus = None
@@ -231,10 +241,23 @@ class CanInterface:
     def _next_button_frame(self, timeout: float) -> bytes | None:
         """Block up to ``timeout`` for the module's NEXT live 0x1E1 (>=7 B).
 
-        Unlike _latest_button_frame this does not drain a backlog -- it
-        returns on the first 0x1E1 off the wire so the caller can reply into
-        the gap right behind it. Same RX-queue caveat: standalone use only.
+        Does not drain a backlog -- it returns on the first 0x1E1 seen so the
+        caller can reply into the gap right behind it.
+
+        Two sources, because there are two callers with different plumbing:
+
+        * **A Notifier is running** (the daemon, via :meth:`start_rx`) -- take
+          the frame the listener stashed in ``VehicleState.button_frame``. The
+          Notifier owns the socket, so calling ``recv()`` here would race its
+          reader thread for every frame and lose most of them. That race was
+          worth ~21% dropped taps in the daemon (2026-09-03) against 0/22 for
+          the same press logic with a single reader, and a dropped tap falls
+          through to the static payload the Gen 1 cluster ignores.
+        * **No Notifier** (tools/set_mode.py, tools/inject_test.py) -- read
+          the socket directly, as before.
         """
+        if self._rx_state is not None:
+            return self._next_button_frame_from_state(timeout)
         if self._bus is None:
             raise RuntimeError("open() first")
         end = time.time() + timeout
@@ -244,6 +267,27 @@ class CanInterface:
                     and len(msg.data) >= 7):
                 return bytes(msg.data)
         return None
+
+    def _next_button_frame_from_state(self, timeout: float) -> bytes | None:
+        """Wait for the RX listener to stash a 0x1E1 we have not used yet.
+
+        Polls rather than blocks -- ``VehicleState`` carries no condition
+        variable, and at the module's ~40 Hz a fresh frame lands within ~25 ms,
+        well inside ``_TRACK_FRAME_TIMEOUT_S``. The ``(payload, stamp)`` tuple
+        is read in one attribute access so we never pair a new payload with an
+        old timestamp.
+        """
+        state = self._rx_state
+        assert state is not None
+        end = time.time() + timeout
+        while True:
+            latest = state.button_frame
+            if latest is not None and latest[1] > self._last_button_stamp:
+                self._last_button_stamp = latest[1]
+                return latest[0]
+            if time.time() >= end:
+                return None
+            time.sleep(0.002)
 
     def send_mode_button_press(self) -> None:
         """Inject ONE logical button press on 0x1E1: a tracking echo press.
@@ -336,6 +380,13 @@ class _DecodeListener(can.Listener):
 
     def on_message_received(self, msg: can.Message) -> None:
         addr = msg.arbitration_id
+        # 0x1E1 is deliberately NOT a "signal" frame (nothing is decoded from
+        # it), but the tracking-echo press needs the module's live counter and
+        # this listener owns the socket. Stash it before the signal gate.
+        if addr == MODE_BUTTON_ADDR:
+            if len(msg.data) >= 7:
+                self._state.button_frame = (bytes(msg.data), time.monotonic())
+            return
         if not signals.is_signal_frame(addr):
             return
         data = bytes(msg.data)
