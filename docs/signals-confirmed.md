@@ -187,13 +187,35 @@ let a stale cursor match a walk target.
 - **One step per tap at ≥ ~1.2 s spacing.** `WALK_GAP_S` = **1.4 s** (clean
   window ~1.2–2.5 s); at 0.75 s taps coalesced into extra steps.
 - **Frame count matters after all** — the cluster **key-repeats** a held
-  button. Steps per press, 3 reps each: 1 → 1, 2 → 1, 3 → 1–2 (marginal),
-  4 → 1, 8 → **2**. `PRESS_TRACK_FRAMES` was **16** (~5–6 rows per "tap"),
-  now **2**. The session-3 note here previously claimed {1,2,3,6,16} were all
+  button, with a measured repeat period of **~50 ms**. Steps per press:
+
+  | frames | steps per tap | notes |
+  |---|---|---|
+  | 16 | ~5–6 | the old `PRESS_TRACK_FRAMES`; the dominant bug |
+  | 8 | 2 | |
+  | 2 | 1, but **double-steps ~1 in 8** | 3/24 across all runs |
+  | **1** | **1, 22/22** | never a double; ~5–10% dropped |
+
+  The session-3 note here previously claimed {1,2,3,6,16} were all
   equivalent; that sweep only ever checked the first step of a N→S→M walk,
-  which a key-repeat overshoot can still satisfy. This was the dominant
-  mode-walk reliability bug — it is why the menu spun at 50–75 ms/step and
-  why a restore leg burned 8 taps without byte 1 ever leaving HOLD.
+  which a key-repeat overshoot can still satisfy. The 16-frame press is why
+  the menu spun at 50–75 ms/step and why a restore leg burned 8 taps without
+  byte 1 ever leaving HOLD.
+
+  The 2-frame double-step was caught live by the probe's dense sampler: on
+  one tap the cursor read `mountain` at t=3.520 and `hold` at t=3.571 — 51 ms
+  apart, i.e. exactly one key-repeat. Two frames (~50 ms of "held") sits
+  right on the repeat boundary.
+
+- **`PRESS_TRACK_FRAMES` is 1, and that is a deliberate trade.** One frame is
+  occasionally *dropped* (~5–10%). That is the right failure: a dropped tap
+  is visible to the closed loop — the cursor simply did not move — and costs
+  one extra tap out of `MAX_WALK_TAPS` (8, against a 4-tap worst case), and
+  the loop's 1.6 s per iteration stays inside the ~3 s menu-open window so
+  nothing commits early. An overshoot commits the **wrong mode** and is not
+  recoverable the same way. Never overshoot; let the closed loop absorb the
+  drops. This is the one thing the closed loop genuinely buys — see the
+  open-loop note above.
 
 ### On-road validation (2026-08-29, session 4 — `tools/drive_log.py`)
 

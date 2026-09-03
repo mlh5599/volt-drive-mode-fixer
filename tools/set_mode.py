@@ -12,7 +12,8 @@ copy of the walk logic), this tool exercises the real shipping code:
 It reads the current mode from 0x1F4 byte 1, then calls
 ``controller.switch_to(target)``. With a ``menu_cursor_source`` wired (this
 tool does) that runs the **closed loop**: tap, read the live menu cursor
-(0x1F4 byte 4), stop the instant it is on the target, let it commit. Then it
+(0x1F4 bytes 4+5), stop the instant it is on the target, let it commit. Then
+it
 polls 0x1F4 byte 1 and prints what the cluster settled on. It does NOT route
 through ``SafetyGate`` -- that gate's preconditions/cooldown are a daemon-loop
 concern; here ``--yes-stationary`` plus the can0 health check are the safety
@@ -25,8 +26,9 @@ and cursor decode re-measured 2026-09-03 with tools/press_calibrate.py):
   * menu open   -> each press steps NORMAL->SPORT->MOUNTAIN->HOLD->..., ONE
                    step per press when presses are >= ~1.2 s apart (closer
                    coalesces into extra steps -- the old overshoot bug) AND
-                   the press is short: the cluster key-repeats a held button,
-                   so >= 8 frames walks 2+ rows on one "tap"
+                   the press is ONE frame: the cluster key-repeats a held
+                   button every ~50 ms, so 2 frames double-steps ~1 run in 8
+                   and 8 frames walks 2 rows on one "tap"
   * ~3 s idle   -> the cursor commits; 0x1F4 byte 1 updates then
   * 0x1F4 bytes 4+5 = ONE field, the live cursor: b4=00 b5=80 NORMAL /
                    b4=80 SPORT / b4=40 MOUNTAIN / b4=20 HOLD / both 00 =
@@ -121,8 +123,9 @@ def main() -> None:
     ap.add_argument("--frames", type=int, default=None,
                     help="bit-7-set frames per tap (default "
                          f"canio.PRESS_TRACK_FRAMES = {canio.PRESS_TRACK_FRAMES}; "
-                         f"keep it <= 4 -- press_calibrate.py measured 8 frames "
-                         f"walking 2 menu rows per tap and 16 walking 5-6)")
+                         f"keep it at 1 -- press_calibrate.py measured 2 frames "
+                         f"double-stepping 1 run in 8, 8 frames walking 2 "
+                         f"rows per tap, and 16 walking 5-6)")
     ap.add_argument("--verify", type=float, default=12.0,
                     help="seconds to poll 0x1F4 byte 1 after the walk (it lags "
                          "a commit ~7-9 s on this car, then may revert parked)")
@@ -206,7 +209,7 @@ def main() -> None:
             sys.exit(f"switch_to refused: {exc}")
         except ModeSwitchFailed as exc:
             print(f"\nclosed loop gave up: {exc}")
-            print("  the live menu cursor (0x1F4 byte 4) never landed on the "
+            print("  the live menu cursor (0x1F4 bytes 4+5) never landed on the "
                   "target. Bounce can0 and let 0x1F4 rest at NORMAL, then "
                   "retry; keep runs short (the cluster rate-limits).")
             sys.exit(1)

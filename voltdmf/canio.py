@@ -57,8 +57,10 @@ log = logging.getLogger(__name__)
 # normally (..83 82 81 80..), then bit 7 clears -- ~350 ms total.
 #
 # We deliberately do NOT replay all ~14: that captured press was long enough
-# to trigger the cluster's key-repeat and walk the menu several rows. A
-# discrete single-step press is ~2 frames (see PRESS_TRACK_FRAMES).
+# to trigger the cluster's key-repeat (~50 ms period) and walk the menu
+# several rows. A discrete single-step press is ONE frame -- see
+# PRESS_TRACK_FRAMES for the on-vehicle numbers. (A human holding the button
+# gets key-repeat too; they just watch the menu and let go.)
 #
 # For PRESS_TRACK_FRAMES iterations we wait for the
 # module's next live 0x1E1, OR 0x80 into its byte 4, and send that back into
@@ -94,17 +96,25 @@ log = logging.getLogger(__name__)
 MODE_STATUS_ADDR = 0x1F4
 MODE_BUTTON_ADDR = 0x1E1
 PRESS_BYTE4 = 0x80               # 0x1E1 byte 4 bit 7 = button pressed
-# Frames with bit 7 set per logical press. MUST stay short: the cluster
-# key-REPEATS a held button, so a long run of "pressed" frames walks the menu
-# several rows on what the caller thinks is one tap. Measured on-vehicle
-# 2026-09-03 (tools/press_calibrate.py, 3 reps each, cursor steps per press):
-#     1 frame -> 1 step    2 frames -> 1 step    4 frames -> 1 step
-#     3 frames -> 1-2 steps (marginal)           8 frames -> 2 steps
-# The old value of 16 was ~5-6 steps per "tap", which is what made the walk
-# unpredictable and left the menu spinning too fast to ever commit. 2 is the
-# smallest value that still gives the cluster a second frame if one is
-# dropped, and sits well clear of the repeat threshold between 4 and 8.
-PRESS_TRACK_FRAMES = 2
+# Frames with bit 7 set per logical press. MUST be exactly 1: the cluster
+# key-REPEATS a held button roughly every 50 ms, so any longer run of
+# "pressed" frames walks the menu extra rows on what the caller thinks is one
+# tap. Measured on-vehicle 2026-09-03 with tools/press_calibrate.py:
+#     16 frames -> ~5-6 steps per tap   (the old value; the dominant bug)
+#      8 frames -> 2 steps
+#      2 frames -> 1 step, but DOUBLE-steps ~1 run in 8 (3/24 across all
+#                  sessions; caught live by the probe sampler, which logged
+#                  the cursor going mountain -> hold 51 ms apart on one tap)
+#      1 frame  -> 1 step, 22/22, never a double
+# 1 frame does occasionally get DROPPED (~5-10%: 1/22 isolated presses, and
+# 1 of 10 presses in a back-to-back walk). That is the right failure to have.
+# A dropped tap is visible to ``ModeCycleController._walk_closed_loop`` -- the
+# cursor simply did not move -- and costs one extra tap out of MAX_WALK_TAPS
+# (8, against a 4-tap worst-case walk), while the loop's 1.6 s per iteration
+# stays inside the ~3 s menu-open window so nothing commits early. An
+# overshoot is not recoverable in the same way: it commits the WRONG mode.
+# So: never overshoot, let the closed loop absorb the drops.
+PRESS_TRACK_FRAMES = 1
 _TRACK_FRAME_TIMEOUT_S = 0.1    # give up waiting for the next live 0x1E1
 RELEASE_GAP_S = 0.75            # min silence after a press = the "button up"
                                 # (reference project's BUTTON_PRESS_COOLDOWN)
