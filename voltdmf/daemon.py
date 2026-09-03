@@ -281,11 +281,13 @@ class Daemon:
         * ``state.drive_mode`` -- 0x1F4 byte 1, the *committed* mode. ``None``
           until the first 0x1F4 frame; :class:`ModeCycleController` turns that
           into a ``ModeUnknownError`` rather than injecting blind.
-        * ``state.menu_cursor`` -- 0x1F4 byte 4, the *live* menu cursor.
+        * ``state.menu_cursor`` -- 0x1F4 bytes 4+5, the *live* menu cursor.
           Passing it makes ``switch_to()`` run the closed loop: tap, let the
           cursor settle, stop the instant it reads the target. Without it the
-          walk is open-loop ``index+1``, only correct from a cold NORMAL menu
-          and wrong from any other current mode.
+          walk is open-loop ``index(target)+1``, which is also correct from
+          any mode -- the menu always opens on NORMAL (measured 2026-09-03,
+          tools/press_calibrate.py). The closed loop buys early exit and a
+          hard failure when a tap does not register, not correctness.
         """
         return ModeCycleController(
             can_if,

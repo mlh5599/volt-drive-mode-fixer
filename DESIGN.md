@@ -144,7 +144,10 @@ just-woken bus does nothing until it can see where the menu cursor is).
 Normal → Sport → Mountain → Hold, so "go to HOLD" means "press N times" where
 N depends on the current mode. The current-mode status signal is confirmed
 (`0x1F4` byte 1), so the controller reads it directly and closes the loop on
-the live menu cursor (`0x1F4` byte 4) rather than blind-counting.
+the live menu cursor (`0x1F4` bytes 4+5) rather than blind-counting. The
+blind count `index(target) + 1` is in fact correct from any mode — the menu
+always opens on NORMAL (measured 2026-09-03) — so the closed loop buys early
+exit and a hard failure on a dropped tap, not correctness.
 
 **Trip Mode (DR5, future work — not building this yet).** The
 [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
@@ -352,7 +355,7 @@ The custom code needed is small and specific to this project:
 5. **Mode-cycle controller** — reads current mode from the status signal
    (`0x1F4` byte 1, confirmed), walks the drive-mode menu to the requested
    `target_mode` along the fixed Normal→Sport→Mountain→Hold cycle order —
-   closing the loop on the live menu cursor (`0x1F4` byte 4) — and sends the
+   closing the loop on the live menu cursor (`0x1F4` bytes 4+5) — and sends the
    taps through the safety wrapper below. This is the one place that needs the
    actual button-press CAN frame; the reconciler and `set-mode` both just ask
    it for a `target_mode` and it doesn't care which asked.
@@ -517,8 +520,9 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   2 prior art; the one frame the daemon transmits. Drove a closed-loop walk
   to all four modes on the road.
 - **Current drive mode → `0x1F4` byte 1** (`0x00`/`0x80`/`0x20`/`0x08` =
-  N/S/M/H) — the daemon's current-mode source. byte 4 is a live menu cursor
-  used to close the loop on a walk.
+  N/S/M/H) — the daemon's current-mode source. Bytes 4+5 are one field, the
+  live menu cursor used to close the loop on a walk (`00`/`80` = NORMAL,
+  `80`/`00` SPORT, `40` MOUNTAIN, `20` HOLD, both `00` = menu closed).
 - **Shift/PRNDL → `0x1F5` byte 3** (`1`–`5` = P/R/N/D/L). `SafetyGate` blocks
   injection unless in DRIVE, and blocks on UNKNOWN.
 - **Ignition/drive-cycle start** — no dedicated signal needed. The Pi is

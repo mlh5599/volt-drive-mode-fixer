@@ -140,36 +140,60 @@ a checked-in file.
   back-to-back blast of a frozen echo (module frames punch through it at
   random points → 0–2 presses per burst, unpredictable).
 
-### `0x1F4` byte 4 — LIVE menu cursor (CONFIRMED 2026-08-29, session 3)
+### `0x1F4` bytes 4+5 — LIVE menu cursor (CORRECTED 2026-09-03, session 10)
 
-Two Pi-side injection sweeps (`explore_frames.py`, `explore_gap.py`; a raw
-socket sampled `0x1F4` while `CanInterface` injected on `0x1E1`):
+**The cursor is ONE field spanning bytes 4 and 5.** Established from a
+2432-frame `0x1F4` capture across a full menu walk. Byte 5 bit 7 is not a
+"menu open" flag — it is the NORMAL cursor code. All 403 frames with that bit
+set carried byte 4 `00`, zero exceptions; a frame with byte 4 ≠ 0 *and* bit 7
+set does not occur on the wire.
 
-| byte | role | codes |
+| b4 | b5 | cursor |
 |---|---|---|
-| **byte 1** | committed mode; moves only on commit, +3.0 s after last tap | `00` N `80` S `20` M `08` H |
-| **byte 4** | **live menu cursor**; steps ~40 ms after each button edge | `00` N `80` S `40` M `20` H |
-| **byte 5** | menu-open hint (`0x80` open); clears at the commit; flickers mid-walk on the injected path | `00` / `80` |
+| `00` | `80` | **NORMAL** |
+| `80` | `00` | **SPORT** |
+| `40` | `00` | **MOUNTAIN** |
+| `20` | `00` | **HOLD** |
+| `00` | `00` | **menu CLOSED** — no cursor (439 frames) |
 
-- Menu **always opens on NORMAL** (seen from HOLD, MOUNTAIN, SPORT starts).
-  Tap 1 opens (cursor → NORMAL, no step); taps 2..N step one row each.
-- **One clean step per tap when taps are ≥ ~1.2 s apart.** Measured
-  overshoot at tighter spacing: 2 taps from NORMAL → SPORT at 1.5–2.0 s,
-  → MOUNTAIN at 0.75–1.0 s, → HOLD at 0.5 s. `WALK_GAP_S` was **0.75** —
-  that was the "steps too far" bug. Now **1.4 s** (clean window ~1.2–2.5 s).
-- **Frame count did not matter**: `PRESS_TRACK_FRAMES` ∈ {1,2,3,6,16} all
-  walked N→S→M cleanly at 1.2 s spacing.
-- New decoders: `signals.decode_menu_cursor()`, `signals.menu_is_open()`;
-  new reader `CanInterface.read_menu_cursor()`.
-- **Do NOT gate the cursor feed on `menu_is_open()`.** Session 10 wired the
-  daemon's closed loop to `state.menu_cursor` and populated it only on
-  frames with byte-5 bit 7 set (nulling it otherwise). That bit flickers off
-  many times per second mid-walk on the injected path, so the cursor read
-  back `None` at almost every check and every non-NORMAL walk-test leg hit
-  `ModeSwitchFailed` after the full 8 taps. Fix: `_DecodeListener` now sets
-  `state.menu_cursor` from byte 4 on every `0x1F4`, ungated — matching
-  `read_menu_cursor()`, the path session 4 validated on-road. Byte 4 `00`
-  → NORMAL is harmless because the cursor is only read mid-walk.
+Byte 1 is unchanged and independent: the *committed* mode (`00` N `80` S
+`20` M `08` H), moving only on commit, +3.0 s after the last tap.
+
+Why this matters: **byte 4 alone cannot tell NORMAL from a closed menu** —
+both are `00`. That single ambiguity produced three wrong fixes in a row,
+each correct against the other's failure and wrong on its own:
+
+- `0652b38` gated `state.menu_cursor` on byte-5 bit 7, so mid-walk (cursor on
+  SPORT/MOUNTAIN/HOLD, bit 7 clear) the cursor read `None` at nearly every
+  check and every non-NORMAL walk-test leg hit `ModeSwitchFailed`.
+- `03daa48` ungated it and read byte 4 alone, so a *closed* menu read as
+  NORMAL — a stale-looking match that can stop a walk early.
+- Both premises were artifacts of decoding byte 4 in isolation. So were the
+  earlier "hold-time ramp" and "flickering menu-open hint" readings.
+
+Decoders: `signals.decode_menu_cursor()` (bytes 4+5, `None` = closed),
+`signals.menu_is_open()`; reader `CanInterface.read_menu_cursor()`.
+`_DecodeListener` assigns `state.menu_cursor` **unconditionally** — the `None`
+is real information (the menu shut), and latching the last value instead would
+let a stale cursor match a walk target.
+
+**Walk timing (re-measured 2026-09-03, `tools/press_calibrate.py`)**
+
+- Menu **always opens on NORMAL**, from any latched mode — confirmed 5/5 by
+  `press_calibrate.py model`. So `presses_to_reach(target)` is
+  `index(target) + 1` from *any* mode, and the open-loop walk was correct all
+  along. The closed loop buys early exit and a hard failure on a dropped tap,
+  not correctness.
+- **One step per tap at ≥ ~1.2 s spacing.** `WALK_GAP_S` = **1.4 s** (clean
+  window ~1.2–2.5 s); at 0.75 s taps coalesced into extra steps.
+- **Frame count matters after all** — the cluster **key-repeats** a held
+  button. Steps per press, 3 reps each: 1 → 1, 2 → 1, 3 → 1–2 (marginal),
+  4 → 1, 8 → **2**. `PRESS_TRACK_FRAMES` was **16** (~5–6 rows per "tap"),
+  now **2**. The session-3 note here previously claimed {1,2,3,6,16} were all
+  equivalent; that sweep only ever checked the first step of a N→S→M walk,
+  which a key-repeat overshoot can still satisfy. This was the dominant
+  mode-walk reliability bug — it is why the menu spun at 50–75 ms/step and
+  why a restore leg burned 8 taps without byte 1 ever leaving HOLD.
 
 ### On-road validation (2026-08-29, session 4 — `tools/drive_log.py`)
 

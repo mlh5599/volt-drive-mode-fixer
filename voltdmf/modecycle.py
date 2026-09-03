@@ -20,16 +20,21 @@ on-car injection sweeps 2026-08-29):
 
 Two readbacks off ``0x1F4`` matter here:
 
-* byte 4 -- the **live menu cursor**, steps ~40 ms after each tap
-  (``signals.decode_menu_cursor``). We close the loop on this: tap, read the
-  cursor, stop once it is on the target, let it commit.
+* bytes 4+5 -- ONE field, the **live menu cursor**, stepping ~40 ms after each
+  tap (``signals.decode_menu_cursor``); ``None`` = menu closed. We close the
+  loop on this: tap, read the cursor, stop once it is on the target, let it
+  commit.
 * byte 1 -- the **committed mode** (``signals.decode_drive_mode``), advisory
   only here: it lags the commit ~3 s and, on a *parked* car, reverts toward
   NORMAL a few seconds later. Callers that need a hard confirmation poll it
   over the following seconds (and really want the car moving).
 
-If no cursor source is wired, :meth:`ModeCycleController.switch_to` falls
-back to the open-loop ``index(target) + 1`` walk (still correct, just blind).
+If no cursor source is wired, :meth:`ModeCycleController.switch_to` falls back
+to the open-loop ``index(target) + 1`` walk. That is correct from *any* start
+mode -- the menu always opens on NORMAL, so the count never depends on where
+you were (measured 2026-09-03, ``tools/press_calibrate.py model``). The closed
+loop buys early exit and a hard failure when a tap does not register, not
+correctness.
 
 This module computes the walk and drives the (injected) transmit function.
 It is deliberately ignorant of *which* trigger asked.

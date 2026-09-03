@@ -30,13 +30,18 @@ log = logging.getLogger(__name__)
 #
 # Confirmed 2026-08-29 on-vehicle: on the Gen 1 HS-CAN (500k) the drive-mode
 # button and the current-mode status share arbitration ID 0x1F4. The body
-# module streams `00 <mode> 00 00 00 00` at ~40 Hz (byte 1 = latched mode). A
-# physical tap drives byte 5 -> 0x80 ("button down"), byte 4 then ramps
-# 80->40->20 while held, and the mode latches ~2-3 s after release.
+# module streams `00 <mode> 00 00 00 00` at ~40 Hz (byte 1 = latched mode).
+# The mode latches ~2-3 s after the last press.
+#
+# (An earlier revision of this note claimed a physical tap sets 0x1F4 byte 5
+# to 0x80 and then "ramps" byte 4 80->40->20 while held. That was a
+# misreading: bytes 4+5 are the MENU CURSOR, and the "ramp" was the cursor
+# advancing NORMAL->SPORT->MOUNTAIN->HOLD under the cluster's key-repeat.
+# See the 0x1F4 block comment in signals.py.)
 #
 # Two different IDs:
-#   MODE_STATUS_ADDR 0x1F4 -- body module streams `00 <mode> 00 00 <ramp>
-#     <btn>` at ~40 Hz; byte 1 = latched mode. READ ONLY (read_drive_mode).
+#   MODE_STATUS_ADDR 0x1F4 -- body module streams `00 <mode> 00 00 <cursor>
+#     <cursor>` at ~40 Hz; byte 1 = latched mode. READ ONLY (read_drive_mode).
 #   MODE_BUTTON_ADDR 0x1E1 -- "ASCMSteeringButton". byte 4 bit 7 = drive-mode
 #     button pressed. This is what we TRANSMIT. Confirmed session 2
 #     (2026-08-29): during a physical press 0x1E1 byte 4 goes 00/01/02/03 ->
@@ -47,11 +52,15 @@ log = logging.getLogger(__name__)
 # Injection model: TRACKING ECHO PRESS.
 # 0x1E1 is NOT a static frame here. byte 4 low 2 bits are a rolling counter,
 # bytes 5-6 are a counter-derived tail, and the module streams the frame at
-# ~40 Hz. A captured *physical* press (session 2, 2026-08-29) is just ~14
+# ~40 Hz. A captured *physical* press (session 2, 2026-08-29) is ~14
 # consecutive frames with byte 4 bit 7 set, the counter still advancing
 # normally (..83 82 81 80..), then bit 7 clears -- ~350 ms total.
 #
-# So we replay exactly that: for PRESS_TRACK_FRAMES iterations, wait for the
+# We deliberately do NOT replay all ~14: that captured press was long enough
+# to trigger the cluster's key-repeat and walk the menu several rows. A
+# discrete single-step press is ~2 frames (see PRESS_TRACK_FRAMES).
+#
+# For PRESS_TRACK_FRAMES iterations we wait for the
 # module's next live 0x1E1, OR 0x80 into its byte 4, and send that back into
 # the ~24 ms gap before the module's next frame. Every injected frame carries
 # the module's current counter + tail (only bit 7 differs), and it lands
@@ -67,10 +76,17 @@ log = logging.getLogger(__name__)
 # long blasts get punched through by module frames at random points, so the
 # cluster saw an unpredictable 0-2 presses per burst.
 #
-# The cluster also RATE-LIMITS: injected presses ~5 s apart register, presses
-# ~2 s apart are all ignored. And this menu takes a wake press first (press 1
-# from an idle menu only lights it up). Both are the caller's problem
-# (ModeCycleController / tools/inject_test.py), not this function's.
+# This menu takes a wake press first: from an idle menu, press 1 only opens
+# it -- and it always opens with the cursor on NORMAL regardless of the
+# current mode (confirmed 2026-09-03; this is why presses_to_reach is
+# index(target)+1 from any mode). Spacing presses ~1.4 s apart registers each
+# one cleanly and stays inside the ~3 s menu-open window. Both are the
+# caller's problem (ModeCycleController), not this function's.
+#
+# (An earlier note here claimed the cluster rate-limits to ~5 s and ignores
+# presses ~2 s apart. That was an artifact of the old 16-frame press: those
+# were being key-repeated into multi-row jumps, not ignored. At 2 frames,
+# 1.4 s spacing is reliable -- measured on-vehicle 2026-09-03.)
 #
 # Injection efficacy is on-road-confirmed: the tracking-echo press drove a
 # closed-loop walk to all four modes (2026-08-29, see the 0x1E1 note in
@@ -78,7 +94,17 @@ log = logging.getLogger(__name__)
 MODE_STATUS_ADDR = 0x1F4
 MODE_BUTTON_ADDR = 0x1E1
 PRESS_BYTE4 = 0x80               # 0x1E1 byte 4 bit 7 = button pressed
-PRESS_TRACK_FRAMES = 16         # bit-7-set frames per press (~14 in a real one)
+# Frames with bit 7 set per logical press. MUST stay short: the cluster
+# key-REPEATS a held button, so a long run of "pressed" frames walks the menu
+# several rows on what the caller thinks is one tap. Measured on-vehicle
+# 2026-09-03 (tools/press_calibrate.py, 3 reps each, cursor steps per press):
+#     1 frame -> 1 step    2 frames -> 1 step    4 frames -> 1 step
+#     3 frames -> 1-2 steps (marginal)           8 frames -> 2 steps
+# The old value of 16 was ~5-6 steps per "tap", which is what made the walk
+# unpredictable and left the menu spinning too fast to ever commit. 2 is the
+# smallest value that still gives the cluster a second frame if one is
+# dropped, and sits well clear of the repeat threshold between 4 and 8.
+PRESS_TRACK_FRAMES = 2
 _TRACK_FRAME_TIMEOUT_S = 0.1    # give up waiting for the next live 0x1E1
 RELEASE_GAP_S = 0.75            # min silence after a press = the "button up"
                                 # (reference project's BUTTON_PRESS_COOLDOWN)
@@ -179,10 +205,16 @@ class CanInterface:
         return self._latest_status(signals.decode_drive_mode, timeout)
 
     def read_menu_cursor(self, timeout: float = 0.5) -> DriveMode | None:
-        """Return the LIVE drive-mode menu cursor (0x1F4 byte 4 -- steps
+        """Return the LIVE drive-mode menu cursor (0x1F4 bytes 4+5 -- steps
         ~40 ms after each button tap; see ``signals.decode_menu_cursor``),
         from the newest frame in the RX queue. Used to close the loop on a
-        walk, so it MUST be current -- see :meth:`_latest_status`."""
+        walk, so it MUST be current -- see :meth:`_latest_status`.
+
+        NOTE ``_latest_status`` keeps only frames that *decode*, so a closed
+        menu (cursor ``None``) is skipped rather than returned here. That is
+        right for this caller -- it polls for the cursor to reach a target --
+        but it is why the daemon's closed loop reads ``state.menu_cursor``
+        instead, which does see the menu close."""
         return self._latest_status(signals.decode_menu_cursor, timeout)
 
     # -- the only transmit path ----------------------------------------
@@ -313,24 +345,18 @@ class _DecodeListener(can.Listener):
             mode = signals.decode_drive_mode(data)
             if mode is not None:
                 self._state.drive_mode = mode
-            # byte 4 = the LIVE menu cursor (steps ~40 ms after each tap).
-            # Feed it UNGATED by byte 5 bit 7 (menu-open): that bit flickers
-            # mid-walk on the injected path, so gating on it strands the
-            # cursor at None and the closed-loop walk never matches (session
-            # 10 regression). This mirrors CanInterface.read_menu_cursor --
-            # the source the on-road-validated walk (session 4) used. 0x00
-            # reads as NORMAL and is also byte 4's resting value; harmless,
-            # because menu_cursor is consumed only by _walk_closed_loop and
-            # only while it is actively tapping, where byte 4 is the cursor.
-            cursor = signals.decode_menu_cursor(data)
-            if cursor is not None:
-                self._state.menu_cursor = cursor
-            # Diagnostics only (walk-test per-tap trace): keep the raw byte-4
-            # code even when it is not in the decode map, plus the byte-5
-            # menu-open hint. Neither drives the closed loop.
-            if len(data) >= 5:
+            # Bytes 4+5 = the LIVE menu cursor (steps ~40 ms after each tap),
+            # or None while the menu is closed. Assign UNCONDITIONALLY: the
+            # None is real information -- it tells the closed-loop walk the
+            # menu has shut, and latching the last cursor instead would let a
+            # stale value match the target and stop a walk early.
+            self._state.menu_cursor = signals.decode_menu_cursor(data)
+            # Diagnostics only (walk-test per-tap trace): the raw byte-4/5
+            # codes, kept even when they decode to nothing. Neither drives the
+            # closed loop.
+            if len(data) >= 6:
                 self._state.menu_cursor_raw = data[4]
-            self._state.menu_open_hint = signals.menu_is_open(data)
+                self._state.menu_open_hint = signals.menu_is_open(data)
         # 0x135 is a known signal frame (keeps mark_signal_seen fresh) but its
         # shifter encoding is messier than 0x1F5 -- not decoded.
         self._state.mark_signal_seen()

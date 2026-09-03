@@ -213,14 +213,20 @@ def decode_speed_mph(data: bytes) -> float | None:
 # body module at ~40 Hz: `00 <mode> 00 00 <cursor> <menu_open>`.
 #   byte 1  latched / committed mode (values below). Changes ONLY on commit,
 #           ~3.0 s after the last button tap.
-#   byte 4  LIVE drive-mode MENU CURSOR -- steps with every button edge, in
-#           walk order, ~40 ms after the tap (00 N / 80 S / 40 M / 20 H).
-#           (An earlier note called this a "hold-time ramp"; the frame-count
-#           sweep on 2026-08-29 showed it is the menu cursor -- one clean step
-#           per tap when taps are >= ~1.2 s apart.)
-#   byte 5  menu-open hint: 0x80 while the drive-mode menu is open, clears
-#           ~3 s after the last tap (coincident with the commit). Flickers
-#           mid-walk on the injected path, so treat as a hint, not gospel.
+#   bytes LIVE drive-mode MENU CURSOR, spanning BOTH byte 4 and byte 5 --
+#   4+5   they are one field, not two. Confirmed 2026-09-03 by a 2432-frame
+#         0x1F4 capture across a full menu walk:
+#             b4=0x00 b5=0x80  cursor on NORMAL   (403 frames)
+#             b4=0x80 b5=0x00  cursor on SPORT
+#             b4=0x40 b5=0x00  cursor on MOUNTAIN
+#             b4=0x20 b5=0x00  cursor on HOLD
+#             b4=0x00 b5=0x00  menu CLOSED, no cursor  (439 frames)
+#         b5 bit 7 was set on 403 frames and every single one carried
+#         b4 == 0x00 -- zero exceptions. So bit 7 is not a "menu open" flag
+#         that happens to flicker; it *is* the NORMAL cursor code, which is
+#         why NORMAL cannot be read out of byte 4 alone. Two earlier readings
+#         of this byte (a "hold-time ramp", then a flickering "menu-open
+#         hint") were both artifacts of decoding byte 4 in isolation.
 # Every one of a 9-transition button walk (NORMAL/SPORT/MOUNTAIN/HOLD dwell +
 # 5 taps) matched byte 1 exactly, in cycle order.
 _DRIVE_MODE_BY_BYTE1: dict[int, DriveMode] = {
@@ -230,20 +236,25 @@ _DRIVE_MODE_BY_BYTE1: dict[int, DriveMode] = {
     0x08: DriveMode.HOLD,
 }
 
-#: 0x1F4 byte 4 -- the live menu cursor. NOTE the byte-4 codes differ from the
+#: 0x1F4 byte 4 -- the non-NORMAL menu-cursor codes. NOTE they differ from the
 #: byte-1 codes: MOUNTAIN is 0x40 here (0x20 in byte 1) and HOLD is 0x20 here
-#: (0x08 in byte 1). NORMAL is 0x00 in both, which is also what an idle
-#: (menu-closed) frame carries -- so a 0x00 cursor is only meaningful right
-#: after a tap.
+#: (0x08 in byte 1). NORMAL is deliberately absent -- it is carried by
+#: ``CURSOR_NORMAL_BIT`` in byte 5, and byte 4 == 0x00 with that bit clear
+#: means the menu is CLOSED.
 _MENU_CURSOR_BY_BYTE4: dict[int, DriveMode] = {
-    0x00: DriveMode.NORMAL,
     0x80: DriveMode.SPORT,
     0x40: DriveMode.MOUNTAIN,
     0x20: DriveMode.HOLD,
 }
 
-#: 0x1F4 byte 5 bit 7 -- drive-mode menu is open.
-MENU_OPEN_BIT = 0x80
+#: 0x1F4 byte 5 bit 7 -- the menu cursor is on NORMAL. This is the NORMAL
+#: cursor code itself (see the block comment above), which is why byte 4 is
+#: always 0x00 whenever it is set.
+CURSOR_NORMAL_BIT = 0x80
+
+#: Back-compat alias for the old (mis-named) constant. Same bit; it does not
+#: mean "menu open" -- use :func:`menu_is_open` for that.
+MENU_OPEN_BIT = CURSOR_NORMAL_BIT
 
 
 def decode_drive_mode(data: bytes) -> DriveMode | None:
@@ -259,24 +270,35 @@ def decode_drive_mode(data: bytes) -> DriveMode | None:
 
 
 def decode_menu_cursor(data: bytes) -> DriveMode | None:
-    """Live drive-mode menu cursor from byte 4 of frame 0x1F4.
+    """Live drive-mode menu cursor from frame 0x1F4, bytes 4 **and** 5.
 
-    This tracks the menu highlight as it walks (one step per button edge),
-    ~40 ms behind the tap -- unlike :func:`decode_drive_mode`, which only
-    moves on the commit ~3 s later. Use it to close the loop on a menu walk.
+    Tracks the menu highlight as it walks (one step per button edge), ~40 ms
+    behind the tap -- unlike :func:`decode_drive_mode`, which only moves on
+    the commit ~3 s later. Use it to close the loop on a menu walk.
 
-    Returns ``None`` for a short frame or an unrecognized value. A ``0x00``
-    result is ``NORMAL`` but is also what an idle/closed frame carries, so
-    only trust it in the window just after a tap.
+    Returns ``None`` when the menu is CLOSED (no cursor to report), and for a
+    short or unrecognized frame. Because closed is now distinguishable from
+    "cursor on NORMAL", the result is trustworthy at any time -- it does not
+    have to be sampled in a window just after a tap.
     """
-    if len(data) < 5:
+    if len(data) < 6:
         return None
-    return _MENU_CURSOR_BY_BYTE4.get(data[4])
+    b4, b5 = data[4], data[5]
+    if b5 & CURSOR_NORMAL_BIT:
+        # NORMAL is signalled in byte 5; byte 4 is always 0x00 alongside it.
+        return DriveMode.NORMAL if b4 == 0x00 else None
+    if b4 == 0x00:
+        return None  # menu closed -- no cursor
+    return _MENU_CURSOR_BY_BYTE4.get(b4)
 
 
 def menu_is_open(data: bytes) -> bool:
-    """True if frame 0x1F4 says the drive-mode menu is currently open."""
-    return len(data) >= 6 and bool(data[5] & MENU_OPEN_BIT)
+    """True if frame 0x1F4 says the drive-mode menu is currently open.
+
+    Equivalent to "a cursor can be read": the menu is open exactly when
+    :func:`decode_menu_cursor` resolves to a mode.
+    """
+    return decode_menu_cursor(data) is not None
 
 
 # --- Shift position (0x1F5 byte 3) -------------------------------------

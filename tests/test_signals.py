@@ -114,6 +114,61 @@ def test_decode_drive_mode_unknown_and_short():
     assert signals.decode_drive_mode(b"\x00") is None
 
 
+# --- menu cursor (0x1F4 bytes 4+5) -------------------------------------
+#
+# Ground truth: a 2432-frame 0x1F4 capture across a full menu walk,
+# 2026-09-03. The cursor is one field spanning bytes 4 AND 5. Every one of
+# the 403 frames with byte-5 bit 7 set carried byte 4 == 0x00.
+def _f4(byte4, byte5, mode=0x00):
+    """A 6-byte 0x1F4 frame: 00 <mode> 00 00 <b4> <b5>."""
+    return bytes([0x00, mode, 0, 0, byte4, byte5])
+
+
+@pytest.mark.parametrize(
+    "byte4,byte5,expected",
+    [
+        (0x00, 0x80, DriveMode.NORMAL),    # NORMAL lives in byte 5
+        (0x80, 0x00, DriveMode.SPORT),
+        (0x40, 0x00, DriveMode.MOUNTAIN),
+        (0x20, 0x00, DriveMode.HOLD),
+        (0x00, 0x00, None),                # menu CLOSED -- not NORMAL
+    ],
+)
+def test_decode_menu_cursor(byte4, byte5, expected):
+    assert signals.decode_menu_cursor(_f4(byte4, byte5)) is expected
+
+
+def test_decode_menu_cursor_closed_is_distinct_from_normal():
+    """The distinction the byte-4-only decode could not make.
+
+    Reading byte 4 alone maps both a closed menu and a NORMAL cursor to 0x00,
+    which is what made every previous walk fix wrong in one direction or the
+    other -- gate on bit 7 and the cursor is always NORMAL; ungate it and a
+    closed menu reads as NORMAL.
+    """
+    assert signals.decode_menu_cursor(_f4(0x00, 0x00)) is None
+    assert signals.decode_menu_cursor(_f4(0x00, 0x80)) is DriveMode.NORMAL
+
+
+def test_decode_menu_cursor_unknown_and_short():
+    assert signals.decode_menu_cursor(_f4(0x11, 0x00)) is None   # unmapped code
+    assert signals.decode_menu_cursor(bytes([0x00, 0x08, 0, 0, 0x40])) is None  # no byte 5
+    assert signals.decode_menu_cursor(b"\x00") is None
+
+
+def test_menu_is_open_tracks_the_cursor():
+    assert signals.menu_is_open(_f4(0x00, 0x80)) is True    # cursor on NORMAL
+    assert signals.menu_is_open(_f4(0x20, 0x00)) is True    # cursor on HOLD
+    assert signals.menu_is_open(_f4(0x00, 0x00)) is False   # closed
+
+
+def test_menu_cursor_is_independent_of_the_committed_mode():
+    """byte 1 lags the commit ~3 s; the cursor must not be read from it."""
+    # committed HOLD (byte1 0x08) while the cursor already sits on SPORT
+    assert signals.decode_menu_cursor(_f4(0x80, 0x00, mode=0x08)) is DriveMode.SPORT
+    assert signals.decode_drive_mode(_f4(0x80, 0x00, mode=0x08)) is DriveMode.HOLD
+
+
 def test_mode_cycle_order():
     assert signals.MODE_CYCLE_ORDER == (
         DriveMode.NORMAL, DriveMode.SPORT, DriveMode.MOUNTAIN, DriveMode.HOLD,

@@ -18,14 +18,20 @@ through ``SafetyGate`` -- that gate's preconditions/cooldown are a daemon-loop
 concern; here ``--yes-stationary`` plus the can0 health check are the safety
 story.
 
-MENU MODEL (owner-observed + on-car injection sweeps 2026-08-29):
-  * menu closed -> any press opens it on NORMAL, whatever mode is latched
+MENU MODEL (owner-observed + on-car injection sweeps 2026-08-29, burst length
+and cursor decode re-measured 2026-09-03 with tools/press_calibrate.py):
+  * menu closed -> any press opens it on NORMAL, whatever mode is latched, so
+                   presses_to_reach(target) is index(target)+1 from ANY mode
   * menu open   -> each press steps NORMAL->SPORT->MOUNTAIN->HOLD->..., ONE
                    step per press when presses are >= ~1.2 s apart (closer
-                   coalesces into extra steps -- the old overshoot bug)
+                   coalesces into extra steps -- the old overshoot bug) AND
+                   the press is short: the cluster key-repeats a held button,
+                   so >= 8 frames walks 2+ rows on one "tap"
   * ~3 s idle   -> the cursor commits; 0x1F4 byte 1 updates then
-  * 0x1F4 byte 4 = the live cursor (00 N / 80 S / 40 M / 20 H); byte 1 = the
-                   committed mode (00 N / 80 S / 20 M / 08 H)
+  * 0x1F4 bytes 4+5 = ONE field, the live cursor: b4=00 b5=80 NORMAL /
+                   b4=80 SPORT / b4=40 MOUNTAIN / b4=20 HOLD / both 00 =
+                   menu CLOSED. Byte 4 alone cannot tell NORMAL from closed.
+  * 0x1F4 byte 1 = the committed mode (00 N / 80 S / 20 M / 08 H)
 
 Car MUST be stationary and in full READY: Park, parking brake set. Capture the
 bus in another shell (``candump -L can0 > /tmp/x.log``) and scan for DTCs
@@ -115,8 +121,8 @@ def main() -> None:
     ap.add_argument("--frames", type=int, default=None,
                     help="bit-7-set frames per tap (default "
                          f"canio.PRESS_TRACK_FRAMES = {canio.PRESS_TRACK_FRAMES}; "
-                         f"the 2026-08-29 sweep found 1..16 all fine -- spacing, "
-                         f"not frame count, drove the overshoot)")
+                         f"keep it <= 4 -- press_calibrate.py measured 8 frames "
+                         f"walking 2 menu rows per tap and 16 walking 5-6)")
     ap.add_argument("--verify", type=float, default=12.0,
                     help="seconds to poll 0x1F4 byte 1 after the walk (it lags "
                          "a commit ~7-9 s on this car, then may revert parked)")

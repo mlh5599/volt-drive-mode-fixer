@@ -34,19 +34,22 @@ class VehicleState:
     shift: ShiftPosition = ShiftPosition.UNKNOWN
     #: Current drive mode -- stays ``None`` until the first 0x1F4 frame.
     drive_mode: DriveMode | None = None
-    #: Live drive-mode menu cursor (0x1F4 byte 4), newest decode, NOT gated on
-    #: the byte-5 menu-open hint (it flickers mid-walk on the injected path --
-    #: gating stranded this at None and broke the closed loop, session 10).
-    #: 0x00 reads as NORMAL and is also byte 4's resting value, so this is
-    #: only meaningful right after a tap -- which is the only time
-    #: ``ModeCycleController``'s closed loop reads it.
+    #: Live drive-mode menu cursor, decoded from 0x1F4 bytes 4 AND 5 together
+    #: (``signals.decode_menu_cursor``), newest frame. ``None`` means the menu
+    #: is CLOSED -- a real reading, not "unknown", so it is assigned
+    #: unconditionally: latching the last cursor instead would let a stale
+    #: value match a walk target and stop the walk early.
     menu_cursor: DriveMode | None = None
-    #: Raw 0x1F4 byte 4 (menu-cursor code), newest frame, whether or not it is
-    #: in the decode map -- walk-test diagnostics so an unmapped cursor code is
-    #: still visible in the per-tap trace. Does not drive the closed loop.
+    #: Raw 0x1F4 byte 4, newest frame, whether or not it is in the decode map
+    #: -- walk-test diagnostics so an unmapped cursor code is still visible in
+    #: the per-tap trace. Does not drive the closed loop. Note byte 4 alone
+    #: cannot distinguish NORMAL from a closed menu (both 0x00); pair it with
+    #: ``menu_open_hint``.
     menu_cursor_raw: int | None = None
-    #: Raw 0x1F4 byte-5 menu-open hint (bit 7), newest frame. Advisory only --
-    #: flickers mid-walk on the injected path (see ``menu_cursor``).
+    #: Whether the menu is open at all, i.e. ``menu_cursor is not None``.
+    #: Diagnostics only. (This was once read off byte-5 bit 7 alone; that bit
+    #: is not an open flag, it is the NORMAL cursor code -- see
+    #: ``signals.CURSOR_NORMAL_BIT``.)
     menu_open_hint: bool = False
     last_signal_monotonic: float | None = field(default=None)
 
