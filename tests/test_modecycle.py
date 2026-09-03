@@ -244,6 +244,34 @@ def test_closed_loop_noop_and_force():
     assert ctl2.switch_to(M, force=True) == 3
 
 
+def test_closed_loop_calls_tap_observer_once_per_tap_with_target():
+    seen = []
+    cur = WalkingCursor()
+    ctl, presser = _closed_controller(
+        [N], cur, tap_observer=lambda tap, target: seen.append((tap, target))
+    )
+    ctl.switch_to(M)  # N(open), S, M -> 3 taps
+    assert seen == [(1, M), (2, M), (3, M)]
+    assert len(seen) == presser.presses
+
+
+def test_tap_observer_not_called_on_the_failure_path_beyond_the_cap():
+    class StuckCursor:
+        def on_tap(self):
+            pass
+
+        def read(self):
+            return N
+
+    seen = []
+    ctl, _ = _closed_controller(
+        [S], StuckCursor(), tap_observer=lambda tap, target: seen.append(tap)
+    )
+    with pytest.raises(ModeSwitchFailed):
+        ctl.switch_to(H)
+    assert seen == list(range(1, MAX_WALK_TAPS + 1))  # one per tap, no more
+
+
 def test_closed_loop_settles_before_reading_cursor():
     sleeps = []
     cur = WalkingCursor()

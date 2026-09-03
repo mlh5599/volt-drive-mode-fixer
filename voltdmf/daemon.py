@@ -118,6 +118,10 @@ class Daemon:
         # loop thread runs the ~1 min cycle inline on its next pass (so the TX
         # path stays single-threaded and the reconciler is naturally skipped).
         self._walk_test_pending = False
+        # True only while _run_walk_test_cycle is executing -- gates the
+        # per-tap 0x1F4 trace (_log_walk_tap) so a normal reconcile walk does
+        # not spam the journal.
+        self._walk_test_active = False
         self._walk_test_result: dict | None = None
 
         # SOC poller bookkeeping (see _service_soc_poll).
@@ -211,6 +215,27 @@ class Daemon:
             can_if,
             lambda: state.drive_mode,
             menu_cursor_source=lambda: state.menu_cursor,
+            tap_observer=self._log_walk_tap,
+        )
+
+    def _log_walk_tap(self, tap: int, target: DriveMode) -> None:
+        """Per-tap 0x1F4 trace, emitted only during a walk-test. The
+        closed-loop match is blind on the injected path -- this line shows what
+        the cursor readback actually did after each tap so a failing leg is
+        diagnosable from the journal alone."""
+        if not self._walk_test_active:
+            return
+        st = self._state
+        if st is None:
+            return
+        raw = st.menu_cursor_raw
+        log.warning(
+            "walk-test tap %d -> %s: cursor=%s raw=%s byte1=%s open=%s",
+            tap, target.value,
+            st.menu_cursor.value if st.menu_cursor else None,
+            f"0x{raw:02x}" if raw is not None else None,
+            st.drive_mode.value if st.drive_mode else None,
+            st.menu_open_hint,
         )
 
     # -- control plane --------------------------------------------------
@@ -474,13 +499,17 @@ class Daemon:
 
         sequence = list(WALK_TEST_ORDER) + [origin]  # cycle every mode, then restore
         legs: list[dict] = []
-        for i, target in enumerate(sequence, start=1):
-            restore = i == len(sequence)
-            self._last_action = f"WALK TEST {i}/{len(sequence)}"
-            legs.append(self._walk_test_leg(gate, target, st, restore=restore))
-            if self._stop.is_set():
-                log.warning("walk-test: interrupted by shutdown")
-                break
+        self._walk_test_active = True  # arm the per-tap 0x1F4 trace
+        try:
+            for i, target in enumerate(sequence, start=1):
+                restore = i == len(sequence)
+                self._last_action = f"WALK TEST {i}/{len(sequence)}"
+                legs.append(self._walk_test_leg(gate, target, st, restore=restore))
+                if self._stop.is_set():
+                    log.warning("walk-test: interrupted by shutdown")
+                    break
+        finally:
+            self._walk_test_active = False
 
         self._manual_target = None
         scored = [leg for leg in legs if not leg["restore"]]

@@ -41,6 +41,13 @@ class VehicleState:
     #: only meaningful right after a tap -- which is the only time
     #: ``ModeCycleController``'s closed loop reads it.
     menu_cursor: DriveMode | None = None
+    #: Raw 0x1F4 byte 4 (menu-cursor code), newest frame, whether or not it is
+    #: in the decode map -- walk-test diagnostics so an unmapped cursor code is
+    #: still visible in the per-tap trace. Does not drive the closed loop.
+    menu_cursor_raw: int | None = None
+    #: Raw 0x1F4 byte-5 menu-open hint (bit 7), newest frame. Advisory only --
+    #: flickers mid-walk on the injected path (see ``menu_cursor``).
+    menu_open_hint: bool = False
     last_signal_monotonic: float | None = field(default=None)
 
     def mark_signal_seen(self) -> None:

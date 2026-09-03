@@ -325,6 +325,12 @@ class _DecodeListener(can.Listener):
             cursor = signals.decode_menu_cursor(data)
             if cursor is not None:
                 self._state.menu_cursor = cursor
+            # Diagnostics only (walk-test per-tap trace): keep the raw byte-4
+            # code even when it is not in the decode map, plus the byte-5
+            # menu-open hint. Neither drives the closed loop.
+            if len(data) >= 5:
+                self._state.menu_cursor_raw = data[4]
+            self._state.menu_open_hint = signals.menu_is_open(data)
         # 0x135 is a known signal frame (keeps mark_signal_seen fresh) but its
         # shifter encoding is messier than 0x1F5 -- not decoded.
         self._state.mark_signal_seen()

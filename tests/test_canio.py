@@ -133,6 +133,24 @@ def test_decode_listener_populates_menu_cursor_from_byte4():
     assert state.menu_cursor is DriveMode.HOLD
 
 
+def test_decode_listener_records_raw_cursor_and_open_hint_for_diagnostics():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+
+    # an unmapped byte-4 code: decoded cursor stays None, raw is still captured
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x00, 0, 0, 0x11, _OPEN, 0, 0))))
+    assert state.menu_cursor is None
+    assert state.menu_cursor_raw == 0x11
+    assert state.menu_open_hint is True
+
+    # menu-open bit clear -> hint follows it even though the cursor holds
+    listener.on_message_received(
+        _Frame(MODE_STATUS_ADDR, bytes((0x00, 0x00, 0, 0, 0x40, 0x00, 0, 0))))
+    assert state.menu_cursor_raw == 0x40
+    assert state.menu_open_hint is False
+
+
 def test_decode_listener_tracks_cursor_regardless_of_menu_open_bit():
     """The session-10 regression: a menu-closed frame must NOT null the
     cursor. byte 5 bit 7 flickers off mid-walk on the injected path; the

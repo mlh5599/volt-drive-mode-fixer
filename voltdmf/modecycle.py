@@ -149,12 +149,18 @@ class ModeCycleController:
         *,
         menu_cursor_source: Callable[[], DriveMode | None] | None = None,
         on_presses_sent: Callable[[int], None] | None = None,
+        tap_observer: Callable[[int, DriveMode], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._presser = presser
         self._current_mode_source = current_mode_source
         self._menu_cursor_source = menu_cursor_source
         self._on_presses_sent = on_presses_sent
+        #: Optional diagnostics hook: called once per closed-loop tap, after
+        #: the cursor settle, with ``(tap_number, target)``. The daemon wires
+        #: this to log the per-tap 0x1F4 cursor/raw/byte-1 trace during a
+        #: walk-test. Never affects control flow.
+        self._tap_observer = tap_observer
         self._sleep = sleep
 
     def switch_to(self, target: DriveMode, *, force: bool = False) -> int:
@@ -217,7 +223,10 @@ class ModeCycleController:
             self._presser.send_mode_button_press()
             taps += 1
             self._sleep(CURSOR_SETTLE_S)
-            if self._menu_cursor_source() == target:
+            cursor = self._menu_cursor_source()
+            if self._tap_observer is not None:
+                self._tap_observer(taps, target)
+            if cursor == target:
                 self._report(target)
                 return taps
             self._sleep(WALK_GAP_S)
