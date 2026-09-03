@@ -87,11 +87,10 @@ Hard rules for every tier:
 3. **Keep both `wifi_failover` NM profiles** (home IOT priority 100, phone
    hotspot priority 50). The phone hotspot is the field rescue path if the
    home SSID is unreachable.
-4. **Do not mask `wpa_supplicant`** unless it is first confirmed that NM on
-   this box does not drive that unit (NM can spawn its own supplicant via
-   D-Bus, or it can rely on `wpa_supplicant.service` — verify with
-   `systemctl status wpa_supplicant` + `nmcli dev` after a test disable).
-   The saving is marginal; not worth the risk.
+4. **Do not mask `wpa_supplicant`.** Checked 2026-09-03: `wpa_supplicant.service`
+   is `enabled` **and `active`** — NM on this box drives the standalone unit
+   rather than a D-Bus-spawned supplicant, so masking it would drop Wi-Fi.
+   The saving is marginal; it is off the table.
 5. **Only mask `avahi-daemon` if `voltpi.local` is genuinely unused** —
    Unbound (`voltpi.haguehome.lan`) and Tailscale MagicDNS (`voltpi`) both
    work without it, but confirm before removing mDNS.
@@ -103,14 +102,17 @@ Verify-before-disable checklist for Tier 2 (cloud-init):
 - `ls /etc/netplan/` and `ls /etc/NetworkManager/system-connections/` — the
   Wi-Fi profiles must be `wifi_failover`-written keyfiles, not
   cloud-init-rendered netplan that would stop regenerating.
+  **Checked 2026-09-03: `/etc/netplan/` is empty; `nmcli dev` shows `wlan0`
+  connected via the `home-iot` keyfile. No netplan to strand — Tier 2 is
+  network-safe.**
 - `cloud-init query --format '{{ ds }}'` / check `/etc/cloud/cloud.cfg.d/`
   for a `*networking*` or `99-installer*` drop-in.
 - Disable via `/etc/cloud/cloud-init.disabled` (leaves already-rendered
   config in place); do **not** `apt purge` until a reboot proves the network
   survives.
-- Also check for `systemd-networkd-wait-online.service` — a second boot
-  barrier that is often enabled and does nothing useful here (NM owns wlan0).
-  Disable it alongside `NetworkManager-wait-online`.
+- `systemd-networkd-wait-online.service` — **checked 2026-09-03: already
+  `disabled`.** Only `NetworkManager-wait-online.service` (`enabled`) is left
+  on the boot path for Tier 3 to take.
 
 ## Tiered plan
 
@@ -171,8 +173,8 @@ Mask: `udisks2`, `ModemManager`, `e2scrub_reap` + `e2scrub_all.timer`,
 the background.
 
 Conditional (verify first — see "Connectivity guarantee"):
-`avahi-daemon`(+socket) only if `voltpi.local` is unused; `wpa_supplicant`
-only if NM does not drive that unit.
+`avahi-daemon`(+socket) only if `voltpi.local` is unused. **Not
+`wpa_supplicant`** — confirmed load-bearing on this box (2026-09-03).
 
 **Never mask:** `NetworkManager`, `ssh`, `tailscaled`. Keep: `node_exporter`,
 `cron`, `systemd-timesyncd`, `voltdmf*`. Put the mask list in the role as
