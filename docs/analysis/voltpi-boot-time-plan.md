@@ -46,7 +46,9 @@ Other findings:
 - rootfs is plain `rw` ext4 — **no overlayroot**. The SD card takes writes
   every boot; a power-yank mid-write risks fs corruption -> fsck -> slow or
   failed boot.
-- `wpa_supplicant` and NetworkManager both enabled (redundant on Bookworm/NM).
+- `wpa_supplicant` and NetworkManager both enabled — may be redundant on
+  Bookworm/NM, but confirm NM does not drive the unit before touching it
+  (see "Connectivity guarantee").
 - BT hardware already off (`dtoverlay=disable-bt`); `bluetooth`/`hciuart`
   inactive but still `enabled`.
 - Enabled cruft: avahi-daemon, udisks2, e2scrub_reap, keyboard-setup,
@@ -57,6 +59,58 @@ Other findings:
   network). The daemon runs entirely on `time.monotonic()`, so dropping the
   network wait does not affect its logic — only journal timestamps drift
   until sync.
+
+## Connectivity guarantee (headless box)
+
+This Pi has no screen or keyboard — the only way in is SSH over Wi-Fi
+(`voltpi.haguehome.lan`) or Tailscale (`voltpi`). Every change below must
+leave Wi-Fi **coming up on its own every boot**. The distinction that makes
+this safe:
+
+- The headless requirement is "Wi-Fi *comes up*", **not** "boot *waits* for
+  Wi-Fi". `NetworkManager` brings the link up either way. Tiers 1 and 3 only
+  remove the *barrier units* that make other services block until it is up —
+  they do not touch NM or the radio. SSH, Tailscale, and node_exporter all
+  tolerate the network arriving a few seconds later (they listen on a
+  wildcard / retry).
+- Tiers 2–3 actually get Wi-Fi up **sooner**: cloud-init off and the
+  pre-`sysinit` chain shortened means `NetworkManager.service` starts
+  earlier, so time-to-SSH improves.
+
+Hard rules for every tier:
+
+1. **`NetworkManager.service` stays enabled and unmasked.** It is the thing
+   that connects Wi-Fi. Not on any mask list. Do not add `After=` deps to it.
+2. **Keep `cfg80211.ieee80211_regdom=US` on `cmdline.txt`** through all
+   Tier 4 edits — it is the Wi-Fi regulatory domain; without it the radio can
+   come up soft-blocked or with no usable channels.
+3. **Keep both `wifi_failover` NM profiles** (home IOT priority 100, phone
+   hotspot priority 50). The phone hotspot is the field rescue path if the
+   home SSID is unreachable.
+4. **Do not mask `wpa_supplicant`** unless it is first confirmed that NM on
+   this box does not drive that unit (NM can spawn its own supplicant via
+   D-Bus, or it can rely on `wpa_supplicant.service` — verify with
+   `systemctl status wpa_supplicant` + `nmcli dev` after a test disable).
+   The saving is marginal; not worth the risk.
+5. **Only mask `avahi-daemon` if `voltpi.local` is genuinely unused** —
+   Unbound (`voltpi.haguehome.lan`) and Tailscale MagicDNS (`voltpi`) both
+   work without it, but confirm before removing mDNS.
+6. After **every** reboot that follows a Tier 2 / 4 change, confirm SSH-in
+   works before moving on. Have the SD reader on hand for Tier 4.
+
+Verify-before-disable checklist for Tier 2 (cloud-init):
+
+- `ls /etc/netplan/` and `ls /etc/NetworkManager/system-connections/` — the
+  Wi-Fi profiles must be `wifi_failover`-written keyfiles, not
+  cloud-init-rendered netplan that would stop regenerating.
+- `cloud-init query --format '{{ ds }}'` / check `/etc/cloud/cloud.cfg.d/`
+  for a `*networking*` or `99-installer*` drop-in.
+- Disable via `/etc/cloud/cloud-init.disabled` (leaves already-rendered
+  config in place); do **not** `apt purge` until a reboot proves the network
+  survives.
+- Also check for `systemd-networkd-wait-online.service` — a second boot
+  barrier that is often enabled and does nothing useful here (NM owns wlan0).
+  Disable it alongside `NetworkManager-wait-online`.
 
 ## Tiered plan
 
@@ -80,11 +134,15 @@ now, earlier once Tier 2 shortens the pre-sysinit chain).
 Nothing on this host needs it. Removes `cloud-init-main` (3.2 s) +
 `cloud-init-local` (1.0 s) from the chain and unblocks `sysinit.target`.
 
-### Tier 3 — `NetworkManager-wait-online` off the boot path  ·  ≈ −3.8 s
+### Tier 3 — network `wait-online` barriers off the boot path  ·  ≈ −3.8 s
 
-`systemctl disable NetworkManager-wait-online.service`. Once Tier 1 lands,
-nothing should block boot on the network. Keep NetworkManager itself (the
-`wifi_failover` role needs it).
+`systemctl disable NetworkManager-wait-online.service` (and
+`systemd-networkd-wait-online.service` if enabled). These are **barrier
+units only** — they hold `network-online.target` until a link is up. NM
+still associates Wi-Fi in the background exactly as before; the link is not
+guaranteed present at a fixed point in boot, which is fine because nothing
+on this box needs to *block* on it. **Keep `NetworkManager.service` itself
+enabled** — it is what brings Wi-Fi up.
 
 **Tiers 1–3 together: `voltdmf` active in ~6–8 s instead of ~19–25 s.**
 All reversible, all ansible-managed, no reboot-bricking risk.
@@ -106,15 +164,19 @@ All reversible, all ansible-managed, no reboot-bricking risk.
 
 ### Tier 5 — mask unused services  ·  ≈ −1–3 s + less 4-core contention  ·  ansible
 
-Mask: `avahi-daemon`(+socket), `udisks2`, `ModemManager`, `wpa_supplicant`,
-`e2scrub_reap` + `e2scrub_all.timer`, `keyboard-setup`, `console-setup`,
-`rpi-eeprom-update`, `systemd-pstore`, `bluetooth`, and the background-work
-timers (`apt-daily*`, `man-db`, `system-upgrade-check`,
-`binary-version-check`) — a car Pi should not apt in the background.
+Mask: `udisks2`, `ModemManager`, `e2scrub_reap` + `e2scrub_all.timer`,
+`keyboard-setup`, `console-setup`, `rpi-eeprom-update`, `systemd-pstore`,
+`bluetooth`, and the background-work timers (`apt-daily*`, `man-db`,
+`system-upgrade-check`, `binary-version-check`) — a car Pi should not apt in
+the background.
 
-Keep: ssh, NetworkManager, tailscaled, node_exporter, cron, timesyncd,
-voltdmf*. Put this in the role as a declarative list so it survives a
-reimage.
+Conditional (verify first — see "Connectivity guarantee"):
+`avahi-daemon`(+socket) only if `voltpi.local` is unused; `wpa_supplicant`
+only if NM does not drive that unit.
+
+**Never mask:** `NetworkManager`, `ssh`, `tailscaled`. Keep: `node_exporter`,
+`cron`, `systemd-timesyncd`, `voltdmf*`. Put the mask list in the role as
+declarative state so it survives a reimage.
 
 ### Tier 6 — structural, next reimage  ·  optional
 
