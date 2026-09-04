@@ -16,17 +16,17 @@ from voltdmf.signals import DriveMode, ShiftPosition
 from voltdmf.state import VehicleState
 
 
-def _config(*, position="hold", **over):
+def _config(*, position="hold-soc", **over):
     raw = {
         "policy": {"default_position": position, "hold_threshold_percent": 30,
-                   "hold_reset_percent": 41, "bar_failsafe_raw": 9},
+                   "bar_failsafe_raw": 9},
         "soc_poll": {"enabled": True, "period_seconds": 10},
     }
     raw.update(over)
     return parse_config(raw)
 
 
-def _daemon(*, start_armed=True, config_path=None, position="hold"):
+def _daemon(*, start_armed=True, config_path=None, position="hold-soc"):
     return Daemon(_config(position=position), lcd=False, start_armed=start_armed,
                   control_enabled=False, config_path=config_path)
 
@@ -51,6 +51,11 @@ class _FakeGate:
 
 def _active_state(**kw):
     st = VehicleState(**kw)
+    if st.soc_percent is not None:
+        # A percentage only counts as a poll reading, and the reconciler only
+        # trusts a fresh one -- so stamp it like a real reply would.
+        st.soc_percent_monotonic = time.monotonic()
+        st.soc_source = "poll"
     st.mark_signal_seen()
     return st
 
@@ -110,14 +115,15 @@ def test_set_mode_blocked_outcome_is_not_ok_and_no_override():
     assert d._manual_target is None
 
 
-# --- setpoint (the three-position selector) ---------------------------
+# --- setpoint (the four-position selector) ----------------------------
 def test_setpoint_jumps_to_an_explicit_detent():
     d = _daemon()
-    assert d._reconciler.position is Position.HOLD
+    assert d._reconciler.position is Position.HOLD_SOC
     reply = d._handle_command("setpoint", {"mode": "mountain"})
     assert reply["ok"] is True
     assert reply["setpoint"] == "mountain"
-    assert reply["previous"] == "hold"
+    assert reply["previous"] == "hold-soc"
+    assert reply["description"] == "enforce mountain mode"
     assert d._reconciler.position is Position.MOUNTAIN
 
 
@@ -125,17 +131,17 @@ def test_setpoint_next_walks_the_sw1_cycle_and_wraps():
     """What an SW1 tap sends. The daemon owns the cycle, not the helper."""
     d = _daemon()
     seen = []
-    for _ in range(4):
+    for _ in range(5):
         seen.append(d._handle_command("setpoint", {"mode": "next"})["setpoint"])
-    assert seen == ["mountain", "off", "hold", "mountain"]
+    assert seen == ["hold-now", "mountain", "off", "hold-soc", "hold-now"]
 
 
-@pytest.mark.parametrize("bad", ["normal", "sport", "auto", "ludicrous"])
+@pytest.mark.parametrize("bad", ["normal", "sport", "ludicrous"])
 def test_setpoint_rejects_a_non_detent(bad):
     d = _daemon()
     reply = d._handle_command("setpoint", {"mode": bad})
     assert reply["ok"] is False
-    assert d._reconciler.position is Position.HOLD
+    assert d._reconciler.position is Position.HOLD_SOC
 
 
 # --- reconcile -----------------------------------------------------
@@ -167,10 +173,10 @@ def test_reconcile_noop_when_already_in_desired_mode():
     assert d._gate.request_calls == []
 
 
-def test_reconcile_noop_on_the_hold_detent_with_a_healthy_pack():
-    """Position 1 is passive above the floor -- the shipped boot behaviour."""
+def test_reconcile_noop_on_the_hold_soc_detent_with_a_healthy_pack():
+    """Detent 1 is passive above the floor -- the shipped boot behaviour."""
     d = _daemon()
-    assert d._reconciler.position is Position.HOLD
+    assert d._reconciler.position is Position.HOLD_SOC
     d._state = _active_state(shift=ShiftPosition.DRIVE,
                              drive_mode=DriveMode.NORMAL, soc_percent=80)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
@@ -192,11 +198,34 @@ def test_reconcile_noop_on_the_off_detent_even_with_a_flat_pack():
 def test_reconcile_walks_to_hold_when_the_soc_floor_engages():
     d = _daemon()                               # passive detent...
     d._state = _active_state(shift=ShiftPosition.DRIVE,
-                             drive_mode=DriveMode.NORMAL, soc_bar_raw=9)
+                             drive_mode=DriveMode.NORMAL, soc_percent=28.0)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._reconcile()                              # ...until the floor engages
     assert d._gate.request_calls == [DriveMode.HOLD]
     assert d._reconciler.floor_latched is True
+
+
+def test_reconcile_holds_now_from_the_first_pass_on_the_hold_now_detent():
+    """Detent 2 does not wait for the pack -- "bank what I have, starting now"."""
+    d = _daemon(position="hold-now")
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.NORMAL, soc_percent=95.0)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == [DriveMode.HOLD]
+    assert d._reconciler.floor_latched is False   # enforced, not floored
+
+
+def test_reconcile_does_not_latch_off_b3_alone_at_boot():
+    """The latch is permanent for the key cycle now, so the coarse b3 proxy
+    must not commit the drive before the 22 005B poll has had a chance."""
+    d = _daemon()
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.NORMAL, soc_bar_raw=9)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []
+    assert d._reconciler.floor_latched is False
 
 
 def test_reconcile_waits_for_a_decodable_current_mode():
@@ -533,8 +562,10 @@ def test_run_probe_miss_when_cursor_never_arrives(monkeypatch):
 def test_run_probe_blocked_by_precondition(monkeypatch):
     monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
     d = _daemon()
-    # REVERSE is blocking even with allow_park=True
-    st = _active_state(shift=ShiftPosition.REVERSE, drive_mode=DriveMode.NORMAL)
+    # Shift no longer blocks anything; an implausible speed still does, since
+    # it means the frames we are decoding are garbage.
+    st = _active_state(shift=ShiftPosition.REVERSE, speed_mph=250,
+                       drive_mode=DriveMode.NORMAL)
     d._state = st
     d._controller = _ProbeController(st)
 
@@ -571,8 +602,8 @@ def test_run_probe_arms_and_disarms_the_per_tap_trace(monkeypatch):
 
 # --- reload ----------------------------------------------------------
 _RELOAD_YAML = (
-    "policy:\n  default_position: hold\n  hold_threshold_percent: 20\n"
-    "  hold_reset_percent: 35\n  bar_failsafe_raw: 8\n"
+    "policy:\n  default_position: hold-soc\n  hold_threshold_percent: 20\n"
+    "  bar_failsafe_raw: 8\n"
     "soc_poll:\n  enabled: true\n  period_seconds: 15\n"
 )
 
@@ -618,7 +649,9 @@ def test_status_snapshot_is_json_serialisable():
     assert snap["armed"] is True
     assert snap["transmit_enabled"] is True
     assert snap["drive_mode"] == "normal"
-    assert snap["setpoint"] == "hold"
+    assert snap["setpoint"] == "hold-soc"
+    assert snap["position_index"] == 1
+    assert snap["cycle"] == ["hold-soc", "hold-now", "mountain", "off"]
     assert snap["floor_latched"] is False
     assert "dry_run" not in snap
 
@@ -649,3 +682,20 @@ def test_can_tx_gate_absent_means_enabled():
     iface = CanInterface.__new__(CanInterface)
     iface._tx_gate = None
     assert iface._tx_suppressed() is False
+
+
+# --- LCD watch-screen line ---------------------------------------------
+@pytest.mark.parametrize("position", ["hold-soc", "hold-now", "mountain", "off"])
+@pytest.mark.parametrize("armed", [True, False])
+def test_lcd_status_fits_the_watch_screen(position, armed):
+    """The bottom row is 20 columns; a longer line is silently truncated on
+    the panel, which is exactly where the driver reads it."""
+    d = _daemon(position=position, start_armed=armed)
+    assert len(d._lcd_status()) <= 20
+    d._reconciler._floor_latched = True
+    assert len(d._lcd_status()) <= 20
+
+
+def test_lcd_status_distinguishes_the_two_hold_detents():
+    assert "HOLD" in _daemon(position="hold-now")._lcd_status()
+    assert "30%" in _daemon(position="hold-soc")._lcd_status()

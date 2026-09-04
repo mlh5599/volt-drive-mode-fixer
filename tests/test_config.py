@@ -7,9 +7,8 @@ from voltdmf.reconciler import Position
 def _valid() -> dict:
     return {
         "policy": {
-            "default_position": "hold",
+            "default_position": "hold-soc",
             "hold_threshold_percent": 30,
-            "hold_reset_percent": 41,
             "bar_failsafe_raw": 9,
         },
         "soc_poll": {"enabled": True, "period_seconds": 10},
@@ -18,15 +17,15 @@ def _valid() -> dict:
 
 def test_parse_valid():
     cfg = parse_config(_valid())
-    assert cfg.policy.default_position is Position.HOLD
+    assert cfg.policy.default_position is Position.HOLD_SOC
     assert cfg.policy.hold_threshold_percent == 30
-    assert cfg.policy.hold_reset_percent == 41
     assert cfg.policy.bar_failsafe_raw == 9
     assert cfg.soc_poll.enabled is True
     assert cfg.soc_poll.period_seconds == 10
 
 
-@pytest.mark.parametrize("name,want", [("mountain", Position.MOUNTAIN),
+@pytest.mark.parametrize("name,want", [("hold-now", Position.HOLD_NOW),
+                                       ("mountain", Position.MOUNTAIN),
                                        ("off", Position.OFF)])
 def test_every_detent_parses(name, want):
     raw = _valid()
@@ -42,12 +41,14 @@ def test_legacy_default_setpoint_key_still_read():
     assert parse_config(raw).policy.default_position is Position.MOUNTAIN
 
 
-def test_legacy_auto_maps_to_hold():
-    """`auto` was the old name for passive-with-floor, now called `hold`."""
+@pytest.mark.parametrize("legacy", ["auto", "hold"])
+def test_legacy_names_map_to_hold_soc(legacy):
+    """`auto` (two-way toggle) and `hold` (three-position cycle) both named
+    what is now `hold-soc`, so a config.yaml from either era keeps loading."""
     raw = _valid()
     del raw["policy"]["default_position"]
-    raw["policy"]["default_setpoint"] = "auto"
-    assert parse_config(raw).policy.default_position is Position.HOLD
+    raw["policy"]["default_setpoint"] = legacy
+    assert parse_config(raw).policy.default_position is Position.HOLD_SOC
 
 
 def test_both_position_keys_is_an_error():
@@ -64,11 +65,16 @@ def test_missing_position_key():
         parse_config(raw)
 
 
-def test_reset_must_exceed_threshold():
+def test_retired_hold_reset_percent_is_warned_about_not_rejected(caplog):
+    """The floor latches for the key cycle now, so the release percent is
+    gone. A host that has not converged yet must still boot."""
     raw = _valid()
-    raw["policy"]["hold_reset_percent"] = 30
-    with pytest.raises(ConfigError, match="hold_reset_percent"):
-        parse_config(raw)
+    raw["policy"]["hold_reset_percent"] = 41
+    with caplog.at_level("WARNING", logger="voltdmf.config"):
+        cfg = parse_config(raw)
+    assert cfg.policy.default_position is Position.HOLD_SOC
+    assert not hasattr(cfg.policy, "hold_reset_percent")
+    assert "hold_reset_percent" in caplog.text
 
 
 @pytest.mark.parametrize("bad", ["normal", "sport", "ludicrous"])
@@ -123,8 +129,8 @@ def test_load_the_example_config():
 
     example = pathlib.Path(__file__).parent.parent / "config.example.yaml"
     cfg = load_config(example)
-    assert cfg.policy.default_position is Position.HOLD
-    assert cfg.policy.hold_reset_percent > cfg.policy.hold_threshold_percent
+    assert cfg.policy.default_position is Position.HOLD_SOC
+    assert 0 < cfg.policy.hold_threshold_percent < 100
     assert cfg.soc_poll.enabled is True
 
 

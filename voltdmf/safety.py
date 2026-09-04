@@ -17,18 +17,32 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .modecycle import ModeCycleController
-from .signals import DriveMode, ShiftPosition
+from .signals import DriveMode
 from .state import VehicleState
 
 log = logging.getLogger(__name__)
 
-#: Minimum wall time between two mode-switch bursts (reference project value).
-MODE_SWITCH_COOLDOWN_S = 60.0
+#: Minimum wall time between two mode-switch bursts. Started at the reference
+#: project's 60 s, back when a walk was unproven and a runaway one was the
+#: thing to fear. Session 11 landed 35/35 legs in <=4 taps, so the risk now
+#: runs the other way: at 60 s a driver who bumps the stalk could spend most
+#: of a minute in the wrong mode before the reconciler pulls it back. 10 s
+#: still rules out a sustained/looping TX -- one short burst per 10 s is
+#: nothing next to the ~32 Hz the module itself puts on 0x1E1 -- while making
+#: "force it" mean seconds.
+MODE_SWITCH_COOLDOWN_S = 10.0
 
 #: Above this the speed signal is almost certainly garbage -> don't act on it.
 MAX_PLAUSIBLE_SPEED_MPH = 100.0
 
-_BLOCKING_SHIFTS = {ShiftPosition.PARK, ShiftPosition.REVERSE, ShiftPosition.NEUTRAL}
+# Shift position is deliberately NOT a precondition. The thing being pressed
+# is the centre-stack energy-mode menu (Normal/Sport/Mountain/Hold), not a
+# gear selector: it changes how the car spends the pack, never what the
+# driveline does. Pressing it stopped in Park is exactly what a driver does,
+# so gating on PRNDL only bought a false sense of caution -- and it cost
+# real behaviour, because it meant the reconciler could not settle the mode
+# in the driveway before a drive, or while sitting at a charger. Shift is
+# still decoded and reported; it just does not block a switch.
 
 
 @dataclass(frozen=True)
@@ -53,34 +67,22 @@ class SafetyGate:
         controller: ModeCycleController,
         *,
         cooldown_s: float = MODE_SWITCH_COOLDOWN_S,
-        allow_unknown_shift: bool = False,
-        allow_park: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._controller = controller
         self._cooldown_s = cooldown_s
-        # decode_shift is confirmed on-vehicle (0x1F5 byte 3 PRNDL, session 4,
-        # 2026-08-29), so UNKNOWN now means a short/garbled shift frame, not a
-        # missing decoder -- treat it as blocking. Callers that genuinely have
-        # no shift signal (bench rigs without 0x1F5) can still pass True.
-        self._allow_unknown_shift = allow_unknown_shift
-        # The panel walk-test (SW1 solo hold) passes allow_park=True so the
-        # driver can run it fully stopped in Park; REVERSE / NEUTRAL stay
-        # blocking, and the bus + speed checks are unchanged.
-        self._blocking_shifts = (
-            _BLOCKING_SHIFTS - {ShiftPosition.PARK} if allow_park
-            else _BLOCKING_SHIFTS
-        )
         self._monotonic = monotonic
         self._last_switch: float | None = None
 
     def _precondition_failure(self, state: VehicleState) -> str | None:
+        """Why a switch must not go out now, or ``None`` to allow it.
+
+        Two checks, and both are about the *bus* rather than the driveline:
+        a quiet bus means nobody is listening, and an implausible speed means
+        the frames we are reading are garbage. See the note on shift above.
+        """
         if not state.bus_active:
             return "bus is quiet (car off?)"
-        if state.shift in self._blocking_shifts:
-            return f"shift is {state.shift.value}"
-        if state.shift is ShiftPosition.UNKNOWN and not self._allow_unknown_shift:
-            return "shift position unknown"
         if state.speed_mph is not None and state.speed_mph > MAX_PLAUSIBLE_SPEED_MPH:
             return f"implausible speed {state.speed_mph:.0f} mph"
         return None

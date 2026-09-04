@@ -7,17 +7,21 @@ reduced-propulsion mode.
 A single **level-triggered reconciler** continuously drives the car toward a
 desired mode:
 
-- **Three-position selector** — one panel button (SW1), tapped forward, with
-  a fourth tap returning to the first position. Not persisted; every boot
+- **Four-position selector** — one panel button (SW1), tapped forward, with
+  a fifth tap returning to the first position. Not persisted; every boot
   starts back at position 1.
-  1. **`hold`** (default) — hold the pack at 30 %. Passive above that: the car
-     drives exactly as it normally would until the SOC-HOLD floor engages.
-  2. **`mountain`** — enforce Mountain Mode continuously.
-  3. **`off`** — do nothing at all, SOC floor included: the car behaves as if
+  1. **`hold-soc`** (default) — hold the pack at 30 %. Passive above that: the
+     car drives exactly as it normally would until the SOC-HOLD floor engages.
+  2. **`hold-now`** — enforce Hold Mode immediately, whatever the pack reads:
+     bank what is left, starting now.
+  3. **`mountain`** — enforce Mountain Mode continuously.
+  4. **`off`** — do nothing at all, SOC floor included: the car behaves as if
      the device were not plugged in.
-- **SOC-HOLD floor** — live in positions 1 and 2, and it always wins there.
-  When SOC falls to a configurable percentage (30 %, ≈ 2 gauge bars) the
-  reconciler holds the car in Hold Mode until the pack recovers.
+- **SOC-HOLD floor** — live in every position but `off`, and it always wins
+  there. When SOC falls to a configurable percentage (30 %, ≈ 2 gauge bars)
+  the reconciler holds the car in Hold Mode **for the rest of the key cycle**
+  — regen putting charge back in does not release it. A restart, or tapping
+  round to `off`, is what clears it.
 - *(Roadmap)* **Trip Mode** — a speed-based detent that banks EV range on
   the highway, based on
   [vix597/chevy-volt-trip-mode](https://github.com/vix597/chevy-volt-trip-mode).
@@ -37,7 +41,7 @@ status signal (`0x1F4` byte 1, the daemon's mode source), and shift/PRNDL
 resolved SOC — the `22 005B` UDS poll gives exact pack percent and the
 gauge↔SOC curve is near-linear — so the reconciler and its SOC-HOLD floor are
 now **implemented**. `--dry-run` is gone: the daemon boots **armed** on the
-first detent of the selector (`default_position: hold` — passive until the
+first detent of the selector (`default_position: hold-soc` — passive until the
 SOC floor engages), and `voltdmf-ctl disarm` is the mid-drive stop. Still to
 do: migrate the out-of-repo `roles/voltdmf` ExecStart / `config.yaml`, then
 validate the 30 % floor timing over several drives.
@@ -70,13 +74,13 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 `--start-disarmed` boots with transmission suppressed (the reconciler still
 runs and logs what it *would* do, and the `22 005B` SOC poll still transmits)
 — the safe mode for bench work. Normally the daemon boots **armed** but
-passive: with `default_position: hold` it has no target and walks the car
+passive: with `default_position: hold-soc` it has no target and walks the car
 nowhere until the SOC-HOLD floor engages or the driver taps SW1 round to
-`mountain`.
+`hold-now` or `mountain`.
 
 The daemon runs permanently as root under systemd; change modes and daemon
 state from an unprivileged account with `voltdmf-ctl` (`status` / `arm` /
-`disarm` / `setpoint <hold|mountain|off|next>` / `set-mode <mode>` / `reload` /
+`disarm` / `setpoint <hold-soc|hold-now|mountain|off|next>` / `set-mode <mode>` / `reload` /
 `walk-test` / `test-mode <on|off>` / `probe <mode>`) over its control socket.
 `voltdmf-ctl disarm` is the mid-drive
 stop. See `host/README.md` §"Runtime control" and DESIGN.md §"Runtime

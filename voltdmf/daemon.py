@@ -9,9 +9,9 @@ the daemon stays passive rather than dying or retrying mid-burst (DESIGN.md
 SOC poll -- a read, sent armed or disarmed.
 
 The daemon runs permanently under systemd as root. It **boots armed**, but the
-shipped config's ``default_position: hold`` is passive: it enforces nothing
-until the driver taps SW1 round to MOUNTAIN or the SOC-HOLD floor engages --
-a restart on a healthy pack leaves the car where it is. ``voltdmf-ctl disarm``
+shipped config's ``default_position: hold-soc`` is passive: it enforces nothing
+until the SOC-HOLD floor engages or the driver taps SW1 forward -- a restart on
+a healthy pack leaves the car where it is. ``voltdmf-ctl disarm``
 is the mid-drive stop. Operators steer it from an unprivileged account through the
 control socket (:mod:`voltdmf.control`, ``voltdmf-ctl``): ``status`` is
 answered read-only on the socket thread; ``set-mode`` / ``setpoint`` / ``arm``
@@ -403,8 +403,8 @@ class Daemon:
         if state.drive_mode is None:
             return
         desired = self._reconciler.desired_mode(state)
-        # desired is None => the selector is on `hold` with the floor clear,
-        # or on `off`: enforce nothing, leave the car where the driver has it.
+        # desired is None => the selector is on `hold-soc` with the floor
+        # still clear, or on `off`: enforce nothing, leave the car alone.
         if desired is None or desired == state.drive_mode:
             return
 
@@ -520,7 +520,7 @@ class Daemon:
         }
 
     def _cmd_setpoint(self, args: dict) -> dict:
-        """Move the three-position selector: an explicit detent, or ``next``.
+        """Move the four-position selector: an explicit detent, or ``next``.
 
         ``next`` is what the SW1 tap sends. The daemon owns the cycle so the
         button helper cannot drift out of step with it.
@@ -539,11 +539,12 @@ class Daemon:
         after = self._reconciler.position
         log.warning("selector %s -> %s via control socket",
                     before.value, after.value)
-        self._last_action = f"SETPOINT {after.value.upper()}"
+        self._last_action = f"SEL {after.value.upper()}"
         self._walk_settle_until = 0.0  # an explicit choice acts now
         self._wake.set()  # reconcile on the next tick, not after the full sleep
         return {"ok": True, "setpoint": after.value,
-                "position": after.value, "previous": before.value}
+                "position": after.value, "previous": before.value,
+                "description": self._reconciler.describe_position()}
 
     def _cmd_reload(self) -> dict:
         if self._config_path is None:
@@ -599,7 +600,7 @@ class Daemon:
         """Step the closed-loop walk through every drive mode, score each
         landing off 0x1F4 byte 1, then walk back to the starting mode. Runs on
         the loop thread with the reconciler skipped; drives its own
-        cooldown-free, Park-tolerant :class:`SafetyGate` around the shared
+        cooldown-free :class:`SafetyGate` around the shared
         controller so the real 60 s gate and single TX path are untouched."""
         self._walk_test_pending = False
         st = self._state
@@ -610,7 +611,7 @@ class Daemon:
             return
 
         origin = st.drive_mode
-        gate = SafetyGate(self._controller, cooldown_s=0.0, allow_park=True)
+        gate = SafetyGate(self._controller, cooldown_s=0.0)
         log.warning("walk-test: start (origin=%s)", origin.value)
 
         sequence = list(WALK_TEST_ORDER) + [origin]  # cycle every mode, then restore
@@ -717,7 +718,7 @@ class Daemon:
 
     def _run_probe(self, target: DriveMode) -> None:
         """One focused closed-loop walk to ``target``, densely traced. Runs on
-        the loop thread with its own cooldown-free, Park-tolerant SafetyGate
+        the loop thread with its own cooldown-free SafetyGate
         around the shared controller -- like a one-leg walk-test, but with a
         background ~50 ms cursor sampler so the whole byte-4 trajectory is on
         record, not just the 0.2 s post-tap snapshots the closed loop reads.
@@ -752,7 +753,7 @@ class Daemon:
             return
 
         origin = st.drive_mode
-        gate = SafetyGate(self._controller, cooldown_s=0.0, allow_park=True)
+        gate = SafetyGate(self._controller, cooldown_s=0.0)
         self._trace = []
         self._trace_tag = "probe"
         sampler = _CursorSampler(st)
@@ -821,6 +822,9 @@ class Daemon:
             "armed": self._armed,
             "transmit_enabled": self._transmit_enabled(),
             "setpoint": rec.setpoint_label,
+            "position_index": rec.position_index,
+            "position_description": rec.describe_position(),
+            "cycle": [p.value for p in CYCLE],
             "floor_latched": rec.floor_latched,
             "reconciler": rec.snapshot(),
             "drive_mode": (st.drive_mode.value
@@ -873,13 +877,18 @@ class Daemon:
             return self._last_action
         p = self._action_prefix()
         if self._reconciler.floor_latched:
-            return f"{p}SOC-FLOOR -> HOLD"
+            return f"{p}SOC-FLOOR->HOLD"   # 19 cols with the "DIS " prefix
         pos = self._reconciler.position
+        # "enforcing", not "hold": with two hold detents, "hold HOLD" no
+        # longer says which one the driver is on.
+        if pos is Position.HOLD_NOW:
+            return f"{p}enforcing HOLD"
         if pos is Position.MOUNTAIN:
-            return f"{p}hold MOUNTAIN"
+            return f"{p}enforcing MTN"
         if pos is Position.OFF:
             return f"{p}OFF - not acting"
-        return f"{p}SOC floor {int(self._reconciler.snapshot()['hold_threshold_percent'])}%"
+        thresh = self._reconciler.snapshot()["hold_threshold_percent"]
+        return f"{p}armed for {thresh:g}%"
 
     def _await_bus(self, state: VehicleState) -> None:
         deadline = time.monotonic() + BUS_WARMUP_TIMEOUT_S

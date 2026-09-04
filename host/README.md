@@ -14,7 +14,7 @@ Pi 3B. They are checked in so the box is reproducible.
 > whole thing behind a per-host enable flag, and **never let the automation
 > reboot the device** — if applying the overlay needs a reboot, stop and let
 > a human do it while the vehicle is parked. The daemon boots armed but
-> passive (`default_position: hold`); put `--start-disarmed` in `ExecStart`
+> passive (`default_position: hold-soc`); put `--start-disarmed` in `ExecStart`
 > for a host that should come up fully stopped.
 
 ## Phase A -- bring up `can0`
@@ -84,18 +84,19 @@ must be in the `voltdmf` group, see above). No `sudo`:
 voltdmf-ctl status                 # daemon + vehicle snapshot
 voltdmf-ctl disarm                 # mid-drive stop: stop transmitting, keep reading/evaluating
 voltdmf-ctl arm                    # resume transmission
-voltdmf-ctl setpoint next          # one detent forward: hold -> mountain -> off -> hold
-voltdmf-ctl setpoint mountain      # or jump straight to a detent (hold | mountain | off)
+voltdmf-ctl setpoint next          # one detent forward: hold-soc -> hold-now -> mountain -> off -> hold-soc
+voltdmf-ctl setpoint mountain      # or jump straight to a detent (hold-soc | hold-now | mountain | off)
 voltdmf-ctl set-mode hold          # request one switch now, out of band (safety gate still applies)
 voltdmf-ctl reload                 # re-read /etc/voltdmf/config.yaml
 ```
 
 The daemon **boots armed** but passive: the shipped `config.yaml` sets
-`default_position: hold`, the first detent of the three-position selector, so
-it enforces nothing until the SOC-HOLD floor engages or the driver taps SW1
-round to `mountain` — a mid-drive `systemctl restart` on a healthy pack leaves
-the car where it is. The third detent, `off`, stands the device down
-completely (the SOC floor included). There is no `--dry-run`. `voltdmf-ctl disarm` is the mid-drive
+`default_position: hold-soc`, the first detent of the four-position selector,
+so it enforces nothing until the SOC-HOLD floor engages or the driver taps SW1
+round to `hold-now` or `mountain` — a mid-drive `systemctl restart` on a
+healthy pack leaves the car where it is. The last detent, `off`, stands the
+device down completely (the SOC floor included), and is the only way to
+release a floor that has latched for the key cycle without restarting. There is no `--dry-run`. `voltdmf-ctl disarm` is the mid-drive
 stop, `voltdmf-ctl arm` (or `systemctl restart voltdmf`) resumes. Start the
 service with `--start-disarmed` for a host that should come up stopped. `voltdmf.socket` is socket-activated: `voltdmf-ctl`
 works even if the service is momentarily down (the command queues briefly).

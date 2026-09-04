@@ -74,7 +74,8 @@ def test_status_shows_floor_latch(tmp_path, capsys):
                                    "bus_active": True}}
     with _CannedServer(tmp_path, reply) as srv:
         ctl.main(["--socket", srv.path, "status"])
-    assert "floor latched" in capsys.readouterr().out.lower()
+    out = capsys.readouterr().out.lower()
+    assert "floor latched for this key cycle" in out
 
 
 def test_set_mode_request_shape(tmp_path):
@@ -188,22 +189,38 @@ def test_setpoint_off_request_shape(tmp_path):
     assert srv.request == {"cmd": "setpoint", "mode": "off"}
 
 
-@pytest.mark.parametrize("bad", ["normal", "sport", "auto"])
+@pytest.mark.parametrize("bad", ["normal", "sport", "auto", "hold"])
 def test_setpoint_rejects_a_non_detent_at_argparse(tmp_path, bad):
+    """Bare `hold` is rejected on purpose: with two hold detents, a human
+    typing it today could mean either. Config files still accept it."""
     with pytest.raises(SystemExit) as ei:
         ctl.main(["--socket", str(tmp_path / "x"), "setpoint", bad])
     assert ei.value.code == 2
 
 
-def test_status_calls_out_that_off_disables_the_floor(tmp_path, capsys):
-    state = {"transmit_enabled": True, "setpoint": "off", "drive_mode": "normal",
-             "floor_latched": False}
+def test_status_shows_the_detent_number_and_what_it_does(tmp_path, capsys):
+    state = {"transmit_enabled": True, "setpoint": "hold-soc",
+             "position_index": 1, "position_description": "hold the pack at 30%",
+             "cycle": ["hold-soc", "hold-now", "mountain", "off"],
+             "drive_mode": "normal", "floor_latched": False}
     with _CannedServer(tmp_path, {"ok": True, "state": state}) as srv:
         rc = ctl.main(["--socket", srv.path, "status"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "selector:   off" in out
-    assert "floor disabled" in out
+    assert "selector:   1/4 hold-soc  (hold the pack at 30%)" in out
+
+
+def test_status_calls_out_that_off_is_not_acting(tmp_path, capsys):
+    state = {"transmit_enabled": True, "setpoint": "off", "position_index": 4,
+             "position_description": "not acting -- car is on its own",
+             "cycle": ["hold-soc", "hold-now", "mountain", "off"],
+             "drive_mode": "normal", "floor_latched": False}
+    with _CannedServer(tmp_path, {"ok": True, "state": state}) as srv:
+        rc = ctl.main(["--socket", srv.path, "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "selector:   4/4 off" in out
+    assert "not acting" in out
 
 
 def test_ok_false_reply_exits_one(tmp_path, capsys):

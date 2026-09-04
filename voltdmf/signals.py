@@ -320,9 +320,9 @@ def decode_shift(data: bytes) -> ShiftPosition:
     """PRNDL detent from byte 3 of frame 0x1F5.
 
     Returns :data:`ShiftPosition.UNKNOWN` for a short frame or a byte-3 value
-    outside 1..5 (never observed on this car, but stay defensive -- the
-    daemon's SafetyGate treats UNKNOWN as non-blocking only while
-    ``allow_unknown_shift`` is set).
+    outside 1..5 (never observed on this car, but stay defensive). Shift is
+    reported, not enforced: the SafetyGate does not gate a mode switch on
+    PRNDL -- see the note in :mod:`voltdmf.safety`.
     """
     if len(data) < 4:
         return ShiftPosition.UNKNOWN

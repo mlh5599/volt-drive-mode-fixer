@@ -6,11 +6,11 @@ the two PiCAN2 switch pads whenever no capture is running and turns presses
 into three actions:
 
     SW1 tap  (short press, SW2 untouched)
-        -> ``voltdmf-ctl setpoint next`` -- advances the daemon's three-position
-           selector one detent: hold (hold the pack at 30%) -> mountain -> off
-           (car untouched) -> back to hold. The daemon owns the cycle; this
-           helper keeps no index of its own. A failing call is logged and
-           swallowed.
+        -> ``voltdmf-ctl setpoint next`` -- advances the daemon's four-position
+           selector one detent: hold-soc (hold the pack at 30%) -> hold-now
+           (hold it starting now) -> mountain -> off (car untouched) -> back to
+           hold-soc. The daemon owns the cycle; this helper keeps no index of
+           its own. A failing call is logged and swallowed.
 
     SW1 held alone >= --selftest-hold-secs, then released  (SW2 never joined)
         -> ``voltdmf-ctl walk-test`` -- the daemon cycles the closed-loop mode
@@ -460,7 +460,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(charge-current-setpoint discovery capture)")
     ap.add_argument("--ctl", default="/usr/local/bin/voltdmf-ctl",
                     help="path to the voltdmf-ctl entry point")
-    # DEPRECATED, accepted so a unit file written before the three-position
+    # DEPRECATED, accepted so a unit file written before the multi-position
     # selector still starts. SW1 now sends `setpoint next` and the daemon owns
     # the cycle, so there is nothing here for the helper to configure.
     ap.add_argument("--setpoints", nargs=2, default=None, metavar=("A", "B"),

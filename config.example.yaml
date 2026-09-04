@@ -2,23 +2,30 @@
 # Schema and rationale: see DESIGN.md "Mode policy".
 #
 # The daemon boots armed and runs a level-triggered reconciler against a
-# three-position selector the driver advances with a panel SW1 tap:
+# four-position selector the driver advances with a panel SW1 tap:
 #
-#   1. hold      hold the pack at `hold_threshold_percent`. Passive above it,
-#                so a restart on a healthy pack leaves the car where it is;
-#                the SOC-HOLD floor walks the car to HOLD once it drops.
-#   2. mountain  enforce MOUNTAIN continuously (the floor still wins).
-#   3. off       do nothing, floor disabled -- the car behaves as if the
+#   1. hold-soc  hold the pack at `hold_threshold_percent`. Passive above it,
+#                so a healthy pack drives normally; once it drops, the
+#                SOC-HOLD floor walks the car to HOLD and *keeps* it there
+#                for the rest of the key cycle.
+#   2. hold-now  enforce HOLD immediately, whatever the pack reads -- "bank
+#                what I have left, starting now".
+#   3. mountain  enforce MOUNTAIN continuously (the floor still wins).
+#   4. off       do nothing, floor disabled -- the car behaves as if the
 #                device were not plugged in.
 #
-# A fourth tap returns to `hold`. `voltdmf-ctl disarm` is the mid-drive stop.
+# A fifth tap returns to `hold-soc`. `voltdmf-ctl disarm` is the mid-drive
+# stop; tapping round to `off` is the only way to clear a latched floor
+# without restarting.
 
 policy:
-  default_position: hold        # hold | mountain | off -- boot detent, not
-                                # persisted; every key cycle starts here.
-  hold_threshold_percent: 30    # floor forces HOLD at/below this diag SOC
-  hold_reset_percent: 41        # floor releases at/above this (hysteresis;
-                                # 41% is the 3-bar mark, Session-9 calibration)
+  default_position: hold-soc    # hold-soc | hold-now | mountain | off -- boot
+                                # detent, not persisted; every key cycle
+                                # starts here.
+  hold_threshold_percent: 30    # floor forces HOLD at/below this diag SOC and
+                                # latches for the rest of the key cycle (no
+                                # release percent; 30% is mid-2-bar,
+                                # Session-9 calibration)
   bar_failsafe_raw: 9           # 0x096 b3 <= this forces HOLD if the poll is stale
                                 # (~2 gauge bars; Session-9 calibration)
 

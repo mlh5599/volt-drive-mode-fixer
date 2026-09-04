@@ -1,7 +1,7 @@
 import pytest
 
 from voltdmf.modecycle import ModeSwitchFailed
-from voltdmf.safety import SafetyGate
+from voltdmf.safety import MODE_SWITCH_COOLDOWN_S, SafetyGate
 from voltdmf.signals import DriveMode, ShiftPosition
 from voltdmf.state import VehicleState
 
@@ -44,43 +44,27 @@ def test_blocks_when_bus_quiet():
     assert ctl.calls == 0
 
 
-@pytest.mark.parametrize("shift", [ShiftPosition.PARK, ShiftPosition.REVERSE,
-                                   ShiftPosition.NEUTRAL])
-def test_blocks_on_non_drive_shift(shift):
+@pytest.mark.parametrize("shift", list(ShiftPosition))
+def test_shift_position_never_blocks_a_switch(shift):
+    """PRNDL is not a precondition. The mode button is the centre-stack
+    energy-mode menu, not a gear selector -- pressing it in Park is what a
+    driver does, and gating on shift only stopped the reconciler settling
+    the mode before the car moved."""
     ctl = FakeController()
     gate = SafetyGate(ctl)
-    assert gate.request(DriveMode.HOLD, _state(shift=shift)) is False
-    assert ctl.calls == 0
-
-
-def test_blocks_on_unknown_shift_by_default():
-    ctl = FakeController()
-    gate = SafetyGate(ctl)
-    assert gate.request(DriveMode.HOLD, _state(shift=ShiftPosition.UNKNOWN)) is False
-    assert ctl.calls == 0
-
-
-def test_allow_unknown_shift_opt_in():
-    ctl = FakeController()
-    gate = SafetyGate(ctl, allow_unknown_shift=True)
-    assert gate.request(DriveMode.HOLD, _state(shift=ShiftPosition.UNKNOWN)) is True
+    assert gate.request(DriveMode.HOLD, _state(shift=shift)) is True
     assert ctl.calls == 1
 
 
-def test_allow_park_opt_in_lets_park_through():
-    # the panel walk-test builds its gate with allow_park=True
-    ctl = FakeController()
-    gate = SafetyGate(ctl, allow_park=True)
-    assert gate.request(DriveMode.HOLD, _state(shift=ShiftPosition.PARK)) is True
-    assert ctl.calls == 1
-
-
-@pytest.mark.parametrize("shift", [ShiftPosition.REVERSE, ShiftPosition.NEUTRAL])
-def test_allow_park_still_blocks_reverse_and_neutral(shift):
-    ctl = FakeController()
-    gate = SafetyGate(ctl, allow_park=True)
-    assert gate.request(DriveMode.HOLD, _state(shift=shift)) is False
-    assert ctl.calls == 0
+def test_switches_while_parked():
+    """The case that used to be blocked and is now the point: sitting in the
+    driveway with the car on, the daemon can walk to the target mode."""
+    ctl = FakeController(result=3)
+    gate = SafetyGate(ctl)
+    outcome = gate.request_verbose(DriveMode.HOLD,
+                                   _state(shift=ShiftPosition.PARK, speed_mph=0))
+    assert outcome.sent is True
+    assert outcome.blocked is False
 
 
 def test_blocks_on_implausible_speed():
@@ -117,9 +101,23 @@ def test_fail_passive_on_controller_error():
     # no exception propagates
     assert gate.request(DriveMode.HOLD, _state()) is False
     # cooldown still applied so we don't hammer a failing path
-    clock.t += 10.0
+    clock.t += MODE_SWITCH_COOLDOWN_S / 2
     assert gate.request(DriveMode.HOLD, _state()) is False
     assert ctl.calls == 1
+
+
+def test_default_cooldown_walks_a_manual_change_back_within_seconds():
+    """The re-assert budget. Session 11 landed 35/35 legs in <=4 taps, so a
+    minute-long cooldown would strand a driver who bumped the stalk in the
+    wrong mode for most of that minute."""
+    assert MODE_SWITCH_COOLDOWN_S <= 15.0
+    ctl = FakeController()
+    clock = FakeClock()
+    gate = SafetyGate(ctl, monotonic=clock)
+    assert gate.request(DriveMode.HOLD, _state()) is True
+    clock.t += MODE_SWITCH_COOLDOWN_S + 0.1
+    assert gate.request(DriveMode.HOLD, _state()) is True   # driver bumped it
+    assert ctl.calls == 2
 
 
 def test_zero_presses_reports_false():
@@ -143,7 +141,7 @@ class _FailingController:
 
 
 def test_failed_walk_reports_the_taps_actually_sent():
-    gate = SafetyGate(_FailingController(12), cooldown_s=0.0, allow_park=True)
+    gate = SafetyGate(_FailingController(12), cooldown_s=0.0)
     outcome = gate.request_verbose(DriveMode.HOLD, _state(), force=True)
     assert outcome.presses == 12
     assert outcome.sent is False        # taps went out, the switch did not land
@@ -157,7 +155,7 @@ def test_failed_walk_without_a_tap_count_still_reports_zero():
         def switch_to(self, target, *, force=False):
             raise RuntimeError("bus exploded")
 
-    gate = SafetyGate(_Boom(), cooldown_s=0.0, allow_park=True)
+    gate = SafetyGate(_Boom(), cooldown_s=0.0)
     outcome = gate.request_verbose(DriveMode.HOLD, _state(), force=True)
     assert outcome.presses == 0
     assert outcome.blocked is True

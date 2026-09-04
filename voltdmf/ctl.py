@@ -2,7 +2,7 @@
 
     voltdmf-ctl status
     voltdmf-ctl set-mode hold [--force]
-    voltdmf-ctl setpoint hold | mountain | off | next
+    voltdmf-ctl setpoint hold-soc | hold-now | mountain | off | next
     voltdmf-ctl arm
     voltdmf-ctl disarm
     voltdmf-ctl reload
@@ -103,10 +103,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--force", action="store_true",
                     help="walk the menu even if already reading that mode")
     sp = sub.add_parser("setpoint",
-                        help="move the three-position selector: hold (passive, "
-                             "SOC floor live) | mountain (enforce MOUNTAIN) | "
-                             "off (nothing at all, floor disabled) | next (one "
-                             "SW1 tap forward)",
+                        help="move the four-position selector: hold-soc "
+                             "(passive until the pack hits the floor, then "
+                             "HOLD for the drive) | hold-now (enforce HOLD "
+                             "immediately) | mountain (enforce MOUNTAIN) | off "
+                             "(nothing at all, floor disabled) | next (one SW1 "
+                             "tap forward)",
                         parents=[common])
     sp.add_argument("mode", choices=_SETPOINTS)
     sub.add_parser("arm", help="allow transmission (the daemon boots armed)",
@@ -159,13 +161,16 @@ def _print_status(state: dict) -> None:
     tx = "ARMED" if state.get("transmit_enabled") else "disarmed"
     print(f"transmit:   {tx}")
     sp = g("setpoint")
+    where = state.get("position_index")
+    cycle = state.get("cycle") or []
+    detent = f"{where}/{len(cycle)} " if where and cycle else ""
     if state.get("floor_latched"):
-        floor = "  [SOC-HOLD floor latched]"
-    elif sp == "off":
-        floor = "  [floor disabled -- car is on its own]"
+        note = "  [SOC-HOLD floor latched for this key cycle]"
+    elif state.get("position_description"):
+        note = f"  ({state['position_description']})"
     else:
-        floor = ""
-    print(f"selector:   {sp}{floor}")
+        note = ""
+    print(f"selector:   {detent}{sp}{note}")
     print(f"drive mode: {g('drive_mode')}"
           + (f"  (manual override -> {state['manual_override']})"
              if state.get("manual_override") else ""))

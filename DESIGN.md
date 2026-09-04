@@ -8,8 +8,8 @@ exact pack percent (`raw·100/255`) and the gauge↔SOC curve is near-linear
 (`SOC% ≈ 7.07·bars + 19.6`, r = 0.999), so the level-triggered reconciler in
 "Mode policy" — with the SOC-HOLD floor keyed off that poll and `0x096`
 byte 3 as a coarse failsafe — is now **implemented**. `--dry-run` is gone:
-the daemon boots **armed** on the first detent of a three-position selector
-(`default_position: hold` → passive until the SOC floor engages), and
+the daemon boots **armed** on the first detent of a four-position selector
+(`default_position: hold-soc` → passive until the SOC floor engages), and
 `voltdmf-ctl disarm` is the mid-drive stop. The out-of-repo `roles/voltdmf` still needs its ExecStart /
 `config.yaml` migrated to match. Progress and per-drive procedures live in
 `docs/phase-c-field-checklist.md`; the on-vehicle narrative in
@@ -33,12 +33,12 @@ low enough to cause the problem.
   reduced-propulsion mode.
 - **DR2 — Drive toward a chosen mode each drive cycle.** On every drive cycle
   (ignition on) hold a selected mode (MOUNTAIN or, by default, the SOC-HOLD
-  floor). Realized as the reconciler's three-position selector — see "Mode
+  floor). Realized as the reconciler's four-position selector — see "Mode
   policy".
 - **DR3 — SOC floor.** When SOC drops to a configurable percentage, switch to
   Hold Mode and keep it there until the pack recovers. Realized as the floor
-  in "Mode policy" — live in the `hold` and `mountain` detents, deliberately
-  disabled in `off`.
+  in "Mode policy" — live in the `hold-soc`, `hold-now` and `mountain`
+  detents, deliberately disabled in `off`.
 - **DR4 — Off-the-shelf hardware preferred.** Favor a proven, reusable CAN
   interface over custom PCB/firmware design; hobbyist-level electronics
   work (soldering, wiring, light scripting) is acceptable where needed.
@@ -88,24 +88,25 @@ per mode. See "Mode policy" and "Software architecture" below.
 
 **Desired mode = f(selector position, SOC).** One loop pass computes the mode
 the car *should* be in. The result is concrete (HOLD / MOUNTAIN) **or `None`**
-— `None` means "no target, leave the car alone", which is what the `hold`
+— `None` means "no target, leave the car alone", which is what the `hold-soc`
 detent yields above the floor and what `off` yields unconditionally. If a concrete desired mode differs from
 `state.drive_mode` (read from `0x1F4` byte 1) and the daemon is armed, it asks
 the safety gate to walk the menu there — so a hand-picked mode change gets
-walked back, at most once per 60 s cooldown. The reconcile is also skipped
+walked back, at most once per 10 s cooldown. The reconcile is also skipped
 entirely until `0x1F4` decodes a current mode (a fresh boot on a quiet or
 just-woken bus does nothing until it can see where the menu cursor is).
 
-**The three-position selector.** One panel button (SW1) is a rotary detent the
-driver taps forward; a fourth tap returns to the first position. The daemon
+**The four-position selector.** One panel button (SW1) is a rotary detent the
+driver taps forward; a fifth tap returns to the first position. The daemon
 owns the cycle (`voltdmf-ctl setpoint next`), so nothing can drift out of step
 with it.
 
-| position | SOC above `hold_reset_percent` | SOC at/below `hold_threshold_percent` |
+| position | pack above `hold_threshold_percent` | pack at/below `hold_threshold_percent` |
 | --- | --- | --- |
-| **1. `hold`** — hold the pack at 30 % (boot default) | desired = **None** — leave the car alone | desired = **HOLD** (floor wins) |
-| **2. `mountain`** — enforce MOUNTAIN | desired = **MOUNTAIN** | desired = **HOLD** (floor wins) |
-| **3. `off`** — as if unplugged | desired = **None** | desired = **None** — *floor disabled* |
+| **1. `hold-soc`** — hold the pack at 30 % (boot default) | desired = **None** — leave the car alone | desired = **HOLD**, latched for the key cycle |
+| **2. `hold-now`** — bank what is left, starting now | desired = **HOLD** | desired = **HOLD** |
+| **3. `mountain`** — enforce MOUNTAIN | desired = **MOUNTAIN** | desired = **HOLD** (floor wins) |
+| **4. `off`** — as if unplugged | desired = **None** | desired = **None** — *floor disabled* |
 
 - **Position 1 is the product.** "Hold the battery at 30 %" is the whole point
   of the device, so it is both the first detent and the boot default. It is
@@ -113,40 +114,54 @@ with it.
   would, and a mid-drive restart on a healthy pack leaves the car where the
   driver had it. The daemon only acts once the pack reaches
   `hold_threshold_percent`.
-- **Position 3 turns the device off, floor included.** `off` short-circuits
+- **Position 2 is the same floor, brought forward.** `hold-now` asks for HOLD
+  from loop 1 whatever the pack reads, and needs no SOC reading at all — for
+  the drive where the driver decides *now* is the moment to stop spending
+  charge (a highway leg before a city errand). It is enforcement, not the
+  floor, so `floor_latched` stays false; the floor can still latch underneath
+  it and would change nothing, since both ask for HOLD.
+- **Position 4 turns the device off, floor included.** `off` short-circuits
   *before* the floor is evaluated and clears any standing latch, so the car
   behaves exactly as if the Pi were not plugged in. This is the one position
   in which the pack is unprotected — deliberate, so the driver always has a
   way to hand the car back to itself without pulling the connector. Entering
   `off` clears the latch rather than freezing it, because a latch surviving
   there would re-assert HOLD the instant the driver taps back round, on a
-  reading that may be minutes stale.
+  reading that may be minutes stale — and it is, deliberately, the only way to
+  release a latched floor without restarting.
 - **The selector is not persisted.** The Pi runs a read-only root with an
   overlay filesystem, so there is nothing to write to, and **every boot starts
-  at `default_position`** (`hold`). A fresh key cycle is a fresh drive.
-- **Hysteresis.** At/below `hold_threshold_percent` (**30** — diag SOC from
-  the `22 005B` poll) the floor engages (desired = HOLD); it stays latched
-  until a fresh poll reads back at/above `hold_reset_percent` (**41**). The
-  latch lives in memory only and is dropped on `reload` (the selector position
-  survives a reload — it is the driver's live choice).
+  at `default_position`** (`hold-soc`). A fresh key cycle is a fresh drive.
+- **The floor latches for the key cycle.** At/below `hold_threshold_percent`
+  (**30** — diag SOC from the `22 005B` poll) the floor engages (desired =
+  HOLD) and **stays engaged** for the rest of the key cycle. There is no
+  release percent: "drain to 30 %, then hold, and do not let it change".
+  Regen or a long descent putting charge back into the pack must not hand the
+  car back to EV mode and spend it again. The latch lives in memory only and
+  is dropped on `reload` and on a restart; the selector position survives a
+  reload — it is the driver's live choice.
 - **Failsafe on a stale poll.** If the poll stops answering (older than
   ~45 s), `0x096` byte 3 ≤ `bar_failsafe_raw` (**9**, ≈ 2 gauge bars) forces
-  HOLD. The b3 proxy can only *engage* the floor — releasing it takes a real
-  poll reading above the reset percent, so a poll outage fails safe into
-  charge-sustaining HOLD.
+  HOLD. Because the latch is now permanent for the key cycle, the failsafe
+  holds fire for the first ~45 s after start — long enough for the poll to get
+  a word in — rather than committing the whole drive off a ~13 %-per-count
+  proxy before the exact reading has had a chance to arrive. After that grace
+  it fails safe into charge-sustaining HOLD.
 - **Floor target = 2 gauge bars remaining.** From the Session-8 full-drain
   drive the last bar (`1→0`) fell in **53 s** against a ~170 s average for
   the other nine — the bottom of the gauge is a cliff, so the floor engages
   while 2 bars still show. Session 9 pinned the numbers: `SOC% ≈
   7.07·bars + 19.6` (r = 0.999); the 3→2 bar drop is **33.7 %** (raw 0x56),
   the 4→3 bar mark **41.2 %** (raw 0x69). The engage point is **30 %** —
-  mid-2-bar, and the driver-facing name of position 1 — and the release point
-  **41 %**, the 3-bar mark.
+  mid-2-bar, and the driver-facing name of position 1.
 - **Reconcile cadence vs. the driver.** The reconcile runs every loop but
-  every switch still goes through `SafetyGate` (preconditions + the 60 s
+  every switch still goes through `SafetyGate` (preconditions + the 10 s
   cooldown), so if the driver fights the selector the daemon re-asserts at
-  most once a minute. The button is the intended override — tap round to
-  `off` and the daemon stops asserting anything.
+  most once every ten seconds. The cooldown started at 60 s, when a runaway
+  walk was the fear; Session 11 landed 35/35 legs in ≤ 4 taps, and at 60 s a
+  driver who bumps the stalk could spend most of a minute in the wrong mode.
+  10 s still rules out sustained transmission. The button is the intended
+  override — tap round to `off` and the daemon stops asserting anything.
 
 **Mechanics of reaching a target mode** (unchanged). The button cycles
 Normal → Sport → Mountain → Hold, so "go to HOLD" means "press N times" where
@@ -160,16 +175,17 @@ exit and a hard failure on a dropped tap, not correctness.
 **Trip Mode (DR5, future work — not building this yet).** The
 [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
 speed-based Hold (bank EV range on the highway, release it in the city) would
-become a fourth detent or a modifier on the policy, reusing the same
+become a fifth detent or a modifier on the policy, reusing the same
 reconcile + injector plumbing. Tracked, not scheduled.
 
 Config (`config.example.yaml`; parsed by `voltdmf/config.py`):
 
 ```yaml
 policy:
-  default_position: hold        # hold | mountain | off — boot detent, not persisted
-  hold_threshold_percent: 30    # floor forces HOLD at/below this diag SOC
-  hold_reset_percent: 41        # floor releases at/above this (hysteresis)
+  default_position: hold-soc    # hold-soc | hold-now | mountain | off — boot
+                                # detent, not persisted
+  hold_threshold_percent: 30    # floor forces HOLD at/below this diag SOC and
+                                # latches for the rest of the key cycle
   bar_failsafe_raw: 9           # 0x096 b3 <= this forces HOLD if the poll is stale
 
 soc_poll:
@@ -177,11 +193,14 @@ soc_poll:
   period_seconds: 10            # request cadence
 ```
 
-`parse_config` validates `hold_reset_percent > hold_threshold_percent`,
-`default_position ∈ {hold, mountain, off}`, `0 ≤ bar_failsafe_raw ≤ 255`, and
-`period_seconds > 0`. The old key name `default_setpoint` is still read (with
-`auto` mapping to `hold`, which is what `auto` used to mean) so a config.yaml
-deployed before the selector keeps loading; setting both keys is an error. The button GPIO pins live in the `button_helper.py`
+`parse_config` validates `default_position ∈ {hold-soc, hold-now, mountain,
+off}`, `0 ≤ hold_threshold_percent ≤ 100`, `0 ≤ bar_failsafe_raw ≤ 255`, and
+`period_seconds > 0`. The old key name `default_setpoint` is still read, and
+the old detent names `auto` (two-way toggle) and `hold` (three-position cycle)
+both map to `hold-soc` — that is what each meant at the time — so a config.yaml
+from either era keeps loading; setting both keys is an error. The retired
+`hold_reset_percent` is warned about and ignored rather than rejected, so a
+host that has not converged yet still boots. The button GPIO pins live in the `button_helper.py`
 unit, not here.
 
 ## Prior art (reuse this, don't rebuild it)
@@ -215,7 +234,7 @@ layer of defense.
 | Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. `voltdmf/canio.send_mode_button_press()` (tracking-echo press) — one of the daemon's two hard-coded TX frames (the other is the `22 005B` SOC poll); this is the only one gated by arm state. |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki, cross-checked against a full-drain capture; not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` logs it plus a derived accel). |
-| Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Used as a safety precondition — `SafetyGate` blocks injection unless in DRIVE (and blocks on UNKNOWN / short frame). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
+| Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Reported in `status` / the trip log, **not** a `SafetyGate` precondition — a drive-mode change has no driveline implication, so PRNDL does not block a switch (see "Safety model"). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** The `22 005B` SOC poll (above) is the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
 | Current drive mode (status, not button-press) | `0x1F4`, byte 1 | **CONFIRMED on Gen 1 (2026-08-29).** Latched mode: `0x00` NORMAL, `0x80` SPORT, `0x20` MOUNTAIN, `0x08` HOLD. byte 4 = live drive-mode menu cursor (steps ~40 ms after each tap; distinct byte codes), byte 5 bit 7 = menu-open hint. The daemon reads byte 1 as its current-mode source — the press-counting fallback is retired. |
@@ -321,9 +340,8 @@ Reuse rather than rebuild:
 
 The custom code needed is small and specific to this project:
 
-1. **Config loader** — reads the YAML above, validates it (e.g.
-   `hold_reset_percent > hold_threshold_percent`), and produces the policy
-   for the run.
+1. **Config loader** — reads the YAML above, validates it (detent name,
+   percentage and byte ranges), and produces the policy for the run.
 2. **SOC poller** — an inline loop step (`daemon._service_soc_poll`) that
    sends `22 005B` every `soc_poll.period_seconds` (`canio.send_soc_poll`,
    ungated by arm state); the RX listener folds replies on `0x7E8..0x7EF`
@@ -411,14 +429,21 @@ this project needs. Tighten that:
   inter-press spacing, never a sustained/looping transmission. Re-check the
   current mode (if readable) after sending to confirm it landed on the
   intended target rather than blindly trusting the press count.
-- **Preconditions before injecting**: vehicle in Drive, speed within a
-  sane range, ignition on — reduces the chance of triggering the switch in
-  a state where it wouldn't make sense anyway.
+- **Preconditions before injecting**: a live bus and a plausible speed. Both
+  are checks on the *bus* — a quiet bus means nobody is listening, an
+  implausible speed means the frames being decoded are garbage. **Shift/PRNDL
+  is deliberately not a precondition.** The button being pressed is the
+  centre-stack energy-mode menu (Normal/Sport/Mountain/Hold); it changes how
+  the car spends the pack, never what the driveline does, so pressing it
+  stopped in Park is exactly what a driver does. Gating on Drive bought no
+  safety and cost real behaviour — it stopped the reconciler settling the
+  mode in the driveway or at a charger before the car moved. Shift is still
+  decoded and reported, just not enforced.
 - **Fail passive.** If the daemon crashes or hangs, it should simply stop
   transmitting — never get stuck mid-loop retrying a send. Run it under a
   process supervisor (e.g. `systemd` with restart-on-failure). The daemon
   keeps **no persisted state** (read-only overlay root): a fresh start boots
-  armed at `default_position` (`hold` on the shipped config → passive above
+  armed at `default_position` (`hold-soc` on the shipped config → passive above
   the floor) with the floor latch clear and re-derives everything from the
   live bus, so there is no stale latch to re-fire and — absent a low pack —
   nothing to walk.
@@ -448,7 +473,7 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | --- | --- | --- |
 | `status` | daemon + vehicle snapshot | answered read-only on the socket thread |
 | `arm` / `disarm` | flip the runtime transmit-enable | queued → loop thread |
-| `setpoint <hold\|mountain\|off\|next>` | move the three-position selector to a named detent, or `next` for one detent forward (what the panel button sends) | queued → loop thread |
+| `setpoint <hold-soc\|hold-now\|mountain\|off\|next>` | move the four-position selector to a named detent, or `next` for one detent forward (what the panel button sends) | queued → loop thread |
 | `set-mode <mode>` | request one mode switch now, out of band | queued → `SafetyGate.request_verbose()` |
 | `reload` | re-read the config file, rebuild the policy | queued → loop thread |
 | `walk-test` | self-test the closed-loop mode walk: cycle every drive mode, score each landing, restore the start mode | queued → sets a flag; the loop thread runs the ~1 min cycle inline (reconciler skipped) and reports on the LCD + journal |
@@ -458,7 +483,7 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 > **All commands are implemented.** `setpoint` and the reconciler it
 > feeds landed in Session 9; `tools/button_helper.py`'s SW1 tap now drives a
 > real toggle. `walk-test` (SW1 solo hold ≥ 8 s) drives its own cooldown-free,
-> Park-tolerant `SafetyGate` around the shared controller, so the real 60 s
+> cooldown-free `SafetyGate` around the shared controller, so the real 10 s
 > gate and the single-threaded TX path are untouched; it needs the daemon
 > armed and refuses if a run is already queued. `test-mode` + `probe`
 > (Session 10) are the focused replacement for blind walk-test debugging: an
@@ -480,16 +505,18 @@ invocations. State changes come in over an `AF_UNIX` stream socket
   path and `SafetyGate` are never touched from the socket thread.
 - **One gate: armed / disarmed.** There is no `--dry-run`. The service boots
   **armed** — injection efficacy is on-road-confirmed, so there is no reason
-  to hold it back a key cycle at a time — but with `default_position: hold` it
+  to hold it back a key cycle at a time — but with `default_position: hold-soc` it
   has no target and enforces nothing until the SOC floor engages or the driver
-  taps SW1 round to `mountain` (see "Mode policy"). Tapping round to `off`
+  taps SW1 round to `hold-now` or `mountain` (see "Mode policy"). Tapping round to `off`
   stands the device down entirely, floor included. `voltdmf-ctl disarm` is the
   mid-drive stop; `voltdmf-ctl arm` undoes it. While disarmed the reconciler
   still runs and logs what it *would* do, and the `22 005B` SOC poll still
   transmits (it is a read-only diagnostic request, not a mode change).
   `--start-disarmed` boots into the stopped state for bench work.
-- **`setpoint` is the normal control.** It moves the three-position selector
-  (`hold` → `mountain` → `off`, `next` to advance one detent). The reconciler
+- **`setpoint` is the normal control.** It moves the four-position selector
+  (`hold-soc` → `hold-now` → `mountain` → `off`, `next` to advance one
+  detent). The CLI deliberately does not accept a bare `hold`: with two hold
+  detents a human typing it today could mean either. The reconciler
   then drives the car toward whatever the detent implies and holds it there,
   self-healing if the driver bumps the stalk. The position lives in memory
   only — every boot starts at `default_position` (no persisted state; see
@@ -551,15 +578,15 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   N/S/M/H) — the daemon's current-mode source. Bytes 4+5 are one field, the
   live menu cursor used to close the loop on a walk (`00`/`80` = NORMAL,
   `80`/`00` SPORT, `40` MOUNTAIN, `20` HOLD, both `00` = menu closed).
-- **Shift/PRNDL → `0x1F5` byte 3** (`1`–`5` = P/R/N/D/L). `SafetyGate` blocks
-  injection unless in DRIVE, and blocks on UNKNOWN.
+- **Shift/PRNDL → `0x1F5` byte 3** (`1`–`5` = P/R/N/D/L). Decoded and
+  reported; not a `SafetyGate` precondition (see "Safety model").
 - **Ignition/drive-cycle start** — no dedicated signal needed. The Pi is
   powered only while the car is usable and the reconciler is level-triggered,
   so there is no ignition edge to catch.
 - **SOC → `22 005B` UDS poll** (Session 9). Exact pack percent = `raw·100/255`
   from a ~10 s service-22 poll; the gauge↔SOC curve is `SOC% ≈
-  7.07·bars + 19.6` (r = 0.999). The floor engages at 33 % (3→2 bar drop),
-  releases at 41 % (4→3 bar). This unblocked the armed reconciler.
+  7.07·bars + 19.6` (r = 0.999). The floor engages at 30 % (mid-2-bar) and
+  latches for the rest of the key cycle. This unblocked the armed reconciler.
 
 ### Still open
 
