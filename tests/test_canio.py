@@ -208,8 +208,13 @@ def test_decode_listener_ignores_short_frame_without_byte5():
 #     because the Notifier thread lags on a busy bus and the stashed frame was
 #     already stale; a stale counter is the frozen-counter echo the cluster
 #     ignored in session 2.
-# A second bound socket sees every frame (SocketCAN fans out) and nothing else
-# consumes it, so the echo is both uncontended and current.
+#   * a dedicated 0x1E1-filtered socket, read only during a press -- still
+#     stale, and worst of the three at 58% (2 MISSes in 12 probes). Nothing
+#     drains it between taps, so it queued ~52 frames over the 1.6 s walk gap
+#     and recv() returned the oldest, 1582 ms behind the module.
+# All three are the same root cause in different disguises: the echo carried a
+# spent counter. The fix is a second bound socket (SocketCAN fans every frame
+# out, so no contention) that is DRAINED before each press (so no staleness).
 class _EchoFakeBus:
     """Models a socket with a stale BACKLOG and later ARRIVALS.
 
