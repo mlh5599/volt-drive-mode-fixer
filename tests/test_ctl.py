@@ -117,7 +117,7 @@ def test_walk_test_request_shape_and_output(tmp_path, capsys):
 
 def test_test_mode_request_shape_and_output(tmp_path, capsys):
     with _CannedServer(tmp_path, {"ok": True, "test_mode": True,
-                                  "setpoint": "auto"}) as srv:
+                                  "setpoint": "hold"}) as srv:
         rc = ctl.main(["--socket", srv.path, "test-mode", "on"])
     assert rc == 0
     assert srv.request == {"cmd": "test-mode", "on": True}
@@ -128,7 +128,7 @@ def test_test_mode_request_shape_and_output(tmp_path, capsys):
 
 def test_test_mode_off_request_shape(tmp_path, capsys):
     with _CannedServer(tmp_path, {"ok": True, "test_mode": False,
-                                  "setpoint": "auto"}) as srv:
+                                  "setpoint": "hold"}) as srv:
         rc = ctl.main(["--socket", srv.path, "test-mode", "off"])
     assert rc == 0
     assert srv.request == {"cmd": "test-mode", "on": False}
@@ -159,7 +159,7 @@ def test_probe_rejects_bad_mode_at_argparse(tmp_path):
 
 
 def test_status_shows_test_mode_and_probe_verdict(tmp_path, capsys):
-    state = {"transmit_enabled": True, "setpoint": "auto", "drive_mode": "normal",
+    state = {"transmit_enabled": True, "setpoint": "hold", "drive_mode": "normal",
              "test_mode": True,
              "probe": {"target": "hold", "verdict": "CURSOR_ONLY", "taps": 4,
                        "cursor_reached": True, "byte1_after": "normal"}}
@@ -171,10 +171,39 @@ def test_status_shows_test_mode_and_probe_verdict(tmp_path, capsys):
     assert "hold -> CURSOR_ONLY" in out
 
 
-def test_setpoint_rejects_non_setpoint_mode_at_argparse(tmp_path):
+def test_setpoint_next_request_shape(tmp_path, capsys):
+    """`next` is what an SW1 tap sends; the daemon resolves the detent."""
+    with _CannedServer(tmp_path, {"ok": True, "setpoint": "off",
+                                  "previous": "mountain"}) as srv:
+        rc = ctl.main(["--socket", srv.path, "setpoint", "next"])
+    assert rc == 0
+    assert srv.request == {"cmd": "setpoint", "mode": "next"}
+    assert "setpoint = off" in capsys.readouterr().out
+
+
+def test_setpoint_off_request_shape(tmp_path):
+    with _CannedServer(tmp_path, {"ok": True, "setpoint": "off"}) as srv:
+        rc = ctl.main(["--socket", srv.path, "setpoint", "off"])
+    assert rc == 0
+    assert srv.request == {"cmd": "setpoint", "mode": "off"}
+
+
+@pytest.mark.parametrize("bad", ["normal", "sport", "auto"])
+def test_setpoint_rejects_a_non_detent_at_argparse(tmp_path, bad):
     with pytest.raises(SystemExit) as ei:
-        ctl.main(["--socket", str(tmp_path / "x"), "setpoint", "normal"])
+        ctl.main(["--socket", str(tmp_path / "x"), "setpoint", bad])
     assert ei.value.code == 2
+
+
+def test_status_calls_out_that_off_disables_the_floor(tmp_path, capsys):
+    state = {"transmit_enabled": True, "setpoint": "off", "drive_mode": "normal",
+             "floor_latched": False}
+    with _CannedServer(tmp_path, {"ok": True, "state": state}) as srv:
+        rc = ctl.main(["--socket", srv.path, "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "selector:   off" in out
+    assert "floor disabled" in out
 
 
 def test_ok_false_reply_exits_one(tmp_path, capsys):

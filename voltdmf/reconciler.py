@@ -2,40 +2,76 @@
 
 One object holds the two pieces of runtime policy state:
 
-* **setpoint** -- ``None`` (passive / ``auto``) or a HOLD <-> MOUNTAIN toggle
-  the driver moves with the panel button (``voltdmf-ctl setpoint``). Not
-  persisted; every boot starts at ``default_setpoint``, which is ``auto`` on
-  the shipped config -- the reconciler then enforces *nothing* until the
-  driver picks HOLD or MOUNTAIN, or the SOC-HOLD floor engages.
+* **selector position** -- a three-position rotary the driver advances with a
+  SW1 tap (``voltdmf-ctl setpoint next``). Not persisted; every boot starts at
+  ``default_position``:
+
+  1. ``hold``     -- the shipped boot default. Passive on a healthy pack: the
+     car drives on battery exactly as it normally would, and the SOC-HOLD
+     floor engages HOLD only once the pack falls to
+     ``hold_threshold_percent``. This is "hold the battery at 30 %".
+  2. ``mountain`` -- enforce MOUNTAIN continuously, from loop 1.
+  3. ``off``      -- do nothing at all. No enforcement, and the SOC-HOLD floor
+     is disabled and its latch cleared: the car behaves exactly as if the
+     device were not plugged in. This is the only position in which the floor
+     does not protect the pack.
+
 * **floor latch** -- the SOC-HOLD floor. Engages when the pack drops to
   ``hold_threshold_percent`` and stays latched (in memory only) until a fresh
-  poll reads back above ``hold_reset_percent``.
+  poll reads back above ``hold_reset_percent``. Active in ``hold`` and
+  ``mountain``, disabled in ``off``.
 
 :meth:`Reconciler.desired_mode` runs every loop pass and returns the mode the
-car *should* be in right now: HOLD whenever the floor is latched (the floor
-always wins), otherwise the setpoint -- which may be ``None``, meaning "no
-target, leave the car wherever the driver has it". The daemon compares a
-concrete result to the live ``0x1F4`` mode and, when armed, asks
-:class:`voltdmf.safety.SafetyGate` to walk the menu there; ``None`` is a
-no-op.
+car *should* be in right now: ``None`` in ``off``; otherwise HOLD whenever the
+floor is latched (the floor always wins), else MOUNTAIN in the ``mountain``
+position, else ``None`` -- "no target, leave the car wherever the driver has
+it". The daemon compares a concrete result to the live ``0x1F4`` mode and,
+when armed, asks :class:`voltdmf.safety.SafetyGate` to walk the menu there;
+``None`` is a no-op.
 
 Session 9 calibration: the 3->2 gauge-bar drop sits at ~33.7 % diag SOC and
-HOLD is charge-sustaining there, so the floor targets "don't fall below
-2 bars" -- engage 33 %, release 41 % (the 3-bar mark). ``0x096`` byte 3 is a
-coarse failsafe: if the poll stops answering and b3 drops to
-``bar_failsafe_raw`` (~2 bars), force HOLD until a real poll reading returns.
+HOLD is charge-sustaining there. The floor targets "don't fall below 2 bars":
+the shipped engage point is 30 % (mid-2-bar, the driver-facing "hold at 30 %")
+and it releases at 41 %, the 3-bar mark. ``0x096`` byte 3 is a coarse
+failsafe: if the poll stops answering and b3 drops to ``bar_failsafe_raw``
+(~2 bars), force HOLD until a real poll reading returns.
+
+Note for anyone reading older code or logs: the selector used to be a
+two-way HOLD<->MOUNTAIN toggle plus an ``auto`` default, where ``setpoint
+hold`` meant "enforce HOLD continuously". That position is gone -- position 1
+is now named ``hold`` but means the *floor*, which is what today's ``auto``
+did. ``voltdmf-ctl set-mode hold`` still does a one-shot manual switch.
 """
 
 from __future__ import annotations
 
-from .config import Config
+from enum import Enum
+
+from typing import TYPE_CHECKING
+
 from .signals import DriveMode
 from .state import VehicleState
 
-#: The only two modes the setpoint toggle can take (``None`` = passive/auto).
-SETPOINTS: tuple[DriveMode, ...] = (DriveMode.HOLD, DriveMode.MOUNTAIN)
+if TYPE_CHECKING:                 # config imports Position from here, so the
+    from .config import Config    # runtime import would be circular
 
-#: Config / wire string for the passive (no-target) setpoint.
+class Position(str, Enum):
+    """One detent of the SW1 selector. ``str`` so it serialises as its value."""
+
+    #: Passive on a healthy pack; the SOC-HOLD floor is the only actor.
+    HOLD = "hold"
+    #: Enforce MOUNTAIN continuously (the floor still wins if it engages).
+    MOUNTAIN = "mountain"
+    #: Do nothing; floor disabled. As if the device were not plugged in.
+    OFF = "off"
+
+
+#: SW1 tap order. A fourth tap returns to the first position.
+CYCLE: tuple[Position, ...] = (Position.HOLD, Position.MOUNTAIN, Position.OFF)
+
+#: Back-compat: ``auto`` was the old name for what is now ``hold`` -- passive
+#: with the floor live. Accepted on the wire and in config so an older
+#: config.yaml or a muscle-memory command keeps working.
 AUTO = "auto"
 
 #: A poll reply older than this is "stale" -- fall back to the b3 failsafe.
@@ -53,56 +89,83 @@ class Reconciler:
         hold_threshold_percent: float,
         hold_reset_percent: float,
         bar_failsafe_raw: int,
-        default_setpoint: DriveMode | None = None,
+        default_position: Position = Position.HOLD,
         poll_stale_s: float = DEFAULT_POLL_STALE_S,
     ) -> None:
         if hold_reset_percent <= hold_threshold_percent:
             raise ValueError("hold_reset_percent must be > hold_threshold_percent")
-        if default_setpoint is not None and default_setpoint not in SETPOINTS:
-            raise ValueError("default_setpoint must be hold, mountain, or None (auto)")
+        if default_position not in CYCLE:
+            raise ValueError(
+                f"default_position must be one of {[p.value for p in CYCLE]}, "
+                f"not {getattr(default_position, 'value', default_position)!r}")
         self._hold_threshold = hold_threshold_percent
         self._hold_reset = hold_reset_percent
         self._bar_failsafe = bar_failsafe_raw
         self._poll_stale_s = poll_stale_s
-        self._setpoint: DriveMode | None = default_setpoint
+        self._position: Position = default_position
         self._floor_latched = False
         self._floor_source: str | None = None  # "poll" | "bar" while latched
 
-    # -- setpoint -------------------------------------------------------------
+    # -- selector position ---------------------------------------------------
     @property
-    def setpoint(self) -> DriveMode | None:
-        """The driver's selected setpoint, or ``None`` when passive (auto)."""
-        return self._setpoint
+    def position(self) -> Position:
+        """The selector detent the driver has SW1 on."""
+        return self._position
 
     @property
     def setpoint_label(self) -> str:
-        """``"hold"`` / ``"mountain"`` / ``"auto"`` -- safe for logs and JSON."""
-        return self._setpoint.value if self._setpoint is not None else AUTO
+        """``"hold"`` / ``"mountain"`` / ``"off"`` -- safe for logs and JSON."""
+        return self._position.value
 
     @property
     def floor_latched(self) -> bool:
         return self._floor_latched
 
-    def set_setpoint(self, mode: DriveMode) -> None:
-        """Move the HOLD <-> MOUNTAIN toggle. Rejects any other mode."""
-        if mode not in SETPOINTS:
+    def set_position(self, position: Position) -> None:
+        """Jump the selector straight to ``position``."""
+        if position not in CYCLE:
             raise ValueError(
-                f"setpoint must be one of {[m.value for m in SETPOINTS]}, "
-                f"not {getattr(mode, 'value', mode)!r}"
+                f"position must be one of {[p.value for p in CYCLE]}, "
+                f"not {getattr(position, 'value', position)!r}"
             )
-        self._setpoint = mode
+        self._position = position
+        if position is Position.OFF:
+            # Leave nothing latched behind: OFF means the device is not
+            # acting, and a latch surviving here would re-assert HOLD the
+            # instant the driver taps back to a live position, on a reading
+            # that may be minutes stale.
+            self._floor_latched = False
+            self._floor_source = None
+
+    def advance(self) -> Position:
+        """One SW1 tap: step to the next detent, wrapping. Returns the new one.
+
+        The daemon owns this cycle, not the button helper. A helper keeping its
+        own index would drift out of step with the daemon on any restart or
+        any ``voltdmf-ctl setpoint`` from the shell, and the driver would then
+        need two taps to get one move.
+        """
+        self.set_position(CYCLE[(CYCLE.index(self._position) + 1) % len(CYCLE)])
+        return self._position
 
     # -- the decision ------------------------------------------------------
     def desired_mode(self, state: VehicleState) -> DriveMode | None:
-        """The mode the car should be in now: HOLD if the floor is latched,
-        otherwise the current setpoint -- which is ``None`` when passive
-        (``auto``), meaning "no target, leave the car alone". The daemon
-        decides whether to act on a concrete result (armed) or just log it
-        (disarmed); ``None`` it ignores."""
+        """The mode the car should be in now.
+
+        ``OFF`` short-circuits to ``None`` *before* the floor is evaluated --
+        that is what makes the position mean "as if the device were not
+        plugged in". Otherwise the floor wins when latched, then MOUNTAIN in
+        the mountain position, else ``None`` ("leave the car alone"). The
+        daemon acts on a concrete result when armed and ignores ``None``.
+        """
+        if self._position is Position.OFF:
+            return None
         self._update_floor(state)
         if self._floor_latched:
             return DriveMode.HOLD
-        return self._setpoint
+        if self._position is Position.MOUNTAIN:
+            return DriveMode.MOUNTAIN
+        return None
 
     def _update_floor(self, state: VehicleState) -> None:
         # Preferred input: a fresh exact reading from the 22 005B poll.
@@ -130,7 +193,9 @@ class Reconciler:
     # -- introspection --------------------------------------------------
     def snapshot(self) -> dict:
         return {
-            "setpoint": self.setpoint_label,
+            "setpoint": self.setpoint_label,      # kept: the wire field name
+            "position": self._position.value,
+            "cycle": [p.value for p in CYCLE],
             "floor_latched": self._floor_latched,
             "floor_source": self._floor_source,
             "hold_threshold_percent": self._hold_threshold,
@@ -140,7 +205,7 @@ class Reconciler:
 
 
 def build_reconciler(
-    config: Config, *, poll_stale_s: float = DEFAULT_POLL_STALE_S
+    config: "Config", *, poll_stale_s: float = DEFAULT_POLL_STALE_S
 ) -> Reconciler:
     """Instantiate the reconciler from a parsed :class:`Config`."""
     p = config.policy
@@ -148,6 +213,6 @@ def build_reconciler(
         hold_threshold_percent=p.hold_threshold_percent,
         hold_reset_percent=p.hold_reset_percent,
         bar_failsafe_raw=p.bar_failsafe_raw,
-        default_setpoint=p.default_setpoint,
+        default_position=p.default_position,
         poll_stale_s=poll_stale_s,
     )

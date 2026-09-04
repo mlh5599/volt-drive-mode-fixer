@@ -11,13 +11,14 @@ from voltdmf.canio import CanInterface
 from voltdmf.config import parse_config
 from voltdmf.daemon import Daemon
 from voltdmf.safety import RequestOutcome
+from voltdmf.reconciler import Position
 from voltdmf.signals import DriveMode, ShiftPosition
 from voltdmf.state import VehicleState
 
 
-def _config(**over):
+def _config(*, position="hold", **over):
     raw = {
-        "policy": {"default_setpoint": "hold", "hold_threshold_percent": 33,
+        "policy": {"default_position": position, "hold_threshold_percent": 30,
                    "hold_reset_percent": 41, "bar_failsafe_raw": 9},
         "soc_poll": {"enabled": True, "period_seconds": 10},
     }
@@ -25,8 +26,8 @@ def _config(**over):
     return parse_config(raw)
 
 
-def _daemon(*, start_armed=True, config_path=None):
-    return Daemon(_config(), lcd=False, start_armed=start_armed,
+def _daemon(*, start_armed=True, config_path=None, position="hold"):
+    return Daemon(_config(position=position), lcd=False, start_armed=start_armed,
                   control_enabled=False, config_path=config_path)
 
 
@@ -109,37 +110,48 @@ def test_set_mode_blocked_outcome_is_not_ok_and_no_override():
     assert d._manual_target is None
 
 
-# --- setpoint --------------------------------------------------------
-def test_setpoint_moves_the_reconciler_toggle():
+# --- setpoint (the three-position selector) ---------------------------
+def test_setpoint_jumps_to_an_explicit_detent():
     d = _daemon()
-    assert d._reconciler.setpoint is DriveMode.HOLD
+    assert d._reconciler.position is Position.HOLD
     reply = d._handle_command("setpoint", {"mode": "mountain"})
-    assert reply == {"ok": True, "setpoint": "mountain"}
-    assert d._reconciler.setpoint is DriveMode.MOUNTAIN
+    assert reply["ok"] is True
+    assert reply["setpoint"] == "mountain"
+    assert reply["previous"] == "hold"
+    assert d._reconciler.position is Position.MOUNTAIN
 
 
-@pytest.mark.parametrize("bad", ["normal", "sport", "ludicrous"])
-def test_setpoint_rejects_non_setpoint_modes(bad):
+def test_setpoint_next_walks_the_sw1_cycle_and_wraps():
+    """What an SW1 tap sends. The daemon owns the cycle, not the helper."""
+    d = _daemon()
+    seen = []
+    for _ in range(4):
+        seen.append(d._handle_command("setpoint", {"mode": "next"})["setpoint"])
+    assert seen == ["mountain", "off", "hold", "mountain"]
+
+
+@pytest.mark.parametrize("bad", ["normal", "sport", "auto", "ludicrous"])
+def test_setpoint_rejects_a_non_detent(bad):
     d = _daemon()
     reply = d._handle_command("setpoint", {"mode": bad})
     assert reply["ok"] is False
-    assert d._reconciler.setpoint is DriveMode.HOLD
+    assert d._reconciler.position is Position.HOLD
 
 
 # --- reconcile -----------------------------------------------------
 def test_reconcile_acts_when_armed_and_clears_manual_override():
-    d = _daemon()
+    d = _daemon(position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._manual_target = DriveMode.SPORT
     d._reconcile()
-    # default setpoint is HOLD, car reads NORMAL -> a walk is requested
-    assert d._gate.request_calls == [DriveMode.HOLD]
+    # selector on MOUNTAIN, car reads NORMAL -> a walk is requested
+    assert d._gate.request_calls == [DriveMode.MOUNTAIN]
     assert d._manual_target is None
 
 
 def test_reconcile_is_logging_only_when_disarmed():
-    d = _daemon(start_armed=False)
+    d = _daemon(start_armed=False, position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._reconcile()
@@ -147,27 +159,48 @@ def test_reconcile_is_logging_only_when_disarmed():
 
 
 def test_reconcile_noop_when_already_in_desired_mode():
-    d = _daemon()
-    d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.HOLD)
+    d = _daemon(position="mountain")
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.MOUNTAIN)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._reconcile()
     assert d._gate.request_calls == []
 
 
-def test_reconcile_noop_with_passive_default_on_a_healthy_pack():
-    cfg = _config(policy={"default_setpoint": "auto", "hold_threshold_percent": 33,
-                          "hold_reset_percent": 41, "bar_failsafe_raw": 9})
-    d = Daemon(cfg, lcd=False, control_enabled=False)
-    assert d._reconciler.setpoint is None
+def test_reconcile_noop_on_the_hold_detent_with_a_healthy_pack():
+    """Position 1 is passive above the floor -- the shipped boot behaviour."""
+    d = _daemon()
+    assert d._reconciler.position is Position.HOLD
     d._state = _active_state(shift=ShiftPosition.DRIVE,
                              drive_mode=DriveMode.NORMAL, soc_percent=80)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._reconcile()
-    assert d._gate.request_calls == []          # auto + healthy -> no target
+    assert d._gate.request_calls == []          # healthy pack -> no target
+
+
+def test_reconcile_noop_on_the_off_detent_even_with_a_flat_pack():
+    """`off` means the car is on its own -- the floor does not act either."""
+    d = _daemon(position="off")
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.NORMAL, soc_bar_raw=0)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []
+    assert d._reconciler.floor_latched is False
+
+
+def test_reconcile_walks_to_hold_when_the_soc_floor_engages():
+    d = _daemon()                               # passive detent...
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.NORMAL, soc_bar_raw=9)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()                              # ...until the floor engages
+    assert d._gate.request_calls == [DriveMode.HOLD]
+    assert d._reconciler.floor_latched is True
 
 
 def test_reconcile_waits_for_a_decodable_current_mode():
-    d = _daemon()  # default_setpoint hold
+    d = _daemon(position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=None)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
     d._reconcile()
@@ -176,25 +209,25 @@ def test_reconcile_waits_for_a_decodable_current_mode():
 
 # --- post-walk settle guard --------------------------------------------
 def test_reconcile_arms_walk_settle_after_a_sent_walk():
-    d = _daemon()
+    d = _daemon(position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(True, 3, False, "ok"))  # request() -> sent
     d._reconcile()
-    assert d._gate.request_calls == [DriveMode.HOLD]
+    assert d._gate.request_calls == [DriveMode.MOUNTAIN]
     assert d._walk_settle_until > time.monotonic()
 
 
 def test_reconcile_holds_off_while_walk_settle_is_active():
-    d = _daemon()
+    d = _daemon(position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(True, 3, False, "ok"))
     d._reconcile()                              # walk 1 -> settle armed
     d._reconcile()                              # byte-1 still NORMAL (commit lag)
-    assert d._gate.request_calls == [DriveMode.HOLD]   # not re-requested
+    assert d._gate.request_calls == [DriveMode.MOUNTAIN]   # not re-requested
 
 
 def test_reconcile_does_not_arm_settle_when_no_walk_went_out():
-    d = _daemon()
+    d = _daemon(position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(False, 0, True, "blocked"))  # request() -> False
     d._reconcile()
@@ -321,8 +354,7 @@ class _ProbeController:
 
 
 def test_test_mode_on_off_toggles_flag_and_suspends_reconcile():
-    d = _daemon()
-    d._reconciler.set_setpoint(DriveMode.HOLD)
+    d = _daemon(position="mountain")
     d._state = _active_state(shift=ShiftPosition.DRIVE, drive_mode=DriveMode.NORMAL)
     d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
 
@@ -334,7 +366,7 @@ def test_test_mode_on_off_toggles_flag_and_suspends_reconcile():
 
     assert d._handle_command("test-mode", {"on": False})["test_mode"] is False
     d._reconcile()                       # resumed -> acts
-    assert d._gate.request_calls == [DriveMode.HOLD]
+    assert d._gate.request_calls == [DriveMode.MOUNTAIN]
 
 
 def test_probe_refused_when_disarmed():
@@ -539,7 +571,7 @@ def test_run_probe_arms_and_disarms_the_per_tap_trace(monkeypatch):
 
 # --- reload ----------------------------------------------------------
 _RELOAD_YAML = (
-    "policy:\n  default_setpoint: hold\n  hold_threshold_percent: 20\n"
+    "policy:\n  default_position: hold\n  hold_threshold_percent: 20\n"
     "  hold_reset_percent: 35\n  bar_failsafe_raw: 8\n"
     "soc_poll:\n  enabled: true\n  period_seconds: 15\n"
 )
@@ -551,7 +583,7 @@ def test_reload_without_path():
     assert "reload unavailable" in reply["error"]
 
 
-def test_reload_rereads_file_and_keeps_setpoint(tmp_path):
+def test_reload_rereads_file_and_keeps_the_selector_position(tmp_path):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_RELOAD_YAML)
     d = _daemon(config_path=str(cfg))
@@ -567,7 +599,7 @@ def test_reload_rereads_file_and_keeps_setpoint(tmp_path):
 
 def test_reload_bad_config_reports_error(tmp_path):
     cfg = tmp_path / "bad.yaml"
-    cfg.write_text("policy: {default_setpoint: banana}\n")
+    cfg.write_text("policy: {default_position: banana}\n")
     d = _daemon(config_path=str(cfg))
     reply = d._handle_command("reload", {})
     assert reply["ok"] is False

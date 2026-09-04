@@ -7,14 +7,18 @@ reduced-propulsion mode.
 A single **level-triggered reconciler** continuously drives the car toward a
 desired mode:
 
-- **SOC-HOLD floor** — always active. When SOC falls to a configurable
-  percentage (target: ~2 gauge bars) the reconciler holds the car in Hold
-  Mode until the pack recovers. This floor always wins.
-- **Setpoint** — `auto` at boot (no target; the daemon leaves the car alone
-  above the floor). A panel button then selects **HOLD** or **MOUNTAIN**,
-  which the reconciler enforces above the floor. Not persisted; every boot
-  starts back at `auto`.
-- *(Roadmap)* **Trip Mode** — a speed-based setpoint that banks EV range on
+- **Three-position selector** — one panel button (SW1), tapped forward, with
+  a fourth tap returning to the first position. Not persisted; every boot
+  starts back at position 1.
+  1. **`hold`** (default) — hold the pack at 30 %. Passive above that: the car
+     drives exactly as it normally would until the SOC-HOLD floor engages.
+  2. **`mountain`** — enforce Mountain Mode continuously.
+  3. **`off`** — do nothing at all, SOC floor included: the car behaves as if
+     the device were not plugged in.
+- **SOC-HOLD floor** — live in positions 1 and 2, and it always wins there.
+  When SOC falls to a configurable percentage (30 %, ≈ 2 gauge bars) the
+  reconciler holds the car in Hold Mode until the pack recovers.
+- *(Roadmap)* **Trip Mode** — a speed-based detent that banks EV range on
   the highway, based on
   [vix597/chevy-volt-trip-mode](https://github.com/vix597/chevy-volt-trip-mode).
 
@@ -32,11 +36,11 @@ status signal (`0x1F4` byte 1, the daemon's mode source), and shift/PRNDL
 (`0x1F5` byte 3); the closed-loop menu walk has an on-road PASS. Session 9
 resolved SOC — the `22 005B` UDS poll gives exact pack percent and the
 gauge↔SOC curve is near-linear — so the reconciler and its SOC-HOLD floor are
-now **implemented**. `--dry-run` is gone: the daemon boots **armed** but
-passive (`default_setpoint: auto` — no target until the driver picks a
-setpoint or the SOC floor engages), and `voltdmf-ctl disarm` is the mid-drive
-stop. Still to do: migrate the out-of-repo `roles/voltdmf` ExecStart /
-`config.yaml`, then validate the 33 % floor timing over several drives.
+now **implemented**. `--dry-run` is gone: the daemon boots **armed** on the
+first detent of the selector (`default_position: hold` — passive until the
+SOC floor engages), and `voltdmf-ctl disarm` is the mid-drive stop. Still to
+do: migrate the out-of-repo `roles/voltdmf` ExecStart / `config.yaml`, then
+validate the 30 % floor timing over several drives.
 Progress and next steps:
 [`docs/phase-c-field-checklist.md`](docs/phase-c-field-checklist.md) and
 [`docs/field-session-log.md`](docs/field-session-log.md).
@@ -66,19 +70,20 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 `--start-disarmed` boots with transmission suppressed (the reconciler still
 runs and logs what it *would* do, and the `22 005B` SOC poll still transmits)
 — the safe mode for bench work. Normally the daemon boots **armed** but
-passive: with `default_setpoint: auto` it has no target and walks the car
-nowhere until the driver selects HOLD/MOUNTAIN or the SOC-HOLD floor engages.
+passive: with `default_position: hold` it has no target and walks the car
+nowhere until the SOC-HOLD floor engages or the driver taps SW1 round to
+`mountain`.
 
 The daemon runs permanently as root under systemd; change modes and daemon
 state from an unprivileged account with `voltdmf-ctl` (`status` / `arm` /
-`disarm` / `setpoint <hold|mountain>` / `set-mode <mode>` / `reload` /
+`disarm` / `setpoint <hold|mountain|off|next>` / `set-mode <mode>` / `reload` /
 `walk-test` / `test-mode <on|off>` / `probe <mode>`) over its control socket.
 `voltdmf-ctl disarm` is the mid-drive
 stop. See `host/README.md` §"Runtime control" and DESIGN.md §"Runtime
-control". The panel SW1 tap drives `setpoint` and an SW1 solo-hold (≥ 8 s)
-drives `walk-test` — a closed-loop mode-walk self-test that cycles every mode
-and restores the start mode. The SOC-HOLD floor overrides the setpoint to HOLD
-whenever the pack is low.
+control". The panel SW1 tap sends `setpoint next` — one detent forward — and
+an SW1 solo-hold (≥ 8 s) drives `walk-test`, a closed-loop mode-walk self-test
+that cycles every mode and restores the start mode. The SOC-HOLD floor
+overrides to HOLD whenever the pack is low, in every position but `off`.
 
 **Hardware:** PiCAN2 (Raspberry Pi CAN-bus HAT) + Raspberry Pi 3B, connected
 to the OBD-II port via an off-the-shelf OBD-II-to-DB9 cable, powered from

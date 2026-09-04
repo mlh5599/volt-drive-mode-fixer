@@ -17,14 +17,10 @@ from pathlib import Path
 
 import yaml
 
-from .signals import DriveMode
+from .reconciler import CYCLE, Position
 
-#: The setpoint toggle only moves between these two (HOLD is the floor's
-#: target, MOUNTAIN is charge-building). NORMAL / SPORT are never a setpoint.
-SETPOINT_MODES: tuple[DriveMode, ...] = (DriveMode.HOLD, DriveMode.MOUNTAIN)
-
-#: ``default_setpoint`` value that boots the reconciler passive -- it enforces
-#: nothing until the driver picks HOLD/MOUNTAIN or the SOC floor engages.
+#: ``auto`` was the old name for the passive-with-floor position, which is
+#: now called ``hold``. Still accepted so an older config.yaml keeps loading.
 SETPOINT_AUTO = "auto"
 
 
@@ -34,9 +30,11 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    #: Boot value of the setpoint: ``None`` (config ``auto``) starts passive,
-    #: else HOLD / MOUNTAIN is enforced from the first loop. Not persisted.
-    default_setpoint: DriveMode | None
+    #: Boot detent of the SW1 selector, not persisted. ``hold`` (the shipped
+    #: default) is passive with the SOC floor live, ``mountain`` enforces
+    #: MOUNTAIN, ``off`` disables everything including the floor. See
+    #: :mod:`voltdmf.reconciler` for the full position semantics.
+    default_position: Position
     #: Diag SOC at/below which the floor forces HOLD.
     hold_threshold_percent: float
     #: Diag SOC at/above which the floor releases (hysteresis).
@@ -65,20 +63,40 @@ def _require(mapping, key: str, section: str):
     return mapping[key]
 
 
-def _as_setpoint(value, section: str) -> DriveMode | None:
+#: Preferred policy key for the boot detent. ``default_setpoint`` is the old
+#: name and is still read, so a config.yaml deployed before the three-position
+#: selector keeps loading (its ``auto`` maps to ``hold``).
+_POSITION_KEY = "default_position"
+_LEGACY_POSITION_KEY = "default_setpoint"
+
+
+def _policy_position(p_raw: dict):
+    """The boot-position value, from either key. Neither present is an error;
+    both present is too, rather than silently preferring one."""
+    has_new = _POSITION_KEY in p_raw
+    has_old = _LEGACY_POSITION_KEY in p_raw
+    if has_new and has_old:
+        raise ConfigError(
+            f"policy: set only one of {_POSITION_KEY} / {_LEGACY_POSITION_KEY} "
+            f"({_LEGACY_POSITION_KEY} is the old name for the same setting)")
+    if has_new:
+        return p_raw[_POSITION_KEY]
+    if has_old:
+        return p_raw[_LEGACY_POSITION_KEY]
+    raise ConfigError(f"policy: missing required key '{_POSITION_KEY}'")
+
+
+def _as_position(value, section: str, key: str) -> Position:
     text = str(value).strip().lower()
     if text == SETPOINT_AUTO:
-        return None
+        return Position.HOLD          # old name for the same behaviour
     try:
-        mode = DriveMode(text)
+        return Position(text)
     except ValueError:
-        mode = None
-    if mode not in SETPOINT_MODES:
-        allowed = ", ".join((SETPOINT_AUTO, *(m.value for m in SETPOINT_MODES)))
+        allowed = ", ".join((*(p.value for p in CYCLE), SETPOINT_AUTO))
         raise ConfigError(
-            f"{section}: default_setpoint '{value}' is not one of: {allowed}"
-        )
-    return mode
+            f"{section}: {key} '{value}' is not one of: {allowed}"
+        ) from None
 
 
 def _as_percent(value, section: str, key: str) -> float:
@@ -120,8 +138,8 @@ def parse_config(raw: dict) -> Config:
             f"hold_threshold_percent (got reset={reset}, threshold={threshold})"
         )
     policy = PolicyConfig(
-        default_setpoint=_as_setpoint(
-            _require(p_raw, "default_setpoint", "policy"), "policy"
+        default_position=_as_position(
+            _policy_position(p_raw), "policy", _POSITION_KEY
         ),
         hold_threshold_percent=threshold,
         hold_reset_percent=reset,

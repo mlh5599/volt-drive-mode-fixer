@@ -1,19 +1,24 @@
 # Volt Drive Mode Fixer -- example config.
 # Schema and rationale: see DESIGN.md "Mode policy".
 #
-# The daemon boots armed and runs a level-triggered reconciler. With
-# `default_setpoint: auto` it enforces nothing until the driver picks HOLD or
-# MOUNTAIN with the panel button (or `voltdmf-ctl setpoint`); a restart on a
-# healthy pack then leaves the car where it is. The SOC-HOLD floor still
-# overrides to HOLD whenever the pack is low, from any setpoint including auto.
-# `voltdmf-ctl disarm` is the mid-drive stop.
+# The daemon boots armed and runs a level-triggered reconciler against a
+# three-position selector the driver advances with a panel SW1 tap:
+#
+#   1. hold      hold the pack at `hold_threshold_percent`. Passive above it,
+#                so a restart on a healthy pack leaves the car where it is;
+#                the SOC-HOLD floor walks the car to HOLD once it drops.
+#   2. mountain  enforce MOUNTAIN continuously (the floor still wins).
+#   3. off       do nothing, floor disabled -- the car behaves as if the
+#                device were not plugged in.
+#
+# A fourth tap returns to `hold`. `voltdmf-ctl disarm` is the mid-drive stop.
 
 policy:
-  default_setpoint: auto        # auto | hold | mountain -- boot value, not persisted.
-                                # auto: no target until the driver selects one
-                                # or the SOC floor engages.
-  hold_threshold_percent: 33    # floor forces HOLD at/below this diag SOC
-  hold_reset_percent: 41        # floor releases at/above this (hysteresis)
+  default_position: hold        # hold | mountain | off -- boot detent, not
+                                # persisted; every key cycle starts here.
+  hold_threshold_percent: 30    # floor forces HOLD at/below this diag SOC
+  hold_reset_percent: 41        # floor releases at/above this (hysteresis;
+                                # 41% is the 3-bar mark, Session-9 calibration)
   bar_failsafe_raw: 9           # 0x096 b3 <= this forces HOLD if the poll is stale
                                 # (~2 gauge bars; Session-9 calibration)
 

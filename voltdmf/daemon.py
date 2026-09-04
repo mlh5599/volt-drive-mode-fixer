@@ -9,9 +9,9 @@ the daemon stays passive rather than dying or retrying mid-burst (DESIGN.md
 SOC poll -- a read, sent armed or disarmed.
 
 The daemon runs permanently under systemd as root. It **boots armed**, but the
-shipped config's ``default_setpoint: auto`` means it enforces nothing until
-the driver picks HOLD/MOUNTAIN (panel SW1) or the SOC-HOLD floor engages -- a
-restart on a healthy pack leaves the car where it is. ``voltdmf-ctl disarm``
+shipped config's ``default_position: hold`` is passive: it enforces nothing
+until the driver taps SW1 round to MOUNTAIN or the SOC-HOLD floor engages --
+a restart on a healthy pack leaves the car where it is. ``voltdmf-ctl disarm``
 is the mid-drive stop. Operators steer it from an unprivileged account through the
 control socket (:mod:`voltdmf.control`, ``voltdmf-ctl``): ``status`` is
 answered read-only on the socket thread; ``set-mode`` / ``setpoint`` / ``arm``
@@ -31,7 +31,7 @@ from .canio import CanInterface
 from .config import Config, ConfigError, load_config
 from .lcddash import LcdDashboard
 from .modecycle import ModeCycleController
-from .reconciler import Reconciler, build_reconciler
+from .reconciler import CYCLE, Position, Reconciler, build_reconciler
 from .safety import SafetyGate
 from .signals import UDS_SOC_REQ_IDS, DriveMode
 from .state import VehicleState
@@ -247,7 +247,7 @@ class Daemon:
             if self._lcd:
                 # arm/disarm gates CAN *transmission* only; the watch screen is
                 # a display, so it always drives the real panel. The disarmed
-                # state still shows on it -- see the "OFF " tag in _lcd_status.
+                # state still shows on it -- see the "DIS " tag in _lcd_status.
                 dash = LcdDashboard(state, self._lcd_status,
                                     channel=self._channel, **self._lcd_opts)
                 dash.start()
@@ -403,8 +403,8 @@ class Daemon:
         if state.drive_mode is None:
             return
         desired = self._reconciler.desired_mode(state)
-        # desired is None => passive setpoint (auto) and the floor is clear:
-        # enforce nothing, leave the car wherever the driver has it.
+        # desired is None => the selector is on `hold` with the floor clear,
+        # or on `off`: enforce nothing, leave the car where the driver has it.
         if desired is None or desired == state.drive_mode:
             return
 
@@ -418,7 +418,7 @@ class Daemon:
             if self._gate.request(desired, state):
                 self._walk_settle_until = time.monotonic() + WALK_SETTLE_S
         else:
-            self._last_action = f"OFF {floor}->{desired.value.upper()}"
+            self._last_action = f"DIS {floor}->{desired.value.upper()}"
             log.info("reconcile (disarmed): %s -> %s (%s) -- not acting",
                      actual, desired.value, floor)
 
@@ -520,20 +520,30 @@ class Daemon:
         }
 
     def _cmd_setpoint(self, args: dict) -> dict:
-        raw = args.get("mode")
-        try:
-            mode = DriveMode(str(raw).lower())
-        except ValueError:
-            return {"ok": False, "error": f"unknown mode {raw!r}"}
-        try:
-            self._reconciler.set_setpoint(mode)
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
-        log.warning("setpoint -> %s via control socket", mode.value)
-        self._last_action = f"SETPOINT {mode.value.upper()}"
+        """Move the three-position selector: an explicit detent, or ``next``.
+
+        ``next`` is what the SW1 tap sends. The daemon owns the cycle so the
+        button helper cannot drift out of step with it.
+        """
+        raw = str(args.get("mode", "")).lower()
+        before = self._reconciler.position
+        if raw == "next":
+            self._reconciler.advance()
+        else:
+            try:
+                self._reconciler.set_position(Position(raw))
+            except ValueError:
+                allowed = ", ".join(p.value for p in CYCLE)
+                return {"ok": False,
+                        "error": f"unknown position {raw!r} (want: {allowed}, next)"}
+        after = self._reconciler.position
+        log.warning("selector %s -> %s via control socket",
+                    before.value, after.value)
+        self._last_action = f"SETPOINT {after.value.upper()}"
         self._walk_settle_until = 0.0  # an explicit choice acts now
         self._wake.set()  # reconcile on the next tick, not after the full sleep
-        return {"ok": True, "setpoint": self._reconciler.setpoint_label}
+        return {"ok": True, "setpoint": after.value,
+                "position": after.value, "previous": before.value}
 
     def _cmd_reload(self) -> dict:
         if self._config_path is None:
@@ -544,19 +554,18 @@ class Daemon:
             new_reconciler = build_reconciler(new_config, poll_stale_s=POLL_STALE_S)
         except (OSError, ConfigError) as exc:
             return {"ok": False, "error": f"reload failed: {exc}"}
-        # The setpoint is the driver's live choice -- carry it across the
-        # reload. The SOC-floor latch is in-memory state and is dropped. If the
-        # driver never picked one (still passive), leave the new reconciler at
-        # its own default_setpoint.
-        carried = self._reconciler.setpoint
-        if carried is not None:
-            new_reconciler.set_setpoint(carried)
+        # The selector position is the driver's live choice -- carry it across
+        # the reload rather than snapping the car back to the config default
+        # under someone's hand. The SOC-floor latch is in-memory state and is
+        # dropped; the next pass re-derives it from a live reading.
+        new_reconciler.set_position(self._reconciler.position)
         self._config = new_config
         self._reconciler = new_reconciler
         self._walk_settle_until = 0.0  # re-evaluate against the new policy now
-        log.info("config reloaded via control socket (setpoint=%s, floor latch cleared)",
+        log.info("config reloaded via control socket (selector=%s, floor latch cleared)",
                  new_reconciler.setpoint_label)
         return {"ok": True, "setpoint": new_reconciler.setpoint_label,
+                "position": new_reconciler.setpoint_label,
                 "floor_latched": False}
 
     # -- walk-test (panel self-test of the closed-loop mode walk) ---------
@@ -852,7 +861,10 @@ class Daemon:
         return "" if self._armed else " (disarmed)"
 
     def _action_prefix(self) -> str:
-        return "" if self._armed else "OFF "
+        # "DIS", not "OFF": `off` is now a selector position, and the two
+        # states are independent -- the driver must be able to tell a
+        # disarmed daemon from a selector parked on off.
+        return "" if self._armed else "DIS "
 
     def _lcd_status(self) -> str:
         """One-line (<=20 char) summary of what the fixer is doing, for the
@@ -862,10 +874,12 @@ class Daemon:
         p = self._action_prefix()
         if self._reconciler.floor_latched:
             return f"{p}SOC-FLOOR -> HOLD"
-        sp = self._reconciler.setpoint
-        if sp is None:
-            return f"{p}auto (no target)"
-        return f"{p}hold {sp.value.upper()}"
+        pos = self._reconciler.position
+        if pos is Position.MOUNTAIN:
+            return f"{p}hold MOUNTAIN"
+        if pos is Position.OFF:
+            return f"{p}OFF - not acting"
+        return f"{p}SOC floor {int(self._reconciler.snapshot()['hold_threshold_percent'])}%"
 
     def _await_bus(self, state: VehicleState) -> None:
         deadline = time.monotonic() + BUS_WARMUP_TIMEOUT_S

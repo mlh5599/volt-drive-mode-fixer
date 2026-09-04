@@ -2,7 +2,7 @@
 
     voltdmf-ctl status
     voltdmf-ctl set-mode hold [--force]
-    voltdmf-ctl setpoint hold | mountain
+    voltdmf-ctl setpoint hold | mountain | off | next
     voltdmf-ctl arm
     voltdmf-ctl disarm
     voltdmf-ctl reload
@@ -25,12 +25,12 @@ import os
 import socket
 import sys
 
-from .config import SETPOINT_MODES
 from .control import DEFAULT_SOCKET_PATH
+from .reconciler import CYCLE
 from .signals import DriveMode
 
 _MODES = [m.value for m in DriveMode]
-_SETPOINTS = [m.value for m in SETPOINT_MODES]
+_SETPOINTS = [p.value for p in CYCLE] + ["next"]
 _CONNECT_TIMEOUT_S = 3.0
 _REPLY_TIMEOUT_S = 25.0   # > the server's own reply timeout
 
@@ -103,7 +103,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--force", action="store_true",
                     help="walk the menu even if already reading that mode")
     sp = sub.add_parser("setpoint",
-                        help="move the HOLD<->MOUNTAIN setpoint the reconciler holds",
+                        help="move the three-position selector: hold (passive, "
+                             "SOC floor live) | mountain (enforce MOUNTAIN) | "
+                             "off (nothing at all, floor disabled) | next (one "
+                             "SW1 tap forward)",
                         parents=[common])
     sp.add_argument("mode", choices=_SETPOINTS)
     sub.add_parser("arm", help="allow transmission (the daemon boots armed)",
@@ -112,7 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    parents=[common])
     sub.add_parser("reload",
                    help="re-read the config file and rebuild the reconciler "
-                        "(keeps the setpoint, drops the SOC-floor latch)",
+                        "(keeps the selector position, drops the SOC-floor latch)",
                    parents=[common])
     sub.add_parser("walk-test",
                    help="self-test the closed-loop mode walk: cycle every "
@@ -156,8 +159,13 @@ def _print_status(state: dict) -> None:
     tx = "ARMED" if state.get("transmit_enabled") else "disarmed"
     print(f"transmit:   {tx}")
     sp = g("setpoint")
-    floor = "  [SOC-HOLD floor latched]" if state.get("floor_latched") else ""
-    print(f"setpoint:   {sp}{floor}")
+    if state.get("floor_latched"):
+        floor = "  [SOC-HOLD floor latched]"
+    elif sp == "off":
+        floor = "  [floor disabled -- car is on its own]"
+    else:
+        floor = ""
+    print(f"selector:   {sp}{floor}")
     print(f"drive mode: {g('drive_mode')}"
           + (f"  (manual override -> {state['manual_override']})"
              if state.get("manual_override") else ""))

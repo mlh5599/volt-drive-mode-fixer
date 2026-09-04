@@ -6,9 +6,11 @@ the two PiCAN2 switch pads whenever no capture is running and turns presses
 into three actions:
 
     SW1 tap  (short press, SW2 untouched)
-        -> ``voltdmf-ctl setpoint <hold|mountain>`` -- toggles the reconciler
-           setpoint (DESIGN.md design item 4). A no-op until `setpoint` lands
-           in voltdmf-ctl; the failing call is logged and swallowed.
+        -> ``voltdmf-ctl setpoint next`` -- advances the daemon's three-position
+           selector one detent: hold (hold the pack at 30%) -> mountain -> off
+           (car untouched) -> back to hold. The daemon owns the cycle; this
+           helper keeps no index of its own. A failing call is logged and
+           swallowed.
 
     SW1 held alone >= --selftest-hold-secs, then released  (SW2 never joined)
         -> ``voltdmf-ctl walk-test`` -- the daemon cycles the closed-loop mode
@@ -174,9 +176,6 @@ class ButtonHelper:
         self._unit = args.soclog_unit
         self._chargelog_unit = args.chargelog_unit
         self._ctl = args.ctl
-        self._setpoints = args.setpoints
-        self._setpoint_idx = (self._setpoints.index(args.setpoint_start)
-                              if args.setpoint_start in self._setpoints else 0)
         self._lcd_opts = dict(port=args.lcd_port, baud=args.lcd_baud,
                               backlight=args.lcd_backlight)
 
@@ -200,11 +199,11 @@ class ButtonHelper:
                          "grabbing GPIO", unit)
                 self._wait_out_unit(unit)
         self._acquire_with_retry()
-        log.info("watching: SW1 tap = setpoint toggle (%s), "
+        log.info("watching: SW1 tap = selector next (hold -> mountain -> off), "
                  "SW1 hold %.0fs = walk-test, "
                  "SW2 hold %.0fs = launch %s, "
                  "SW1+SW2 hold %.0fs = launch %s",
-                 "/".join(self._setpoints), self._selftest_hold,
+                 self._selftest_hold,
                  self._single_hold, self._chargelog_unit,
                  self._launch_hold, self._unit)
         try:
@@ -244,9 +243,17 @@ class ButtonHelper:
 
     # -- action: setpoint toggle -----------------------------------------
     def _toggle_setpoint(self) -> None:
-        self._setpoint_idx ^= 1
-        target = self._setpoints[self._setpoint_idx]
-        argv = [self._ctl, "setpoint", target]
+        """SW1 tap: ask the daemon to advance its selector one detent.
+
+        The helper deliberately keeps no idea of which position the car is in.
+        It used to hold its own index and send an absolute target, which drifts
+        the moment anything else moves the selector -- a daemon restart (the
+        position is not persisted), or a `voltdmf-ctl setpoint` from the shell.
+        After a drift the next tap re-sends the position the car is already in
+        and looks like a dead button. `next` is evaluated by the one component
+        that actually knows the current position.
+        """
+        argv = [self._ctl, "setpoint", "next"]
         log.info("SW1 tap -> %s", " ".join(argv))
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
@@ -258,9 +265,7 @@ class ButtonHelper:
             log.info("  ok%s", f": {out}" if out else "")
         else:
             msg = (r.stderr or r.stdout).strip()
-            log.warning("  voltdmf-ctl rc=%d: %s  "
-                        "(expected until `setpoint` lands in voltdmf-ctl)",
-                        r.returncode, msg)
+            log.warning("  voltdmf-ctl rc=%d: %s", r.returncode, msg)
 
     # -- action: closed-loop mode-walk self-test ------------------------
     def _run_walk_test(self) -> None:
@@ -455,13 +460,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(charge-current-setpoint discovery capture)")
     ap.add_argument("--ctl", default="/usr/local/bin/voltdmf-ctl",
                     help="path to the voltdmf-ctl entry point")
-    ap.add_argument("--setpoints", nargs=2, default=["hold", "mountain"],
-                    metavar=("A", "B"),
-                    help="the two reconciler setpoints SW1 toggles between "
-                         "(default: hold mountain)")
-    ap.add_argument("--setpoint-start", default="hold",
-                    help="setpoint assumed current at boot; the first tap "
-                         "selects the other (default: hold)")
+    # DEPRECATED, accepted so a unit file written before the three-position
+    # selector still starts. SW1 now sends `setpoint next` and the daemon owns
+    # the cycle, so there is nothing here for the helper to configure.
+    ap.add_argument("--setpoints", nargs=2, default=None, metavar=("A", "B"),
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--setpoint-start", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--lcd-port", default="/dev/serial0")
     ap.add_argument("--lcd-baud", type=int, default=9600)
     ap.add_argument("--lcd-backlight", type=int, default=45, metavar="PCT")
@@ -486,8 +490,8 @@ def main(argv: list[str] | None = None) -> int:
         print("button_helper plan (nothing started):")
         print(f"  SW1 = BCM {args.sw1_gpio}   SW2 = BCM {args.sw2_gpio}   "
               f"debounce {args.bounce_ms:.0f} ms")
-        print(f"  SW1 tap         -> {args.ctl} setpoint "
-              f"<{'/'.join(args.setpoints)}>  (start {args.setpoint_start})")
+        print(f"  SW1 tap         -> {args.ctl} setpoint next"
+              "   (hold -> mountain -> off -> hold)")
         print(f"  SW1 solo {args.selftest_hold_secs:.0f}s  -> {args.ctl} "
               f"walk-test  (daemon runs the ~1 min cycle, LCD shows result)")
         print(f"  SW2 solo {args.single_hold_secs:.0f}s  -> systemctl start "
