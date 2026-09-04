@@ -2,9 +2,10 @@
 
 Two sections, both required (see ``config.example.yaml``):
 
-* ``policy`` -- the reconciler's decision constants: the boot setpoint
-  (``auto`` to start passive, or ``hold`` / ``mountain`` to enforce from the
-  first loop) and the SOC-HOLD floor's engage / release / failsafe thresholds.
+* ``policy`` -- the reconciler's decision constants: the boot detent of the
+  three-position selector (``hold`` -- passive until the floor engages --
+  ``mountain``, or ``off``) and the SOC-HOLD floor's engage / release /
+  failsafe thresholds.
 * ``soc_poll`` -- whether the daemon runs the ``22 005B`` UDS poll and how
   often. Enabled by default; the goal is to trust a passive SOC signal later
   and switch it off.
