@@ -394,6 +394,79 @@ def test_run_probe_landed_when_cursor_and_byte1_reach_target(monkeypatch):
     json.dumps(d._status_snapshot())         # probe result stays serialisable
 
 
+def test_probe_running_is_true_while_the_probe_actually_runs(monkeypatch):
+    """``probe_running`` must cover the RUN, not just the queued window.
+
+    It used to be ``_probe_pending is not None``, and ``_run_probe`` clears
+    ``_probe_pending`` on its first line -- so the flag read False for the
+    entire duration of the probe. A client polling "not probe_running, read
+    the result" therefore got handed the PREVIOUS probe's result. That
+    produced a full round of bogus verdicts on 2026-09-04: rows reporting
+    LANDED whose byte1_after did not match their own target.
+    """
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+    seen = []
+
+    class _Watching(_ProbeController):
+        def switch_to(self, target, force=False):
+            seen.append(d._status_snapshot()["probe_running"])
+            return super().switch_to(target, force)
+
+    d._controller = _Watching(st)
+    assert d._status_snapshot()["probe_running"] is False   # idle
+    d._handle_command("probe", {"mode": "hold"})
+    assert d._status_snapshot()["probe_running"] is True    # queued
+    d._run_probe(DriveMode.HOLD)
+
+    assert seen == [True], "flag was False while the walk was in flight"
+    assert d._status_snapshot()["probe_running"] is False   # done
+    assert d._status_snapshot()["probe_queued"] is False
+
+
+def test_probe_seq_advances_once_per_probe(monkeypatch):
+    """A client can tell a fresh result from a stale one without a flag."""
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+    d._controller = _ProbeController(st)
+
+    assert d._status_snapshot()["probe_seq"] == 0
+    d._run_probe(DriveMode.HOLD)
+    assert d._probe_result["seq"] == 1
+    assert d._status_snapshot()["probe_seq"] == 1
+    d._run_probe(DriveMode.SPORT)
+    assert d._probe_result["seq"] == 2
+    assert d._status_snapshot()["probe_seq"] == 2
+
+
+def test_probe_clears_running_when_the_walk_blows_up(monkeypatch):
+    """A stuck ``probe_running`` would wedge every later probe's client.
+
+    SafetyGate absorbs an exception from the controller into a blocked
+    outcome rather than letting it out, so the probe completes normally with
+    a MISS -- but the flag has to be clear either way, which is why
+    ``_probe_active`` is released in a ``finally``.
+    """
+    monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
+    d = _daemon()
+    st = _active_state(shift=ShiftPosition.PARK, drive_mode=DriveMode.NORMAL)
+    d._state = st
+
+    class _Exploding(_ProbeController):
+        def switch_to(self, target, force=False):
+            raise RuntimeError("bus went away mid-walk")
+
+    d._controller = _Exploding(st)
+    d._run_probe(DriveMode.HOLD)
+    assert d._probe_result["verdict"] == "MISS"
+    assert d._status_snapshot()["probe_running"] is False
+    assert d._status_snapshot()["probe_seq"] == 1
+
+
 def test_run_probe_cursor_only_when_byte1_never_commits(monkeypatch):
     monkeypatch.setattr(daemon_mod, "WALK_TEST_LEG_SETTLE_S", 0.0)
     d = _daemon()

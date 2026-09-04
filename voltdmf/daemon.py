@@ -196,6 +196,17 @@ class Daemon:
         # and run inline on the loop's next pass (like the walk-test).
         self._test_mode = False
         self._probe_pending: DriveMode | None = None
+        #: True for the DURATION of _run_probe. Distinct from _probe_pending,
+        #: which _run_probe clears on its first line -- so a status field
+        #: derived from _probe_pending alone reads False while the probe is
+        #: actually running, and a client polling "not running" gets handed the
+        #: PREVIOUS probe's result. That misread produced a whole round of
+        #: bogus verdicts on 2026-09-04 (rows reporting LANDED with a byte1
+        #: that did not match their own target).
+        self._probe_active = False
+        #: Bumped once per completed probe. Lets a client tell a fresh result
+        #: from a stale one without having to trust any running flag.
+        self._probe_seq = 0
         self._probe_result: dict | None = None
 
         # SOC poller bookkeeping (see _service_soc_poll).
@@ -712,10 +723,21 @@ class Daemon:
         * ``BLOCKED``     -- a SafetyGate precondition stopped the walk.
         """
         self._probe_pending = None
+        self._probe_active = True
+        self._probe_seq += 1        # bump FIRST so both exits stamp the same
+        try:                        # seq the status block is already showing
+            self._run_probe_inner(target)
+        finally:
+            self._probe_active = False
+
+    def _run_probe_inner(self, target: DriveMode) -> None:
+        """The probe body. Split out only so :meth:`_run_probe` can hold
+        ``_probe_active`` across every exit path, including an exception."""
         st = self._state
         if st is None or self._controller is None or st.drive_mode is None:
             self._probe_result = {"ok": False, "verdict": "ABORT",
-                                  "target": target.value}
+                                  "target": target.value,
+                                  "seq": self._probe_seq}
             self._last_action = "PROBE ABORT"
             log.warning("probe: aborted before start (no mode / no controller)")
             return
@@ -757,6 +779,7 @@ class Daemon:
 
         self._probe_result = {
             "ok": verdict in ("LANDED", "CURSOR_ONLY"),
+            "seq": self._probe_seq,
             "verdict": verdict,
             "target": target.value,
             "origin": origin.value,
@@ -817,7 +840,10 @@ class Daemon:
             "walk_test_running": self._walk_test_pending,
             "test_mode": self._test_mode,
             "probe": self._probe_result,
-            "probe_running": self._probe_pending is not None,
+            "probe_running": (self._probe_pending is not None
+                              or self._probe_active),
+            "probe_queued": self._probe_pending is not None,
+            "probe_seq": self._probe_seq,
             "uptime_s": round(time.monotonic() - self._started, 1),
         }
 
