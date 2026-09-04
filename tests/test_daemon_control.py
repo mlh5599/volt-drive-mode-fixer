@@ -699,3 +699,35 @@ def test_lcd_status_fits_the_watch_screen(position, armed):
 def test_lcd_status_distinguishes_the_two_hold_detents():
     assert "HOLD" in _daemon(position="hold-now")._lcd_status()
     assert "30%" in _daemon(position="hold-soc")._lcd_status()
+
+
+def test_lcd_selector_reports_soc_fresh_for_a_live_poll():
+    d = _daemon()
+    d._state = _active_state(soc_percent=61.0)
+    assert d._lcd_selector()["soc_fresh"] is True
+
+
+def test_lcd_selector_reports_soc_not_fresh_when_stale():
+    d = _daemon()
+    d._state = _active_state(soc_percent=61.0)
+    d._state.soc_percent_monotonic -= 999  # well past poll_stale_s
+    assert d._lcd_selector()["soc_fresh"] is False
+
+
+def test_lcd_selector_reports_soc_not_fresh_off_the_bar_failsafe():
+    """A reading sourced from the 0x096 proxy, not the poll, is never 'fresh'
+    -- the watch screen must flag it even if it arrived a second ago."""
+    d = _daemon()
+    d._state = VehicleState(soc_bar_raw=9)
+    d._state.mark_signal_seen()
+    assert d._lcd_selector()["soc_fresh"] is False
+
+
+def test_lcd_selector_reports_the_position_and_floor():
+    d = _daemon(position="hold-now")
+    d._state = _active_state()
+    snap = d._lcd_selector()
+    assert snap["label"] == "hold-now"
+    assert snap["index"] == 2
+    assert snap["cycle_len"] == 4
+    assert snap["floor_latched"] is False

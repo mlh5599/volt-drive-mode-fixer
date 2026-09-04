@@ -249,6 +249,7 @@ class Daemon:
                 # a display, so it always drives the real panel. The disarmed
                 # state still shows on it -- see the "DIS " tag in _lcd_status.
                 dash = LcdDashboard(state, self._lcd_status,
+                                    selector_fn=self._lcd_selector,
                                     channel=self._channel, **self._lcd_opts)
                 dash.start()
 
@@ -869,6 +870,19 @@ class Daemon:
         # states are independent -- the driver must be able to tell a
         # disarmed daemon from a selector parked on off.
         return "" if self._armed else "DIS "
+
+    def _lcd_selector(self) -> dict:
+        """The reconciler position + SOC freshness, for the watch screen."""
+        st = self._state
+        fresh = bool(
+            st is not None and st.soc_source == "poll"
+            and st.soc_percent_fresh(self._reconciler.poll_stale_s)
+        )
+        return {"label": self._reconciler.setpoint_label,
+                "index": self._reconciler.position_index,
+                "cycle_len": len(CYCLE),
+                "floor_latched": self._reconciler.floor_latched,
+                "soc_fresh": fresh}
 
     def _lcd_status(self) -> str:
         """One-line (<=20 char) summary of what the fixer is doing, for the

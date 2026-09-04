@@ -324,3 +324,10 @@ def test_snapshot_shape():
     assert snap["floor_source"] == "poll"
     assert snap["hold_threshold_percent"] == 30.0
     assert "hold_reset_percent" not in snap
+
+
+def test_poll_stale_s_exposes_the_configured_threshold():
+    """The LCD watch screen judges SOC freshness against this -- it must be
+    the same number the floor logic itself uses, not a second guess at it."""
+    assert _rec(poll_stale_s=45.0).poll_stale_s == 45.0
+    assert _rec(poll_stale_s=12.0).poll_stale_s == 12.0

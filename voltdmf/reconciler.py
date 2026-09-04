@@ -169,6 +169,12 @@ class Reconciler:
     def floor_latched(self) -> bool:
         return self._floor_latched
 
+    @property
+    def poll_stale_s(self) -> float:
+        """Age past which a poll reading is no longer trusted for the floor --
+        the same threshold callers should use to judge the SOC % on display."""
+        return self._poll_stale_s
+
     def set_position(self, position: Position) -> None:
         """Jump the selector straight to ``position``."""
         if position not in CYCLE:
