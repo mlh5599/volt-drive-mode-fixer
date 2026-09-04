@@ -1195,3 +1195,74 @@ SOC hunt either way.
     and a bench `soc_log.py --lcd` run drives the daemon to log `LCD claimed
     by another process; releasing the panel` then `LCD free again` on exit —
     the hand-off now actually fires (see Session 6).
+
+## Session 11 (2026-09-04) — the mode walk is reliable: 35/35 legs, 0 misses
+
+The walk now lands every leg. Three consecutive 12-probe rounds on a parked
+car, `4f4e1c4`:
+
+| round | landed | exact tap count | dropped taps |
+|-------|--------|-----------------|--------------|
+| 1     | 11/11  | 11/11           | 0 / 28 (0%)  |
+| 2     | 12/12  | 9/12            | 3 / 33 (9%)  |
+| 3     | 12/12  | 10/12           | 2 / 32 (6%)  |
+
+**35 of 35 legs landed, zero MISSes**, worst case 4 taps against a
+`MAX_WALK_TAPS` of 12. The residual ~5% single-tap drop is the documented
+`PRESS_TRACK_FRAMES = 1` trade: a dropped tap is visible to the closed loop
+and costs one retry, an overshoot would commit the WRONG mode.
+
+### What was actually wrong: the echo carried a spent counter
+
+Four press-path designs were measured on the car. All three failures are the
+same root cause wearing different clothes — the tracking echo mirrored a 0x1E1
+whose rolling counter the module had already moved past, which is the
+frozen-counter frame the cluster ignored back in session 2.
+
+| press path | drop rate | misses |
+|------------|-----------|--------|
+| shared socket, `recv()` racing the Notifier | 21% | 0 |
+| frame stashed by the RX listener            | 36% | 1 |
+| dedicated 0x1E1-filtered socket, no drain   | 58% | 2 |
+| dedicated socket **+ drained before each press** | **0-9%** | **0** |
+
+The third is the instructive one: isolating the socket removed all contention
+and made things *worse*. Nothing reads that socket between taps, so across the
+walk's ~1.6 s inter-tap gap it silently queues frames and `recv()` returns the
+OLDEST. Measured directly, 0x1E1 at ~32 Hz:
+
+    idle 0.0 s -> first recv is fresh,     0 frames queued behind it
+    idle 0.2 s -> first recv  170 ms old,  5 queued
+    idle 0.8 s -> first recv  791 ms old, 26 queued
+    idle 1.6 s -> first recv 1582 ms old, 52 queued
+
+A 1.6 s-old frame is ~52 counts behind the module. On the car that showed as
+the menu refusing to open for 11 consecutive taps. The fix is both halves at
+once: a second bound socket (SocketCAN fans every frame out, so no contention)
+that is drained non-blocking before each press (so no staleness). The drain
+must stay non-blocking or it eats the live frame the press is replying to.
+
+`tools/press_calibrate.py` never reproduced any of this — its `_Watch` thread
+drains continuously. That gap between the tool measuring 22/22 clean and the
+daemon dropping a fifth of its taps was the diagnostic lever.
+
+### Two measurement bugs that produced false results first
+
+Worth recording, because both manufactured confident numbers that were wrong.
+
+- **`status.probe_running` was `_probe_pending is not None`**, and `_run_probe`
+  clears `_probe_pending` on its first line — so the flag read False for the
+  entire duration of a probe. A harness doing the obvious thing (issue probe,
+  poll until not running, read `probe`) is handed the PREVIOUS probe's result.
+  This produced a full 12-row round reporting `LANDED` on rows whose
+  `byte1_after` did not match their own target; it was only caught because the
+  rows were self-contradictory. Fixed in `4f4e1c4`: the flag spans the run, and
+  results carry a monotonic `seq` so a client need not trust any flag.
+- **A converge restarted the daemon mid-round.** `test-mode` is in-memory by
+  design, so the reconciler silently re-armed and the remaining probes ran in a
+  different configuration than the ones before them. The round driver now
+  aborts if the daemon PID changes or if `test_mode` goes false.
+
+**Do not run a validation round while an `ansible-playbook` converge is in
+flight**, and check `pgrep -af ansible` on the Pi first — the restart handler
+is what corrupts the round.
