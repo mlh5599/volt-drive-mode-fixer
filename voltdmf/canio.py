@@ -268,12 +268,27 @@ class CanInterface:
         the echo has to carry the module's current counter or the cluster
         ignores it.
 
-        Does not drain a backlog: it returns on the first frame seen so the
-        caller can reply into the ~24 ms gap right behind it.
+        DRAINS the queue first, then blocks for the next arrival. Both halves
+        are load-bearing. Nothing reads this socket between taps, so during the
+        walk's ~1.6 s inter-tap gap it silently accumulates a backlog, and
+        ``recv()`` hands back the OLDEST frame in it. Measured on-vehicle
+        2026-09-04, 0x1E1 at ~32 Hz:
+
+            idle 0.0 s -> first recv is fresh,     0 frames queued behind it
+            idle 0.2 s -> first recv  170 ms old,  5 queued
+            idle 0.8 s -> first recv  791 ms old, 26 queued
+            idle 1.6 s -> first recv 1582 ms old, 52 queued
+
+        A 1.6 s-old counter is ~52 counts behind the module: exactly the
+        frozen-counter echo the cluster ignored in session 2. That is why the
+        walk saw the menu refuse to open for 11 straight taps. After the drain
+        the returned frame is at most one frame period (~31 ms) old.
         """
         bus = self._echo_bus
         if bus is None:
             raise RuntimeError("open() first")
+        while bus.recv(timeout=0.0) is not None:
+            pass                      # discard the idle backlog; all stale
         end = time.time() + timeout
         while time.time() < end:
             msg = bus.recv(timeout=max(0.0, end - time.time()))

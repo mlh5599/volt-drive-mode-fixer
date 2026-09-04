@@ -210,41 +210,77 @@ def test_decode_listener_ignores_short_frame_without_byte5():
 #     ignored in session 2.
 # A second bound socket sees every frame (SocketCAN fans out) and nothing else
 # consumes it, so the echo is both uncontended and current.
-class _SendingFakeBus(_FakeBus):
-    """_FakeBus that also records what was transmitted on it."""
+class _EchoFakeBus:
+    """Models a socket with a stale BACKLOG and later ARRIVALS.
 
-    def __init__(self, frames):
-        super().__init__(frames)
+    The distinction is the whole point of the drain. ``recv(timeout=0)`` is a
+    non-blocking peek at what is already queued -- on the car that is up to
+    1.6 s of accumulated 0x1E1 (~52 frames), every one of them carrying a
+    counter the cluster has long since moved past. ``recv(timeout>0)`` blocks
+    for the module's next transmission, which is the only frame the echo may
+    mirror. A fake that cannot tell the two apart cannot test this.
+    """
+
+    def __init__(self, backlog=(), arrivals=()):
+        self.backlog = list(backlog)
+        self.arrivals = list(arrivals)
         self.sent = []
+        self.recv_calls = 0
+
+    def recv(self, timeout=0.0):
+        self.recv_calls += 1
+        queue = self.backlog if not timeout else self.arrivals
+        return queue.pop(0) if queue else None
 
     def send(self, msg, timeout=None):
         self.sent.append(msg)
 
+    def shutdown(self):
+        self.shut_down = True
 
-def _iface_with_echo(frames):
+
+def _iface_with_echo(backlog=(), arrivals=()):
     iface = CanInterface.__new__(CanInterface)
     iface._bus = None            # must NOT be touched on the press path
-    iface._echo_bus = _SendingFakeBus(frames)
+    iface._echo_bus = _EchoFakeBus(backlog, arrivals)
     iface._tx_gate = None
     return iface
 
 
 def test_next_button_frame_reads_the_echo_socket_not_the_shared_bus():
     payload = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    iface = _iface_with_echo([_Frame(0x1E1, payload)])
+    iface = _iface_with_echo(arrivals=[_Frame(0x1E1, payload)])
     # _bus is None: reaching for the shared socket here would raise
     assert iface._next_button_frame(0.05) == payload
 
 
-def test_next_button_frame_returns_the_first_frame_not_the_backlog_tail():
-    """The echo has to land in the gap behind the frame it mirrors.
+def test_next_button_frame_discards_the_backlog_and_waits_for_the_next_frame():
+    """The counter in a queued frame is already spent.
 
-    Unlike ``read_menu_cursor`` (which wants the newest 0x1F4), the press must
-    reply immediately, so this deliberately does NOT drain the queue.
+    Nothing reads this socket between taps, so it accumulates ~1.6 s of 0x1E1
+    during the walk's inter-tap gap. Echoing any of that mirrors a counter the
+    module has moved ~52 counts past -- the frozen-counter echo the cluster
+    ignores, measured on-vehicle 2026-09-04 as a menu that would not open for
+    11 straight taps.
+    """
+    stale = [_Frame(0x1E1, bytes((0x00, 0x11, 0x22, 0x33, n, 0x66, 0x77)))
+             for n in range(5)]
+    fresh = bytes((0x00, 0x11, 0x22, 0x33, 0x09, 0x66, 0x77))
+    iface = _iface_with_echo(backlog=stale, arrivals=[_Frame(0x1E1, fresh)])
+    assert iface._next_button_frame(0.05) == fresh
+    assert iface._echo_bus.backlog == []          # drained, not left to rot
+
+
+def test_next_button_frame_does_not_drain_the_frame_it_returns():
+    """The drain is non-blocking, so it must not eat a live arrival.
+
+    Once the queue is empty the press has to reply into the gap behind the
+    very next frame, not the one after it.
     """
     first = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    second = bytes((0x00, 0x11, 0x22, 0x33, 0x04, 0x66, 0x77))
-    iface = _iface_with_echo([_Frame(0x1E1, first), _Frame(0x1E1, second)])
+    second = bytes((0x00, 0x11, 0x22, 0x33, 0x06, 0x66, 0x77))
+    iface = _iface_with_echo(
+        arrivals=[_Frame(0x1E1, first), _Frame(0x1E1, second)])
     assert iface._next_button_frame(0.05) == first
     assert iface._next_button_frame(0.05) == second
 
@@ -252,12 +288,13 @@ def test_next_button_frame_returns_the_first_frame_not_the_backlog_tail():
 def test_next_button_frame_skips_a_short_frame():
     """< 7 B cannot carry the counter tail the echo has to mirror."""
     good = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    iface = _iface_with_echo([_Frame(0x1E1, bytes(4)), _Frame(0x1E1, good)])
+    iface = _iface_with_echo(
+        arrivals=[_Frame(0x1E1, bytes(4)), _Frame(0x1E1, good)])
     assert iface._next_button_frame(0.05) == good
 
 
 def test_next_button_frame_times_out_when_the_bus_is_quiet():
-    iface = _iface_with_echo([])
+    iface = _iface_with_echo()
     assert iface._next_button_frame(0.02) is None
 
 
@@ -270,7 +307,7 @@ def test_next_button_frame_requires_open():
 
 def test_press_mirrors_the_live_frame_and_sends_on_the_echo_socket():
     live = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    iface = _iface_with_echo([_Frame(0x1E1, live)] * 8)
+    iface = _iface_with_echo(arrivals=[_Frame(0x1E1, live)] * 8)
     iface.send_mode_button_press()
     sent = iface._echo_bus.sent
     assert len(sent) == canio_module.PRESS_TRACK_FRAMES
@@ -290,7 +327,7 @@ def test_press_falls_back_to_the_static_frame_on_a_quiet_bus():
 
 def test_press_transmits_nothing_while_disarmed():
     live = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    iface = _iface_with_echo([_Frame(0x1E1, live)] * 8)
+    iface = _iface_with_echo(arrivals=[_Frame(0x1E1, live)] * 8)
     iface._tx_gate = lambda: False
     iface.send_mode_button_press()
     assert iface._echo_bus.sent == []
