@@ -76,6 +76,11 @@ WALK_TEST_LEG_SETTLE_S = 4.0
 #: post-tap reads the closed loop actually consults.
 PROBE_SAMPLE_PERIOD_S = 0.05
 
+#: How long the LCD's selector row shows the just-picked setting before
+#: settling back to the plain "current setting" line -- long enough to be
+#: seen across a couple of the watch screen's repaints (_REPAINT_S).
+SELECTOR_FLASH_S = 3.0
+
 
 class _CursorSampler(threading.Thread):
     """Background dense sampler for one :meth:`Daemon._run_probe`.
@@ -155,6 +160,7 @@ class Daemon:
         # shutdown, or when a control command is waiting in the queue.
         self._wake = threading.Event()
         self._last_action: str | None = None
+        self._selector_flash_until = 0.0  # monotonic deadline; see SELECTOR_FLASH_S
 
         # The one transmit lock now that ``--dry-run`` is gone. The daemon
         # boots armed; ``voltdmf-ctl disarm`` flips this off mid-drive.
@@ -246,10 +252,9 @@ class Daemon:
             dash = None
             if self._lcd:
                 # arm/disarm gates CAN *transmission* only; the watch screen is
-                # a display, so it always drives the real panel. The disarmed
-                # state still shows on it -- see the "DIS " tag in _lcd_status.
-                dash = LcdDashboard(state, self._lcd_status,
-                                    selector_fn=self._lcd_selector,
+                # a display, so it always drives the real panel regardless of
+                # armed state.
+                dash = LcdDashboard(state, selector_fn=self._lcd_selector,
                                     channel=self._channel, **self._lcd_opts)
                 dash.start()
 
@@ -541,6 +546,8 @@ class Daemon:
         log.warning("selector %s -> %s via control socket",
                     before.value, after.value)
         self._last_action = f"SEL {after.value.upper()}"
+        if after is not before:
+            self._selector_flash_until = time.monotonic() + SELECTOR_FLASH_S
         self._walk_settle_until = 0.0  # an explicit choice acts now
         self._wake.set()  # reconcile on the next tick, not after the full sleep
         return {"ok": True, "setpoint": after.value,
@@ -882,27 +889,8 @@ class Daemon:
                 "index": self._reconciler.position_index,
                 "cycle_len": len(CYCLE),
                 "floor_latched": self._reconciler.floor_latched,
-                "soc_fresh": fresh}
-
-    def _lcd_status(self) -> str:
-        """One-line (<=20 char) summary of what the fixer is doing, for the
-        watch screen's bottom row."""
-        if self._last_action is not None:
-            return self._last_action
-        p = self._action_prefix()
-        if self._reconciler.floor_latched:
-            return f"{p}SOC-FLOOR->HOLD"   # 19 cols with the "DIS " prefix
-        pos = self._reconciler.position
-        # "enforcing", not "hold": with two hold detents, "hold HOLD" no
-        # longer says which one the driver is on.
-        if pos is Position.HOLD_NOW:
-            return f"{p}enforcing HOLD"
-        if pos is Position.MOUNTAIN:
-            return f"{p}enforcing MTN"
-        if pos is Position.OFF:
-            return f"{p}OFF - not acting"
-        thresh = self._reconciler.snapshot()["hold_threshold_percent"]
-        return f"{p}armed for {thresh:g}%"
+                "soc_fresh": fresh,
+                "flashing": time.monotonic() < self._selector_flash_until}
 
     def _await_bus(self, state: VehicleState) -> None:
         deadline = time.monotonic() + BUS_WARMUP_TIMEOUT_S

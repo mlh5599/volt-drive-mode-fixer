@@ -9,7 +9,7 @@ import pytest
 from voltdmf import daemon as daemon_mod
 from voltdmf.canio import CanInterface
 from voltdmf.config import parse_config
-from voltdmf.daemon import Daemon
+from voltdmf.daemon import SELECTOR_FLASH_S, Daemon
 from voltdmf.safety import RequestOutcome
 from voltdmf.reconciler import Position
 from voltdmf.signals import DriveMode, ShiftPosition
@@ -142,6 +142,32 @@ def test_setpoint_rejects_a_non_detent(bad):
     reply = d._handle_command("setpoint", {"mode": bad})
     assert reply["ok"] is False
     assert d._reconciler.position is Position.HOLD_SOC
+
+
+def test_setpoint_change_starts_the_lcd_flash():
+    d = _daemon()
+    assert d._lcd_selector()["flashing"] is False
+    d._handle_command("setpoint", {"mode": "mountain"})
+    assert d._lcd_selector()["flashing"] is True
+
+
+def test_setpoint_flash_expires_after_the_timeout():
+    d = _daemon()
+    d._handle_command("setpoint", {"mode": "mountain"})
+    d._selector_flash_until -= SELECTOR_FLASH_S + 1  # fast-forward past it
+    assert d._lcd_selector()["flashing"] is False
+
+
+def test_setpoint_to_the_same_detent_does_not_flash():
+    d = _daemon()  # already hold-soc
+    d._handle_command("setpoint", {"mode": "hold-soc"})
+    assert d._lcd_selector()["flashing"] is False
+
+
+def test_rejected_setpoint_does_not_flash():
+    d = _daemon()
+    d._handle_command("setpoint", {"mode": "ludicrous"})
+    assert d._lcd_selector()["flashing"] is False
 
 
 # --- reconcile -----------------------------------------------------
@@ -684,23 +710,7 @@ def test_can_tx_gate_absent_means_enabled():
     assert iface._tx_suppressed() is False
 
 
-# --- LCD watch-screen line ---------------------------------------------
-@pytest.mark.parametrize("position", ["hold-soc", "hold-now", "mountain", "off"])
-@pytest.mark.parametrize("armed", [True, False])
-def test_lcd_status_fits_the_watch_screen(position, armed):
-    """The bottom row is 20 columns; a longer line is silently truncated on
-    the panel, which is exactly where the driver reads it."""
-    d = _daemon(position=position, start_armed=armed)
-    assert len(d._lcd_status()) <= 20
-    d._reconciler._floor_latched = True
-    assert len(d._lcd_status()) <= 20
-
-
-def test_lcd_status_distinguishes_the_two_hold_detents():
-    assert "HOLD" in _daemon(position="hold-now")._lcd_status()
-    assert "30%" in _daemon(position="hold-soc")._lcd_status()
-
-
+# --- LCD watch-screen selector ------------------------------------------
 def test_lcd_selector_reports_soc_fresh_for_a_live_poll():
     d = _daemon()
     d._state = _active_state(soc_percent=61.0)

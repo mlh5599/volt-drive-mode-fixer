@@ -5,21 +5,24 @@ When the daemon is up and nothing else has claimed the panel (see
 to the SparkFun 4x20:
 
     +--------------------+
-    |DMF C-  SOC   84.3% |
+    |ACTIVE -            |
     |sel 1/4 HOLD-SOC    |
-    |gear D  GM MOUNTAIN |
-    |on-start -> MOUNTAIN |
+    |gear D  DM MOUNTAIN |
+    |SOC       84.3%     |
     +--------------------+
 
-Row 0  a live bus-state glyph (see :func:`bus_icon`) + diag SOC % from the
-       22 005B poll -- the one number the instrument cluster never shows.
-       A trailing ``~`` marks a % that is not a live poll reading (poll
-       gone stale, or the coarse bar failsafe took over).
+Row 0  the live bus state, spelled out in full (see :func:`bus_label`):
+       ACTIVE spins a trailing tick so a hung watch thread would visibly
+       stop, WARNING/BUS-OFF blink so a fault is something you notice.
 Row 1  the VDMF selector: which of the four SW1 detents is live, and
-       whether the SOC-HOLD floor has latched on top of it.
-Row 2  committed drive mode (0x1F4 byte 1) + PRNDL gear (0x1F5 byte 3).
-Row 3  a one-line status the daemon supplies (what it is armed to do /
-       the last switch it requested).
+       whether the SOC-HOLD floor has latched on top of it. Right after a
+       SW1 tap this instead flashes the newly-picked setting (``-> LABEL``)
+       for ``SELECTOR_FLASH_S``, then settles back to the steady-state line.
+Row 2  committed drive mode (0x1F4 byte 1, labelled DM) + PRNDL gear
+       (0x1F5 byte 3).
+Row 3  diag SOC % from the 22 005B poll -- the one number the instrument
+       cluster never shows. A trailing ``~`` marks a % that is not a live
+       poll reading (poll gone stale, or the coarse bar failsafe took over).
 
 Everything here is fail-soft: the thread never raises into the daemon, a
 missing / unusable serial port just means the screen stays dark, and a
@@ -42,10 +45,10 @@ from .state import VehicleState
 
 log = logging.getLogger(__name__)
 
-#: SocketCAN "can state <x>" -> a tag :func:`bus_icon` knows how to draw.
-_BUS_ABBR = {
-    "ERROR-ACTIVE": "ACTIVE", "ERROR-WARNING": "WARN",
-    "ERROR-PASSIVE": "PASV", "BUS-OFF": "BUSOFF", "STOPPED": "STOP",
+#: SocketCAN "can state <x>" -> the full word :func:`bus_label` shows.
+_BUS_WORD = {
+    "ERROR-ACTIVE": "ACTIVE", "ERROR-WARNING": "WARNING",
+    "ERROR-PASSIVE": "PASSIVE", "BUS-OFF": "BUS-OFF", "STOPPED": "STOPPED",
 }
 _GEAR_LETTER = {
     ShiftPosition.PARK: "P", ShiftPosition.REVERSE: "R",
@@ -53,14 +56,9 @@ _GEAR_LETTER = {
     ShiftPosition.LOW: "L", ShiftPosition.UNKNOWN: "?",
 }
 
-#: 2-char glyph for every bus tag except ACTIVE, which spins instead (see
-#: bus_icon). WARN/BUSOFF also blink -- a fault should catch the eye, not
-#: blend into the row.
-_BUS_GLYPH = {
-    "WARN": "W!", "PASV": "P~", "BUSOFF": "X!", "STOP": "ST", "QUIET": "Qz",
-}
 _SPINNER = "-\\|/"
-_BLINKING_TAGS = ("WARN", "BUSOFF")
+#: A fault should catch the eye, not blend into the row -- these blink.
+_BLINKING_TAGS = ("WARNING", "BUS-OFF")
 
 #: How often the thread repaints, and how often it forces a full refresh
 #: (to recover a panel that browned out under us).
@@ -82,22 +80,21 @@ def _bus_tag(channel: str, state: VehicleState) -> str:
     if not state.bus_active:
         return "QUIET"
     raw = can_state(channel)
-    return _BUS_ABBR.get(raw, raw[:6])
+    return _BUS_WORD.get(raw, raw)
 
 
-def bus_icon(tag: str, ticks: int) -> str:
-    """2-3 char glyph for a bus tag from :func:`_bus_tag`.
+def bus_label(tag: str, ticks: int) -> str:
+    """Full word for a bus tag from :func:`_bus_tag`, animated.
 
-    ACTIVE spins a new frame every tick -- a heartbeat that a hung watch
-    thread would visibly stop, unlike static text. WARN/BUSOFF blink instead,
-    so a fault is something you notice, not read.
+    ACTIVE gets a spinning suffix -- a heartbeat that a hung watch thread
+    would visibly stop, unlike static text. WARNING/BUS-OFF blink the whole
+    word instead, so a fault is something you notice, not read.
     """
     if tag == "ACTIVE":
-        return "C" + _SPINNER[ticks % len(_SPINNER)]
-    glyph = _BUS_GLYPH.get(tag, (tag or "?")[:2])
+        return "ACTIVE" + _SPINNER[ticks % len(_SPINNER)]
     if tag in _BLINKING_TAGS and ticks % 2:
-        return "  "
-    return glyph
+        return ""
+    return tag or "?"
 
 
 def _soc_label(state: VehicleState) -> str:
@@ -106,36 +103,41 @@ def _soc_label(state: VehicleState) -> str:
     return f"{state.soc_percent:.1f}%"
 
 
-def render_screen(state: VehicleState, *, bus_icon: str, position_label: str,
+def render_screen(state: VehicleState, *, bus_label: str, position_label: str,
                   position_index: int, cycle_len: int, floor_latched: bool,
-                  soc_fresh: bool, status: str) -> list[str]:
+                  soc_fresh: bool, flashing: bool = False) -> list[str]:
     """Compose the four watch-screen rows. Pure -- easy to unit-test.
 
-    ``bus_icon`` is a short string, not the :func:`bus_icon` function --
+    ``bus_label`` is a resolved string, not the :func:`bus_label` function --
     the caller resolves the tag and animation tick before calling this.
     ``soc_fresh`` marks the displayed % with ``~`` when it is not a live
     poll reading (stale poll, or the coarse bar failsafe took over) -- the
     number stays on screen either way, but a stale one should not be trusted
-    the way a live one is.
+    the way a live one is. ``flashing`` swaps the selector row for a "new
+    setting" confirmation right after a SW1 tap -- the caller (the daemon)
+    owns the timeout, this just draws whichever state it's told.
     """
     mode = state.drive_mode.value.upper() if state.drive_mode else "no 1F4"
     gear = _GEAR_LETTER.get(state.shift, "?")
-    sel = f"sel {position_index}/{cycle_len} {position_label.upper()}"
-    if floor_latched:
-        sel += " FLR"
+    if flashing:
+        sel = f"-> {position_label.upper()}"
+    else:
+        sel = f"sel {position_index}/{cycle_len} {position_label.upper()}"
+        if floor_latched:
+            sel += " FLR"
     stale_mark = "" if (state.soc_percent is None or soc_fresh) else "~"
     rows = [
-        f"DMF {bus_icon:<3} SOC {_soc_label(state):>6}{stale_mark}",
+        bus_label,
         sel,
-        f"gear {gear}  GM {mode}",
-        status,
+        f"gear {gear}  DM {mode}",
+        f"SOC {_soc_label(state):>6}{stale_mark}",
     ]
     return [r[:20] for r in rows]
 
 
 def _default_selector() -> dict:
     return {"label": "--", "index": 0, "floor_latched": False,
-            "soc_fresh": False}
+            "soc_fresh": False, "flashing": False}
 
 
 class LcdDashboard:
@@ -144,19 +146,17 @@ class LcdDashboard:
     Parameters
     ----------
     state:        the shared :class:`VehicleState` the RX loop updates.
-    status_fn:    ``() -> str`` the daemon uses to describe what it is doing.
     selector_fn:  ``() -> dict`` with ``label``, ``index``, ``floor_latched``
                   -- the daemon's live reconciler position. Defaults to a
                   placeholder so callers that don't care (most tests) don't
                   have to supply one.
     """
 
-    def __init__(self, state: VehicleState, status_fn, *, selector_fn=None,
+    def __init__(self, state: VehicleState, *, selector_fn=None,
                  channel: str = "can0", port: str = "/dev/serial0",
                  baud: int = 9600, backlight: int = 45,
                  interval: float = _REPAINT_S, dry_run: bool = False) -> None:
         self._state = state
-        self._status_fn = status_fn
         self._selector_fn = selector_fn or _default_selector
         self._channel = channel
         self._lcd_kwargs = dict(port=port, baud=baud, backlight=backlight,
@@ -238,13 +238,13 @@ class LcdDashboard:
         sel = self._selector_fn()
         rows = render_screen(
             self._state,
-            bus_icon=bus_icon(_bus_tag(self._channel, self._state), ticks),
+            bus_label=bus_label(_bus_tag(self._channel, self._state), ticks),
             position_label=sel["label"],
             position_index=sel["index"],
             cycle_len=sel.get("cycle_len", 4),
             floor_latched=sel["floor_latched"],
             soc_fresh=sel.get("soc_fresh", False),
-            status=self._status_fn(),
+            flashing=sel.get("flashing", False),
         )
         for i, text in enumerate(rows):
             self._lcd.line(i, text)
