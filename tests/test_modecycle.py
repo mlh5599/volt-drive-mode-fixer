@@ -220,9 +220,12 @@ def test_closed_loop_raises_when_cursor_never_arrives():
 
     cur = StuckCursor()
     ctl, presser = _closed_controller([S], cur)
-    with pytest.raises(ModeSwitchFailed):
+    with pytest.raises(ModeSwitchFailed) as exc:
         ctl.switch_to(H)
     assert presser.presses == MAX_WALK_TAPS
+    # The failure has to carry the tap count -- it is the dropped-tap evidence,
+    # and SafetyGate reports it. Losing it made every probe MISS read "taps 0".
+    assert exc.value.taps == MAX_WALK_TAPS
 
 
 def test_closed_loop_reports_canonical_count_to_tracker():

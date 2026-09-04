@@ -380,6 +380,20 @@ this project needs. Tighten that:
   gated by arm state) and `send_soc_poll()` (hard-coded `22 005B` request,
   ungated — a read-only diagnostic poll). Each hard-codes its ID + payload;
   there is no general-purpose "send arbitrary frame" path.
+- **Two sockets, split by job.** `open()` binds *two* SocketCAN sockets to the
+  same interface: `_bus`, which the RX `can.Notifier` owns, and `_echo_bus`,
+  hardware-filtered to `0x1E1` and used only by the press path. This is a
+  correctness requirement, not an optimization. The tracking-echo press must
+  mirror the module's *current* `0x1E1` counter — a stale counter is the
+  frozen-counter frame the cluster ignores — and sharing one socket breaks
+  that two different ways, both measured on-vehicle (2026-09-03):
+  `recv()` alongside the Notifier lost 21% of taps, because SocketCAN gives
+  each frame to exactly one reader; taking the frame from the Notifier's
+  decoded state instead was *worse* at 36%, because that thread lags on a busy
+  Global A bus and hands back an already-stale frame. A second bound socket
+  gets its own copy of every frame, so the echo is neither contended nor
+  stale. It widens no privilege: the filter means it only ever queues `0x1E1`,
+  and the only thing written to it is the one hard-coded press frame.
 - **Rate limiting.** Cap both the size and rate of a press burst — at most
   3 presses (Normal→Hold, the longest possible cycle) with realistic
   inter-press spacing, never a sustained/looping transmission. Re-check the
