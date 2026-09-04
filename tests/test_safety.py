@@ -1,5 +1,6 @@
 import pytest
 
+from voltdmf.modecycle import ModeSwitchFailed
 from voltdmf.safety import SafetyGate
 from voltdmf.signals import DriveMode, ShiftPosition
 from voltdmf.state import VehicleState
@@ -126,3 +127,37 @@ def test_zero_presses_reports_false():
     gate = SafetyGate(ctl)
     assert gate.request(DriveMode.HOLD, _state()) is False
     assert ctl.calls == 1
+
+
+# -- a failed walk must still report the taps it put on the wire ----------
+#
+# Regression: request_verbose returned presses=0 for ANY exception, so every
+# probe MISS row read "taps 0" even after MAX_WALK_TAPS taps went out. That
+# under-counted taps on exactly the runs where the dropped-tap rate matters.
+class _FailingController:
+    def __init__(self, taps):
+        self._taps = taps
+
+    def switch_to(self, target, *, force=False):
+        raise ModeSwitchFailed(f"never reached {target.value}", taps=self._taps)
+
+
+def test_failed_walk_reports_the_taps_actually_sent():
+    gate = SafetyGate(_FailingController(12), cooldown_s=0.0, allow_park=True)
+    outcome = gate.request_verbose(DriveMode.HOLD, _state(), force=True)
+    assert outcome.presses == 12
+    assert outcome.sent is False        # taps went out, the switch did not land
+    assert outcome.blocked is True
+
+
+def test_failed_walk_without_a_tap_count_still_reports_zero():
+    """Any other exception has no ``taps``; must not crash on the getattr."""
+
+    class _Boom:
+        def switch_to(self, target, *, force=False):
+            raise RuntimeError("bus exploded")
+
+    gate = SafetyGate(_Boom(), cooldown_s=0.0, allow_park=True)
+    outcome = gate.request_verbose(DriveMode.HOLD, _state(), force=True)
+    assert outcome.presses == 0
+    assert outcome.blocked is True

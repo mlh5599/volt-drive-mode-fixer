@@ -128,7 +128,12 @@ class SafetyGate:
         except Exception as exc:  # fail-passive: never propagate into the RX loop
             log.exception("mode switch to %s failed; staying passive", target.value)
             self._last_switch = self._monotonic()  # apply cooldown even on failure
-            return RequestOutcome(False, 0, True, f"switch failed: {exc}")
+            # A failed walk still put taps on the wire, and that count is the
+            # dropped-tap evidence -- report it instead of a misleading 0.
+            # ``sent`` stays False: the walk did not achieve the switch.
+            return RequestOutcome(
+                False, getattr(exc, "taps", 0), True, f"switch failed: {exc}"
+            )
 
         self._last_switch = self._monotonic()
         if sent == 0:

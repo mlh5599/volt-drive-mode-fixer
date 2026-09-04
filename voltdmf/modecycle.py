@@ -104,7 +104,16 @@ class ModeSwitchFailed(RuntimeError):
     reverts toward NORMAL on a parked car, so callers that want a hard commit
     check poll it themselves over the following seconds
     (``tools/set_mode.py``, the daemon loop).
+
+    ``taps`` carries how many taps actually went on the wire before giving up.
+    A failed walk is the case where that count matters most -- it is the
+    dropped-tap evidence -- and it used to be lost: ``SafetyGate`` reported
+    ``presses=0`` for any exception, so every MISS row read "taps 0".
     """
+
+    def __init__(self, message: str, taps: int = 0) -> None:
+        super().__init__(message)
+        self.taps = taps
 
 
 class ButtonPresser(Protocol):
@@ -248,7 +257,8 @@ class ModeCycleController:
         # poison a PressCountingModeTracker. Caller handles the exception.
         raise ModeSwitchFailed(
             f"menu cursor never reached {target.value} in {taps} taps "
-            f"(bus degraded, menu not opening, or cluster ignoring us)"
+            f"(bus degraded, menu not opening, or cluster ignoring us)",
+            taps=taps,
         )
 
     def _report(self, landed: DriveMode) -> None:
