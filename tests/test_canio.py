@@ -7,6 +7,8 @@ RX backlog -- ``recv()`` hands back the oldest queued frame first, and the
 socket buffers 0x1F4 at ~40 Hz while ``send_mode_button_press`` runs.
 """
 
+import pytest
+
 from voltdmf import canio as canio_module
 from voltdmf import signals
 from voltdmf.canio import MODE_STATUS_ADDR, CanInterface, _DecodeListener
@@ -197,90 +199,116 @@ def test_decode_listener_ignores_short_frame_without_byte5():
 
 # -- the live 0x1E1 the tracking-echo press mirrors ---------------------
 #
-# In the daemon a can.Notifier owns the socket, so the press path must take
-# the module's live 0x1E1 from the listener instead of racing the Notifier
-# with its own recv(). That race cost ~21% dropped taps on-vehicle
-# (2026-09-03) against 0/22 with a single reader.
-def test_decode_listener_stashes_the_live_button_frame():
-    state = VehicleState()
-    listener = _DecodeListener(state)
-    assert state.button_frame is None
+# The press path owns its OWN socket (``_echo_bus``, hardware-filtered to
+# 0x1E1) rather than sharing ``_bus`` with the daemon's can.Notifier. Two
+# earlier designs were measured on-vehicle 2026-09-03 and both lost taps:
+#   * recv() on the shared socket -- 21% dropped taps, because SocketCAN gives
+#     each frame to exactly one of the two readers.
+#   * reading the frame the listener stashed in VehicleState -- WORSE, 36%,
+#     because the Notifier thread lags on a busy bus and the stashed frame was
+#     already stale; a stale counter is the frozen-counter echo the cluster
+#     ignored in session 2.
+# A second bound socket sees every frame (SocketCAN fans out) and nothing else
+# consumes it, so the echo is both uncontended and current.
+class _SendingFakeBus(_FakeBus):
+    """_FakeBus that also records what was transmitted on it."""
 
-    payload = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    listener.on_message_received(_Frame(0x1E1, payload))
-    frame, stamp = state.button_frame
-    assert frame == payload
-    assert stamp > 0
+    def __init__(self, frames):
+        super().__init__(frames)
+        self.sent = []
 
-    # a newer frame replaces it, with a fresh timestamp
-    newer = bytes((0x00, 0x11, 0x22, 0x33, 0x04, 0x66, 0x77))
-    listener.on_message_received(_Frame(0x1E1, newer))
-    assert state.button_frame[0] == newer
-    assert state.button_frame[1] >= stamp
-
-
-def test_decode_listener_ignores_a_short_button_frame():
-    """< 7 B cannot carry the counter tail the echo has to mirror."""
-    state = VehicleState()
-    listener = _DecodeListener(state)
-    listener.on_message_received(_Frame(0x1E1, bytes(4)))
-    assert state.button_frame is None
+    def send(self, msg, timeout=None):
+        self.sent.append(msg)
 
 
-def _iface_reading_state(state):
+def _iface_with_echo(frames):
     iface = CanInterface.__new__(CanInterface)
-    iface._bus = None            # must NOT be touched on the state path
-    iface._rx_state = state
-    iface._last_button_stamp = 0.0
+    iface._bus = None            # must NOT be touched on the press path
+    iface._echo_bus = _SendingFakeBus(frames)
+    iface._tx_gate = None
     return iface
 
 
-def test_next_button_frame_prefers_the_listener_over_the_socket():
-    state = VehicleState()
+def test_next_button_frame_reads_the_echo_socket_not_the_shared_bus():
     payload = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    state.button_frame = (payload, 100.0)
-    iface = _iface_reading_state(state)
-    # _bus is None: reaching for the socket here would raise
+    iface = _iface_with_echo([_Frame(0x1E1, payload)])
+    # _bus is None: reaching for the shared socket here would raise
     assert iface._next_button_frame(0.05) == payload
 
 
-def test_next_button_frame_will_not_reuse_the_same_frame():
-    """Each press frame must mirror a NEW module frame, not the last one.
+def test_next_button_frame_returns_the_first_frame_not_the_backlog_tail():
+    """The echo has to land in the gap behind the frame it mirrors.
 
-    Re-sending the same counter is the "static frame with a frozen counter"
-    the cluster was seen to ignore in session 2.
+    Unlike ``read_menu_cursor`` (which wants the newest 0x1F4), the press must
+    reply immediately, so this deliberately does NOT drain the queue.
     """
-    state = VehicleState()
     first = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
-    state.button_frame = (first, 100.0)
-    iface = _iface_reading_state(state)
-    assert iface._next_button_frame(0.05) == first
-    # nothing new arrived -> times out rather than echoing `first` again
-    assert iface._next_button_frame(0.02) is None
-    # a genuinely newer frame is taken
     second = bytes((0x00, 0x11, 0x22, 0x33, 0x04, 0x66, 0x77))
-    state.button_frame = (second, 101.0)
+    iface = _iface_with_echo([_Frame(0x1E1, first), _Frame(0x1E1, second)])
+    assert iface._next_button_frame(0.05) == first
     assert iface._next_button_frame(0.05) == second
 
 
+def test_next_button_frame_skips_a_short_frame():
+    """< 7 B cannot carry the counter tail the echo has to mirror."""
+    good = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
+    iface = _iface_with_echo([_Frame(0x1E1, bytes(4)), _Frame(0x1E1, good)])
+    assert iface._next_button_frame(0.05) == good
+
+
 def test_next_button_frame_times_out_when_the_bus_is_quiet():
-    iface = _iface_reading_state(VehicleState())   # never any frame
+    iface = _iface_with_echo([])
     assert iface._next_button_frame(0.02) is None
 
 
-def test_start_rx_switches_the_press_path_to_the_state():
-    """Wiring check: start_rx must arm the state source, close must clear it."""
+def test_next_button_frame_requires_open():
+    iface = CanInterface.__new__(CanInterface)
+    iface._echo_bus = None
+    with pytest.raises(RuntimeError):
+        iface._next_button_frame(0.01)
+
+
+def test_press_mirrors_the_live_frame_and_sends_on_the_echo_socket():
+    live = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
+    iface = _iface_with_echo([_Frame(0x1E1, live)] * 8)
+    iface.send_mode_button_press()
+    sent = iface._echo_bus.sent
+    assert len(sent) == canio_module.PRESS_TRACK_FRAMES
+    for msg in sent:
+        assert msg.arbitration_id == canio_module.MODE_BUTTON_ADDR
+        # byte 4 bit 7 set, everything else mirrored verbatim
+        assert bytes(msg.data) == live[:4] + bytes(
+            (live[4] | canio_module.PRESS_BYTE4,)) + live[5:]
+
+
+def test_press_falls_back_to_the_static_frame_on_a_quiet_bus():
+    iface = _iface_with_echo([])
+    iface.send_mode_button_press()
+    assert [bytes(m.data) for m in iface._echo_bus.sent] == [
+        canio_module._STATIC_PRESS_PAYLOAD]
+
+
+def test_press_transmits_nothing_while_disarmed():
+    live = bytes((0x00, 0x11, 0x22, 0x33, 0x05, 0x66, 0x77))
+    iface = _iface_with_echo([_Frame(0x1E1, live)] * 8)
+    iface._tx_gate = lambda: False
+    iface.send_mode_button_press()
+    assert iface._echo_bus.sent == []
+
+
+def test_start_rx_leaves_the_press_path_on_its_own_socket():
+    """The Notifier takes ``_bus``; ``_echo_bus`` must be untouched by it."""
     state = VehicleState()
     iface = CanInterface.__new__(CanInterface)
     iface._bus = _FakeBus([])
+    iface._echo_bus = _FakeBus([])
     iface._notifier = None
-    iface._rx_state = None
-    iface._last_button_stamp = 99.0
 
     captured = {}
 
     class _FakeNotifier:
         def __init__(self, bus, listeners):
+            captured["bus"] = bus
             captured["listeners"] = listeners
 
         def stop(self):
@@ -289,11 +317,14 @@ def test_start_rx_switches_the_press_path_to_the_state():
     real_notifier = canio_module.can.Notifier
     canio_module.can.Notifier = _FakeNotifier
     try:
+        echo = iface._echo_bus
         iface.start_rx(state)
-        assert iface._rx_state is state
-        assert iface._last_button_stamp == 0.0   # reset, or the first tap stalls
+        assert captured["bus"] is iface._bus     # Notifier owns the SHARED bus
+        assert iface._echo_bus is echo           # press socket untouched
         iface.close()
-        assert iface._rx_state is None
+        assert captured["stopped"] is True
+        assert echo.shut_down is True            # both sockets closed
+        assert iface._echo_bus is None
     finally:
         canio_module.can.Notifier = real_notifier
 

@@ -87,7 +87,7 @@ log = logging.getLogger(__name__)
 #
 # (An earlier note here claimed the cluster rate-limits to ~5 s and ignores
 # presses ~2 s apart. That was an artifact of the old 16-frame press: those
-# were being key-repeated into multi-row jumps, not ignored. At 2 frames,
+# were being key-repeated into multi-row jumps, not ignored. At 1 frame,
 # 1.4 s spacing is reliable -- measured on-vehicle 2026-09-03.)
 #
 # Injection efficacy is on-road-confirmed: the tracking-echo press drove a
@@ -110,7 +110,7 @@ PRESS_BYTE4 = 0x80               # 0x1E1 byte 4 bit 7 = button pressed
 # 1 of 10 presses in a back-to-back walk). That is the right failure to have.
 # A dropped tap is visible to ``ModeCycleController._walk_closed_loop`` -- the
 # cursor simply did not move -- and costs one extra tap out of MAX_WALK_TAPS
-# (8, against a 4-tap worst-case walk), while the loop's 1.6 s per iteration
+# (12, against a 4-tap worst-case walk), while the loop's 1.6 s per iteration
 # stays inside the ~3 s menu-open window so nothing commits early. An
 # overshoot is not recoverable in the same way: it commits the WRONG mode.
 # So: never overshoot, let the closed loop absorb the drops.
@@ -150,11 +150,9 @@ class CanInterface:
         self._tx_gate = tx_gate
         self._bus: can.BusABC | None = None
         self._notifier: can.Notifier | None = None
-        #: Set by :meth:`start_rx`. While a Notifier is running it owns the
-        #: socket, so the press path reads the live 0x1E1 from here instead of
-        #: racing it with its own ``recv()`` -- see ``_next_button_frame``.
-        self._rx_state: VehicleState | None = None
-        self._last_button_stamp = 0.0
+        #: Second socket, filtered to 0x1E1, dedicated to the tracking-echo
+        #: press -- see :meth:`open`.
+        self._echo_bus: can.BusABC | None = None
 
     def _tx_suppressed(self) -> bool:
         return self._tx_gate is not None and not self._tx_gate()
@@ -162,22 +160,45 @@ class CanInterface:
     # -- lifecycle --------------------------------------------------------
     def open(self) -> None:
         self._bus = can.Bus(interface="socketcan", channel=self._channel)
-        log.info("opened %s", self._channel)
+        # SECOND socket for the press path. SocketCAN delivers every frame to
+        # every socket bound to the interface, so this costs nothing and buys
+        # two things the shared socket could not give at once:
+        #
+        #   * no contention -- a Notifier on ``_bus`` (the daemon) and a
+        #     ``recv()`` here are no longer pulling from the same queue, where
+        #     each frame goes to exactly one of them.
+        #   * freshness -- the echo must mirror the module's CURRENT counter.
+        #     Taking it from the Notifier's decoded state instead was tried
+        #     (71f0fc3) and was WORSE, 36% dropped taps against 21%: the
+        #     listener thread lags on a busy Global A bus, so the frame it had
+        #     stashed was often already stale and the cluster ignored the echo
+        #     exactly like the frozen-counter frame in session 2.
+        #
+        # The hardware filter means this socket only ever queues 0x1E1, so a
+        # recv() here returns the newest button frame with minimal latency.
+        # ``receive_own_messages`` stays False (python-can's default) so our
+        # own injected frames never come back and get mistaken for the
+        # module's.
+        self._echo_bus = can.Bus(
+            interface="socketcan", channel=self._channel,
+            can_filters=[{"can_id": MODE_BUTTON_ADDR, "can_mask": 0x7FF}])
+        log.info("opened %s (+ 0x%03X-filtered echo socket)",
+                 self._channel, MODE_BUTTON_ADDR)
 
     def start_rx(self, state: VehicleState) -> None:
         if self._bus is None:
             raise RuntimeError("open() first")
+        # The Notifier takes over ``_bus``. The press path is unaffected: it
+        # lives on ``_echo_bus``, its own socket.
         self._notifier = can.Notifier(self._bus, [_DecodeListener(state)])
-        # From here on the Notifier owns the socket; the press path must take
-        # its live 0x1E1 from the state, not from a competing recv().
-        self._rx_state = state
-        self._last_button_stamp = 0.0
 
     def close(self) -> None:
         if self._notifier is not None:
             self._notifier.stop()
             self._notifier = None
-        self._rx_state = None
+        if self._echo_bus is not None:
+            self._echo_bus.shutdown()
+            self._echo_bus = None
         if self._bus is not None:
             self._bus.shutdown()
             self._bus = None
@@ -241,53 +262,24 @@ class CanInterface:
     def _next_button_frame(self, timeout: float) -> bytes | None:
         """Block up to ``timeout`` for the module's NEXT live 0x1E1 (>=7 B).
 
-        Does not drain a backlog -- it returns on the first 0x1E1 seen so the
-        caller can reply into the gap right behind it.
+        Reads the dedicated ``_echo_bus`` socket, which is hardware-filtered to
+        0x1E1 (see :meth:`open`). Nothing else consumes that socket, so this
+        never races the daemon's Notifier and always returns a CURRENT frame --
+        the echo has to carry the module's current counter or the cluster
+        ignores it.
 
-        Two sources, because there are two callers with different plumbing:
-
-        * **A Notifier is running** (the daemon, via :meth:`start_rx`) -- take
-          the frame the listener stashed in ``VehicleState.button_frame``. The
-          Notifier owns the socket, so calling ``recv()`` here would race its
-          reader thread for every frame and lose most of them. That race was
-          worth ~21% dropped taps in the daemon (2026-09-03) against 0/22 for
-          the same press logic with a single reader, and a dropped tap falls
-          through to the static payload the Gen 1 cluster ignores.
-        * **No Notifier** (tools/set_mode.py, tools/inject_test.py) -- read
-          the socket directly, as before.
+        Does not drain a backlog: it returns on the first frame seen so the
+        caller can reply into the ~24 ms gap right behind it.
         """
-        if self._rx_state is not None:
-            return self._next_button_frame_from_state(timeout)
-        if self._bus is None:
+        bus = self._echo_bus
+        if bus is None:
             raise RuntimeError("open() first")
         end = time.time() + timeout
         while time.time() < end:
-            msg = self._bus.recv(timeout=max(0.0, end - time.time()))
-            if (msg is not None and msg.arbitration_id == MODE_BUTTON_ADDR
-                    and len(msg.data) >= 7):
+            msg = bus.recv(timeout=max(0.0, end - time.time()))
+            if msg is not None and len(msg.data) >= 7:
                 return bytes(msg.data)
         return None
-
-    def _next_button_frame_from_state(self, timeout: float) -> bytes | None:
-        """Wait for the RX listener to stash a 0x1E1 we have not used yet.
-
-        Polls rather than blocks -- ``VehicleState`` carries no condition
-        variable, and at the module's ~40 Hz a fresh frame lands within ~25 ms,
-        well inside ``_TRACK_FRAME_TIMEOUT_S``. The ``(payload, stamp)`` tuple
-        is read in one attribute access so we never pair a new payload with an
-        old timestamp.
-        """
-        state = self._rx_state
-        assert state is not None
-        end = time.time() + timeout
-        while True:
-            latest = state.button_frame
-            if latest is not None and latest[1] > self._last_button_stamp:
-                self._last_button_stamp = latest[1]
-                return latest[0]
-            if time.time() >= end:
-                return None
-            time.sleep(0.002)
 
     def send_mode_button_press(self) -> None:
         """Inject ONE logical button press on 0x1E1: a tracking echo press.
@@ -310,7 +302,7 @@ class CanInterface:
                      "byte4|=0x%02x x%d, then stop TX for >=%.2fs",
                      PRESS_BYTE4, PRESS_TRACK_FRAMES, RELEASE_GAP_S)
             return
-        if self._bus is None:
+        if self._echo_bus is None:
             raise RuntimeError("open() first")
         sent = misses = 0
         for _ in range(PRESS_TRACK_FRAMES):
@@ -325,7 +317,7 @@ class CanInterface:
             frame = can.Message(arbitration_id=MODE_BUTTON_ADDR,
                                 data=bytes(buf), is_extended_id=False)
             try:
-                self._bus.send(frame, timeout=_TX_SEND_TIMEOUT_S)
+                self._echo_bus.send(frame, timeout=_TX_SEND_TIMEOUT_S)
             except can.CanError as exc:
                 log.warning("0x1E1 press: TX backpressure after %d/%d (%s)",
                             sent, PRESS_TRACK_FRAMES, exc)
@@ -336,7 +328,7 @@ class CanInterface:
             log.warning("0x1E1 press: no live frame to track -- sending static "
                         "fallback once (cluster may ignore it)")
             try:
-                self._bus.send(
+                self._echo_bus.send(
                     can.Message(arbitration_id=MODE_BUTTON_ADDR,
                                 data=_STATIC_PRESS_PAYLOAD, is_extended_id=False),
                     timeout=_TX_SEND_TIMEOUT_S)
@@ -380,13 +372,6 @@ class _DecodeListener(can.Listener):
 
     def on_message_received(self, msg: can.Message) -> None:
         addr = msg.arbitration_id
-        # 0x1E1 is deliberately NOT a "signal" frame (nothing is decoded from
-        # it), but the tracking-echo press needs the module's live counter and
-        # this listener owns the socket. Stash it before the signal gate.
-        if addr == MODE_BUTTON_ADDR:
-            if len(msg.data) >= 7:
-                self._state.button_frame = (bytes(msg.data), time.monotonic())
-            return
         if not signals.is_signal_frame(addr):
             return
         data = bytes(msg.data)

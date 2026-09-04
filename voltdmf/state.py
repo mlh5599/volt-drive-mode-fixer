@@ -32,17 +32,6 @@ class VehicleState:
     uds_replies: int = 0
     uds_nrcs: int = 0
     shift: ShiftPosition = ShiftPosition.UNKNOWN
-    #: Newest live 0x1E1 button frame (>= 7 B) as ``(payload, monotonic)``.
-    #: Stored as ONE tuple so a reader always gets a matched pair -- the
-    #: tracking-echo press reads this from another thread.
-    #:
-    #: This is the frame ``CanInterface.send_mode_button_press`` mirrors. It
-    #: comes through the RX listener rather than a second ``bus.recv()``
-    #: because when a ``can.Notifier`` is running it owns the socket, and a
-    #: competing ``recv()`` loses most frames to it -- measured as a ~21%
-    #: dropped-tap rate in the daemon vs. 0/22 for the same press logic with
-    #: a single reader (2026-09-03).
-    button_frame: tuple[bytes, float] | None = None
     #: Current drive mode -- stays ``None`` until the first 0x1F4 frame.
     drive_mode: DriveMode | None = None
     #: Live drive-mode menu cursor, decoded from 0x1F4 bytes 4 AND 5 together
