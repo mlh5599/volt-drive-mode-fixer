@@ -12,6 +12,7 @@ Prereqs: `can0` up at the right bitrate (see `../host/`), `can-utils` and
 | `logcan.sh` | Phase C | Timestamped `candump -l` capture to a file. |
 | `watch_soc.py` | Phase C | Live raw + candidate decodings of `0x206`; correlate against the dash to calibrate `decode_soc`. **Effectively obsolete:** `0x206` is confirmed absent from this car's bus (0 frames in a 213 MB capture). SOC hunting has moved to the broadcast candidates + `22 005B` poll in `soc_log.py` / `soc_report.py`. |
 | `mode_diff.py` | Phase C | Diffs bus traffic before/after one mode-button press; checks the `0x1E1` bit-39 candidate and flags any other frame that moved. |
+| `headlight_diff.py` | Phase C | Diffs bus traffic across an off/on/off headlight cycle; flags bytes that flip while the lights are on and revert once they're off again (rules out counters/noise). Goal: an exterior-lighting signal to auto-dim the LCD backlight. |
 | `cycle_modes.py` | Phase C | Walks all four modes, tabulating candidate status frames per mode -> finds the current-mode status signal. |
 | `ignition_check.py` | Phase C | Whether the bus goes quiet with the car off, and whether a chosen status frame resets to Normal across an ignition cycle. |
 | `inject_test.py` | Phase C.5 | **Transmits.** Lower-level walk/timing sweep (`--cycle`, `--repeat`, `--frames`) with its own copy of the walk loop. Use for tuning frames/gap. |
