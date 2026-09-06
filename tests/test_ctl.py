@@ -78,6 +78,60 @@ def test_status_shows_floor_latch(tmp_path, capsys):
     assert "floor latched for this key cycle" in out
 
 
+def test_status_reports_the_engine_and_why_it_is_standing_down(tmp_path, capsys):
+    reply = {"ok": True, "state": {
+        "armed": True, "transmit_enabled": True, "setpoint": "hold-now",
+        "floor_latched": True, "drive_mode": "normal", "shift": "drive",
+        "engine_state": "running", "engine_running": True,
+        "engine_run_counter": 258, "bus_active": True,
+        "ice_block": "engine running in NORMAL (SOC 21%) -- the pack is spent "
+                     "and HOLD is not on the menu"}}
+    with _CannedServer(tmp_path, reply) as srv:
+        ctl.main(["--socket", srv.path, "status"])
+    out = capsys.readouterr().out
+    assert "engine:     running" in out
+    assert "0x4C5 running" in out and "0x3F9 258" in out
+    assert "NOT ACTING: engine running in NORMAL" in out
+
+
+def test_status_reports_a_target_it_has_given_up_on(tmp_path, capsys):
+    reply = {"ok": True, "state": {
+        "armed": True, "transmit_enabled": True, "setpoint": "mountain",
+        "drive_mode": "normal", "shift": "drive", "bus_active": True,
+        "give_up": "MOUNTAIN unreachable -- gave up after 3 attempts "
+                   "(tap SW1 or run set-mode to retry)",
+        "attempts": {"target": "mountain", "attempts": 3, "max_attempts": 3,
+                     "gave_up": True}}}
+    with _CannedServer(tmp_path, reply) as srv:
+        ctl.main(["--socket", srv.path, "status"])
+    out = capsys.readouterr().out
+    assert "NOT ACTING: MOUNTAIN unreachable" in out
+    assert "attempts:" not in out   # the give-up line already said 3 of 3
+
+
+def test_status_shows_a_walk_in_progress(tmp_path, capsys):
+    reply = {"ok": True, "state": {
+        "armed": True, "transmit_enabled": True, "setpoint": "mountain",
+        "drive_mode": "normal", "shift": "drive", "bus_active": True,
+        "attempts": {"target": "mountain", "attempts": 1, "max_attempts": 3,
+                     "gave_up": False}}}
+    with _CannedServer(tmp_path, reply) as srv:
+        ctl.main(["--socket", srv.path, "status"])
+    out = capsys.readouterr().out
+    assert "attempts:   1/3 toward mountain" in out
+    assert "NOT ACTING" not in out
+
+
+def test_status_omits_the_engine_line_when_the_car_never_reports_one(tmp_path,
+                                                                     capsys):
+    reply = {"ok": True, "state": {"armed": True, "transmit_enabled": True,
+                                   "setpoint": "mountain", "drive_mode": "hold",
+                                   "shift": "drive", "bus_active": True}}
+    with _CannedServer(tmp_path, reply) as srv:
+        ctl.main(["--socket", srv.path, "status"])
+    assert "engine:" not in capsys.readouterr().out
+
+
 def test_set_mode_request_shape(tmp_path):
     with _CannedServer(tmp_path, {"ok": True, "result": "switched"}) as srv:
         rc = ctl.main(["--socket", srv.path, "set-mode", "sport", "--force"])

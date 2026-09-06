@@ -5,11 +5,20 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from .signals import DriveMode, ShiftPosition
+from .signals import DriveMode, EngineState, ShiftPosition
 
 #: If no known signal frame has been seen for this long, treat the bus as
 #: quiet -> car is off (Global A buses go silent with the ignition off).
 BUS_QUIET_TIMEOUT_S = 2.0
+
+#: How long the 0x3F9 engine run counter may sit still before we stop calling
+#: it a sign of life. It steps on essentially every one of that frame's ~4 Hz
+#: slots while the engine is burning fuel, so 3 s is ~12 missed chances --
+#: comfortably past RX jitter. It is deliberately NOT sized to ride out the
+#: 13-43 s no-fuel stretches seen mid-leg: 0x4C5 covers those, and on a car
+#: that has no 0x4C5 a stretched timeout would just move the flapping around.
+#: Also the settling time before "seen but never moved" may mean "stopped".
+ENGINE_COUNTER_IDLE_S = 3.0
 
 
 @dataclass
@@ -32,6 +41,16 @@ class VehicleState:
     uds_replies: int = 0
     uds_nrcs: int = 0
     shift: ShiftPosition = ShiftPosition.UNKNOWN
+    #: Range-extender engine state from 0x4C5 byte 2. The direct read; stays
+    #: UNKNOWN until the first decodable frame.
+    engine_state: EngineState = EngineState.UNKNOWN
+    #: 0x3F9 bytes 1-2 -- the opaque engine run counter, newest frame.
+    engine_run_counter: int | None = None
+    #: ``time.monotonic()`` when that counter was first seen, and when it last
+    #: changed. The pair is what makes "frozen" distinguishable from "not
+    #: watched long enough yet".
+    engine_counter_seen_monotonic: float | None = None
+    engine_counter_moved_monotonic: float | None = None
     #: Current drive mode -- stays ``None`` until the first 0x1F4 frame.
     drive_mode: DriveMode | None = None
     #: Live drive-mode menu cursor, decoded from 0x1F4 bytes 4 AND 5 together
@@ -72,3 +91,57 @@ class VehicleState:
         """True if a poll reply landed within ``max_age_s`` seconds."""
         age = self.soc_percent_age()
         return age is not None and age <= max_age_s
+
+    # -- range-extender engine -------------------------------------------
+    def note_engine_run_counter(self, value: int) -> None:
+        """Fold a fresh 0x3F9 counter reading in, tracking when it moves."""
+        now = time.monotonic()
+        if self.engine_counter_seen_monotonic is None:
+            self.engine_counter_seen_monotonic = now
+        elif value != self.engine_run_counter:
+            self.engine_counter_moved_monotonic = now
+        self.engine_run_counter = value
+
+    def engine_counter_advancing(self) -> bool | None:
+        """Is the 0x3F9 run counter moving? ``None`` == not yet knowable.
+
+        ``None`` is returned both before the first frame and during the first
+        :data:`ENGINE_COUNTER_IDLE_S` of watching a still counter -- at that
+        point "frozen" and "we only just started looking" are the same
+        picture, and reporting the wrong one of those is how a caller ends up
+        walking a menu that has nothing on it.
+        """
+        if self.engine_run_counter is None:
+            return None
+        now = time.monotonic()
+        if self.engine_counter_moved_monotonic is not None:
+            return (now - self.engine_counter_moved_monotonic) <= ENGINE_COUNTER_IDLE_S
+        assert self.engine_counter_seen_monotonic is not None
+        if now - self.engine_counter_seen_monotonic >= ENGINE_COUNTER_IDLE_S:
+            return False
+        return None
+
+    @property
+    def engine_running(self) -> bool | None:
+        """Is the car on an engine leg? ``None`` if neither signal has said.
+
+        The union of the two signals, because each is blind where the other
+        sees (docs/analysis/session12-engine-signal.md):
+
+        * 0x3F9 tracks fuelling, so it starts moving 33-42 s before 0x4C5
+          leaves ``off`` at the head of a leg -- but it also freezes for
+          13-43 s at a time on overrun and at rest mid-leg;
+        * 0x4C5 rides through those freezes on ``running``, and is the only
+          one of the two that does.
+
+        So a moving counter overrides an ``off`` 0x4C5, and a ``running``
+        0x4C5 stands on its own. Both errors of this union are in the safe
+        direction: it says "running" slightly early and slightly late, and
+        the cost of that is only that a mode walk waits.
+        """
+        advancing = self.engine_counter_advancing()
+        if self.engine_state is EngineState.UNKNOWN:
+            return advancing
+        if self.engine_state is EngineState.OFF:
+            return True if advancing else False
+        return True  # RUNNING, or the ramp at either edge

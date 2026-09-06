@@ -446,3 +446,39 @@ def test_send_soc_poll_runs_even_while_disarmed():
     iface.send_soc_poll(0x7E4)
     assert len(bus.sent) == 1
     assert bus.sent[0].arbitration_id == 0x7E4
+
+
+# -- _DecodeListener: the engine frames (0x4C5 / 0x3F9) -----------------
+def test_decode_listener_populates_engine_state_from_4c5():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(
+        _Frame(signals.ENGINE_STATE_ADDR, bytes.fromhex("0000490000")))
+    assert state.engine_state is signals.EngineState.OFF
+    listener.on_message_received(
+        _Frame(signals.ENGINE_STATE_ADDR, bytes.fromhex("0000DD0000")))
+    assert state.engine_state is signals.EngineState.RUNNING
+
+
+def test_decode_listener_tracks_the_3f9_run_counter():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(
+        _Frame(signals.ENGINE_RUN_COUNTER_ADDR,
+               bytes.fromhex("0000022851598964")))
+    assert state.engine_run_counter == 0x0002
+    assert state.engine_counter_moved_monotonic is None
+    listener.on_message_received(
+        _Frame(signals.ENGINE_RUN_COUNTER_ADDR,
+               bytes.fromhex("00000A2851598964")))
+    assert state.engine_run_counter == 0x000A
+    assert state.engine_counter_moved_monotonic is not None
+
+
+def test_decode_listener_ignores_a_short_engine_frame():
+    state = VehicleState()
+    listener = _DecodeListener(state)
+    listener.on_message_received(_Frame(signals.ENGINE_STATE_ADDR, b"\x00\x00"))
+    listener.on_message_received(_Frame(signals.ENGINE_RUN_COUNTER_ADDR, b"\x00"))
+    assert state.engine_state is signals.EngineState.UNKNOWN
+    assert state.engine_run_counter is None

@@ -191,11 +191,59 @@ def test_is_signal_frame():
 def test_confirmed_signal_set():
     # Phase C, 2026-08-29 (session 4, drive): drive-mode status (0x1F4 b1),
     # the button injection (0x1E1), and PRNDL (0x1F5 b3) are all confirmed
-    # on-vehicle. Speed still needs a longer discharge drive; SOC is a UDS
+    # on-vehicle. The two engine signals (0x4C5 b2, 0x3F9 b1-2) were confirmed
+    # 2026-09-05 offline against three in-repo captures spanning two labelled
+    # engine starts. Speed still needs a longer discharge drive; SOC is a UDS
     # poll now, not a SIGNAL_IDS entry.
     confirmed = {name for name, s in signals.SIGNAL_IDS.items() if s.confirmed}
-    assert confirmed == {"drive_mode_status", "drive_mode_button", "shift"}
+    assert confirmed == {"drive_mode_status", "drive_mode_button", "shift",
+                         "engine_state", "engine_run_counter"}
     assert signals.SIGNAL_IDS["drive_mode_status"].addr == 0x1F4
     assert signals.SIGNAL_IDS["drive_mode_button"].addr == 0x1E1
     assert signals.SIGNAL_IDS["shift"].addr == 0x1F5
     assert "soc" not in signals.SIGNAL_IDS
+
+
+# --- range-extender engine (0x4C5 byte 2 / 0x3F9 bytes 1-2) ---------------
+#
+# Payloads below are verbatim from the in-repo captures: 0x4C5's five distinct
+# byte-2 values (the whole set -- the other four payload bytes are always
+# zero), and two consecutive 0x3F9 frames from the session-9 engine start
+# (counter 0x0002 -> 0x000A over one 0.25 s slot).
+
+def test_decode_engine_state_covers_the_observed_codes():
+    assert signals.decode_engine_state(bytes.fromhex("0000490000")) is (
+        signals.EngineState.OFF)
+    assert signals.decode_engine_state(bytes.fromhex("0000DD0000")) is (
+        signals.EngineState.RUNNING)
+    # The ramp values appear at BOTH edges of an engine leg (session 9 has a
+    # 0xDD -> 0xB5 -> 0x87 -> 0x59 -> 0x49 shutdown), so they mean "in
+    # transition", not "starting" -- and either way the engine is turning.
+    for ramp in ("0000590000", "0000870000", "0000B50000"):
+        assert signals.decode_engine_state(bytes.fromhex(ramp)) is (
+            signals.EngineState.TRANSITION)
+
+
+def test_decode_engine_state_is_unknown_not_off_when_it_cannot_tell():
+    # UNKNOWN must never collapse into OFF: "off" is the reading that lets a
+    # caller put taps on a menu that has nothing on it.
+    assert signals.decode_engine_state(b"\x00\x00") is signals.EngineState.UNKNOWN
+    assert signals.decode_engine_state(
+        bytes.fromhex("0000FF0000")) is signals.EngineState.UNKNOWN
+
+
+def test_decode_engine_run_counter_is_bytes_1_and_2_big_endian():
+    assert signals.decode_engine_run_counter(
+        bytes.fromhex("0000022851598964")) == 0x0002
+    assert signals.decode_engine_run_counter(
+        bytes.fromhex("00000A2851598964")) == 0x000A
+    # Byte 0 was 0x00 in all 15485 captured frames, so it is deliberately not
+    # read in -- a change there must not register as engine revolutions.
+    assert signals.decode_engine_run_counter(
+        bytes.fromhex("FF00022851598964")) == 0x0002
+    assert signals.decode_engine_run_counter(b"\x00\x00") is None
+
+
+def test_engine_frames_are_signal_frames():
+    assert signals.is_signal_frame(signals.ENGINE_STATE_ADDR)
+    assert signals.is_signal_frame(signals.ENGINE_RUN_COUNTER_ADDR)

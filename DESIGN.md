@@ -154,6 +154,39 @@ with it.
   7.07·bars + 19.6` (r = 0.999); the 3→2 bar drop is **33.7 %** (raw 0x56),
   the 4→3 bar mark **41.2 %** (raw 0x69). The engage point is **30 %** —
   mid-2-bar, and the driver-facing name of position 1.
+- **A spent pack takes HOLD off the menu.** Once the car gives up on the pack
+  for a key cycle it starts the range extender and sits in NORMAL, and the
+  centre stack stops offering HOLD and MOUNTAIN at all — observed on the
+  2026-09-04 drive (restart after parking on a nearly-flat pack) and caught on
+  the wire in the Session-8 capture. Walking a menu that has no such entry can
+  only spend taps, so **engine running + car in NORMAL + no fresh SOC reading
+  above 24 % ⇒ the reconciler withholds its target** and reports why
+  (`reconciler.charge_sustaining_block`, surfaced as `ice_block` in `status`,
+  `NO HOLD` on the LCD). The 24 % release keeps a cold-morning ERDTT start, an
+  engine-maintenance cycle, or our own working HOLD from blocking anything.
+  The check is level-triggered and self-clearing, fails **open** on an unknown
+  engine reading (a car without `0x4C5`/`0x3F9` behaves exactly as before) and
+  **closed** on an unknown SOC, and the SOC floor gets no exemption — a
+  latched floor asking for HOLD on a written-off pack is the exact drive that
+  produced it.
+- **Give up after three walks.** The gate above covers the one failure we
+  understand; `safety.AttemptBudget` covers every other one without needing to
+  know what it is. The reconciler is level-triggered, so "mode != target"
+  stays true forever if the walk never lands — before this, the only thing
+  between that and a whole drive of 10 s tap bursts was the cooldown itself.
+  Three walks, because a walk is already a closed loop that taps up to 12
+  times reading the cursor back each time: a whole walk failing is not "a tap
+  went missing", it is "the menu is not behaving", and a fourth identical walk
+  is not new information. An **attempt** is a walk that put taps on the wire —
+  a walk suppressed by the cooldown, a precondition, or the ICE block costs
+  nothing, so a car with a quiet bus never burns the budget. It clears when
+  the car reaches the mode (however it got there — the driver's own thumb
+  counts), when the target changes, and on explicit intent: an SW1 tap, a
+  `set-mode`, an `arm`, a `reload`, and the bus going quiet, which is this
+  project's key-cycle boundary. Nothing is persisted and nothing expires on a
+  timer: giving up is meant to be visible (`give_up` / `attempts` in `status`,
+  `GAVE UP` on the LCD, one journal line per edge) and to stay given up until
+  a person or the car says otherwise.
 - **Reconcile cadence vs. the driver.** The reconcile runs every loop but
   every switch still goes through `SafetyGate` (preconditions + the 10 s
   cooldown), so if the driver fights the selector the daemon re-asserts at
@@ -237,6 +270,7 @@ layer of defense.
 | Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Reported in `status` / the trip log, **not** a `SafetyGate` precondition — a drive-mode change has no driveline implication, so PRNDL does not block a switch (see "Safety model"). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** The `22 005B` SOC poll (above) is the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
+| Range-extender engine running | `0x4C5` byte 2 (+ `0x3F9` bytes 1-2) | **CONFIRMED on Gen 1 (2026-09-05, offline from the session-8/9 captures).** `0x4C5` b2: `0x49` off, `0xDD` on an engine leg, `0x59`/`0x87`/`0xB5` a ~1.5 s ramp at either edge. `0x3F9` b1-2 BE is a fuelling accumulator whose *movement* corroborates it -- it leads `0x4C5` by 33-42 s at the head of a leg and freezes on overrun and at rest, so the two are read as a union (`VehicleState.engine_running`). Purpose: once the pack is spent the car runs the engine in NORMAL and drops HOLD/MOUNTAIN from the centre-stack menu, so the reconciler must stop walking to a mode that is not on offer (see "Mode policy" / `reconciler.charge_sustaining_block`). `docs/analysis/session12-engine-signal.md`. |
 | Current drive mode (status, not button-press) | `0x1F4`, byte 1 | **CONFIRMED on Gen 1 (2026-08-29).** Latched mode: `0x00` NORMAL, `0x80` SPORT, `0x20` MOUNTAIN, `0x08` HOLD. byte 4 = live drive-mode menu cursor (steps ~40 ms after each tap; distinct byte codes), byte 5 bit 7 = menu-open hint. The daemon reads byte 1 as its current-mode source — the press-counting fallback is retired. |
 
 ## Hardware design
@@ -429,6 +463,12 @@ this project needs. Tighten that:
   inter-press spacing, never a sustained/looping transmission. Re-check the
   current mode (if readable) after sending to confirm it landed on the
   intended target rather than blindly trusting the press count.
+- **Bounded persistence.** Rate limiting bounds how *fast* the daemon can
+  tap; it does nothing about how *long*. A level-triggered reconciler chasing
+  a mode the car will not take is a slow-motion runaway, and one whole drive
+  of it is what the 2026-09-04 failure looked like. `safety.AttemptBudget`
+  bounds the total: three walks per target, then it stops and says so, until
+  the car reaches the mode or a person intervenes (see "Mode policy").
 - **Preconditions before injecting**: a live bus and a plausible speed. Both
   are checks on the *bus* — a quiet bus means nobody is listening, an
   implausible speed means the frames being decoded are garbage. **Shift/PRNDL

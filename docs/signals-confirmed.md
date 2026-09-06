@@ -1,5 +1,12 @@
 # Confirmed CAN signals (Gen 1 Chevy Volt, this vehicle)
 
+**Status (2026-09-05, through session 12):** the range-extender engine is now
+readable too -- `0x4C5` byte 2 with `0x3F9` bytes 1-2 as corroboration, both
+`confirmed=True`, mined offline from the existing captures (section below,
+`docs/analysis/session12-engine-signal.md`). SOC was resolved in session 9 as
+the `22 005B` UDS poll, not a broadcast frame (`docs/analysis/session9-soc-anchor.md`);
+the paragraph below predates both and is kept as the session-8 snapshot.
+
 **Status (2026-08-30, through session 8):** `drive_mode_button` (`0x1E1`),
 `drive_mode_status` (`0x1F4` byte 1) and `shift`/PRNDL (`0x1F5` byte 3) are
 `confirmed=True` in `voltdmf/signals.py` and validated on-road; `0x1F4` byte 1
@@ -318,6 +325,70 @@ let a stale cursor match a walk target.
 - **Done** (`4013ea3`): `allow_unknown_shift=False` is now the `SafetyGate`
   default and the daemon takes it, so injection is blocked on UNKNOWN / short
   `0x1F5` as well as on any non-DRIVE detent.
+
+## Range-extender engine -- `0x4C5` byte 2 + `0x3F9` bytes 1-2  (CONFIRMED 2026-09-05, offline)
+
+Found without a drive, by mining the three captures already in `captures/`:
+two of them contain a labelled engine start (session 8's full drain into
+forced charge-sustaining, session 9's driver-selected HOLD leg) and the third
+is EV-only, the negative control. Full write-up with the timings and the
+speed cross-reference: `docs/analysis/session12-engine-signal.md`. Regenerate
+any of it with `tools/engine_check.py <capture> [--since <epoch>]`.
+
+- **`0x4C5`**, ~2 Hz, 5 bytes. **Byte 2 is the only byte that ever changes**;
+  the other four are always `00`.
+
+  | byte 2 | frames (all 3 captures) | meaning |
+  |---|---|---|
+  | `0x49` | 6 309 | off -- the car is an EV |
+  | `0x59` / `0x87` / `0xB5` | 4 each | the ~1.5 s ramp between states |
+  | `0xDD` | 1 414 | on an engine leg |
+
+  The ramp values appear at **both** edges (session 9 has a
+  `0xDD → 0xB5 → 0x87 → 0x59 → 0x49` shutdown), so they decode to
+  `EngineState.TRANSITION`, not "starting". `0xDD` means *on an engine leg*
+  rather than *crank turning right now*: it held for the whole 701 s of the
+  session-9 leg, including five stretches where the engine was not burning
+  fuel. That is the wider reading and the one this project wants -- the menu
+  entry is missing across those gaps too.
+
+- **`0x3F9`**, ~4 Hz, 8 bytes. **Bytes 1-2 big-endian are a monotone
+  accumulator**; byte 0 was `0x00` in all 15 478 frames (left out of the
+  decode on purpose -- an unrelated flag byte there would read as a false
+  "engine running"), bytes 3-7 are a near-static `28 51 59 89 6x`.
+  **0 steps** across the whole EV-only capture and both EV legs; 160 steps in
+  session 8's 40 s engine tail, 2 349 in session 9's leg. Rate 4-159
+  counts/s, median 60 -- unit unpinned and unused, only *did it change
+  recently* is read.
+
+  It tracks **fuelling, not rotation**: it leads `0x4C5` by 32.8 s (session
+  8) / 41.9 s (session 9) at the head of a leg, and freezes for 12.7-43.3 s
+  mid-leg. One of those freezes lines up exactly with a 70 mph → standstill →
+  35 mph decel on `0x3E9` -- overrun fuel cut, then a stop.
+
+- **Read as a union** (`VehicleState.engine_running`): a moving counter
+  overrides an `off` `0x4C5`, and a `running` `0x4C5` stands on its own.
+  Neither alone covers a leg, and they are blind in opposite places. Both
+  errors of the union are in the safe direction (slightly early, slightly
+  late), and the cost is only a mode walk that waits.
+
+- **Why it exists.** On the 2026-09-04 drive the pack was spent, the car came
+  up with the engine running and stuck in NORMAL, and the centre stack stopped
+  offering HOLD/MOUNTAIN entirely -- so the reconciler walked the menu, failed,
+  and retried every 10 s cooldown for the rest of the drive. Session 8 caught
+  that exact state on the wire: engine on at the 0-bar mark with `0x1F4` byte 1
+  still `0x00` (NORMAL). Session 9's leg, by contrast, ran with byte 1 at
+  `0x08` (HOLD) -- same engine, complete menu, because HOLD was selected
+  before the pack was written off.
+
+- Implemented: `signals.decode_engine_state()` / `decode_engine_run_counter()`
+  (+ `EngineState`, both `confirmed=True` in `SIGNAL_IDS`, both in
+  `is_signal_frame`); `state.VehicleState.engine_running` /
+  `engine_counter_advancing()` (tri-state -- "not watched long enough yet"
+  never reads as "off"); `reconciler.charge_sustaining_block()`, used by both
+  `Reconciler.desired_mode` and `SafetyGate._precondition_failure`;
+  `voltdmf-ctl status` prints the engine read and any `NOT ACTING:` reason;
+  the LCD SOC row gains an `ICE` / `NO HOLD` tag.
 
 ## Ignition behavior (from `ignition_check.py`)  (NOT CONFIRMED)
 

@@ -5,6 +5,8 @@ Responsibilities (DESIGN.md "Safety model"):
 
 * preconditions -- only inject in a state where switching makes sense
 * rate limiting -- one burst per cooldown, never a sustained/looping TX
+* giving up -- :class:`AttemptBudget` stops a level-triggered reconciler from
+  re-walking a menu that will not take the mode, for the whole drive
 * fail-passive -- any error stops transmitting and returns cleanly; the
   caller's loop keeps reading the bus but we do not retry mid-burst
 """
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .modecycle import ModeCycleController
+from .reconciler import charge_sustaining_block
 from .signals import DriveMode
 from .state import VehicleState
 
@@ -34,6 +37,18 @@ MODE_SWITCH_COOLDOWN_S = 10.0
 
 #: Above this the speed signal is almost certainly garbage -> don't act on it.
 MAX_PLAUSIBLE_SPEED_MPH = 100.0
+
+#: How many walks the reconciler will spend on one target before it gives up
+#: on that target for the rest of the key cycle (:class:`AttemptBudget`).
+#:
+#: Three, because a walk is already a closed loop that tries hard by itself:
+#: it taps up to ``MAX_WALK_TAPS`` (12) times, reading the cursor back after
+#: each, so it recovers dropped taps and coalesced steps *within* one attempt.
+#: A whole walk failing therefore does not mean "a tap went missing" -- it
+#: means the menu is not doing what the model says, and a fourth identical
+#: walk is not new information. Three costs at most ~1 minute of tapping in
+#: the worst case, and in the measured clean case never fires at all.
+MAX_TARGET_ATTEMPTS = 3
 
 # Shift position is deliberately NOT a precondition. The thing being pressed
 # is the centre-stack energy-mode menu (Normal/Sport/Mountain/Hold), not a
@@ -61,6 +76,89 @@ class RequestOutcome:
     reason: str
 
 
+class AttemptBudget:
+    """Give up on a target the car refuses to take.
+
+    The gap this closes, from the 2026-09-04 drive: the reconciler is
+    level-triggered, so "mode != target" stays true forever if the walk never
+    lands, and the only thing between it and a permanent 10 s tap cycle was
+    the cooldown. :func:`voltdmf.reconciler.charge_sustaining_block` handles
+    the one failure we understand (a spent pack takes HOLD off the menu);
+    this handles every other one, without needing to know what it is.
+
+    One target and one count, because the reconciler only ever pursues one
+    mode at a time -- asking for a different mode is new intent and starts
+    the count over. An attempt is *a walk that put taps on the wire*, not a
+    loop pass: a walk suppressed by the cooldown, by a precondition, or by
+    the ICE block costs nothing and is not counted, so a car sitting with a
+    quiet bus does not burn the budget.
+
+    Nothing here is persisted and nothing expires on a timer. It clears when
+    the car reaches the target (however it got there -- the driver's own
+    button counts), when the target changes, and on the explicit-intent
+    events the daemon routes through :meth:`reset`: a SW1 tap, a
+    ``set-mode``, an ``arm``, a ``reload``, and the bus going quiet, which is
+    this project's key-cycle boundary.
+    """
+
+    def __init__(self, max_attempts: int = MAX_TARGET_ATTEMPTS) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self._max = max_attempts
+        self._target: DriveMode | None = None
+        self._attempts = 0
+
+    @property
+    def target(self) -> DriveMode | None:
+        """The mode the current count is about, or ``None`` if idle."""
+        return self._target
+
+    @property
+    def attempts(self) -> int:
+        return self._attempts
+
+    @property
+    def max_attempts(self) -> int:
+        return self._max
+
+    def exhausted(self, target: DriveMode) -> bool:
+        """Has ``target`` used up the budget?"""
+        return target is self._target and self._attempts >= self._max
+
+    def give_up_reason(self, target: DriveMode) -> str | None:
+        """Human-readable "why not", or ``None`` to keep trying."""
+        if not self.exhausted(target):
+            return None
+        return (f"{target.value.upper()} unreachable -- gave up after "
+                f"{self._attempts} attempts (tap SW1 or run set-mode to retry)")
+
+    def record_attempt(self, target: DriveMode) -> int:
+        """Count one walk that went on the wire. Returns the new count."""
+        if target is not self._target:
+            self._target = target
+            self._attempts = 0
+        self._attempts += 1
+        return self._attempts
+
+    def note_reached(self, target: DriveMode) -> None:
+        """The car is now in ``target`` -- whatever we were counting is done."""
+        if target is self._target:
+            self.reset()
+
+    def reset(self) -> None:
+        self._target = None
+        self._attempts = 0
+
+    def snapshot(self) -> dict:
+        return {
+            "target": self._target.value if self._target else None,
+            "attempts": self._attempts,
+            "max_attempts": self._max,
+            "gave_up": (self._target is not None
+                        and self.exhausted(self._target)),
+        }
+
+
 class SafetyGate:
     def __init__(
         self,
@@ -74,18 +172,26 @@ class SafetyGate:
         self._monotonic = monotonic
         self._last_switch: float | None = None
 
-    def _precondition_failure(self, state: VehicleState) -> str | None:
-        """Why a switch must not go out now, or ``None`` to allow it.
+    def _precondition_failure(
+        self, target: DriveMode, state: VehicleState
+    ) -> str | None:
+        """Why a switch to ``target`` must not go out now, or ``None``.
 
-        Two checks, and both are about the *bus* rather than the driveline:
-        a quiet bus means nobody is listening, and an implausible speed means
-        the frames we are reading are garbage. See the note on shift above.
+        Two checks about the *bus* rather than the driveline -- a quiet bus
+        means nobody is listening, and an implausible speed means the frames
+        we are reading are garbage (see the note on shift above) -- plus one
+        about the target: a mode the car has taken off the menu cannot be
+        walked to, so trying only spends taps.
+
+        That last one lives here rather than only in the reconciler so that a
+        hand-typed ``voltdmf-ctl set-mode hold`` gets the same answer, and
+        gets it as a sentence instead of as twelve taps and a timeout.
         """
         if not state.bus_active:
             return "bus is quiet (car off?)"
         if state.speed_mph is not None and state.speed_mph > MAX_PLAUSIBLE_SPEED_MPH:
             return f"implausible speed {state.speed_mph:.0f} mph"
-        return None
+        return charge_sustaining_block(state, target)
 
     def _in_cooldown(self) -> bool:
         return self.cooldown_remaining() > 0.0
@@ -110,7 +216,7 @@ class SafetyGate:
         ``target`` (passed through to :meth:`ModeCycleController.switch_to`).
         Preconditions, the cooldown, and the press cap are *not* bypassable.
         """
-        reason = self._precondition_failure(state)
+        reason = self._precondition_failure(target, state)
         if reason is not None:
             log.info("mode switch to %s blocked: %s", target.value, reason)
             return RequestOutcome(False, 0, True, f"blocked: {reason}")

@@ -12,7 +12,7 @@ from voltdmf.config import parse_config
 from voltdmf.daemon import SELECTOR_FLASH_S, Daemon
 from voltdmf.safety import RequestOutcome
 from voltdmf.reconciler import Position
-from voltdmf.signals import DriveMode, ShiftPosition
+from voltdmf.signals import DriveMode, EngineState, ShiftPosition
 from voltdmf.state import VehicleState
 
 
@@ -39,11 +39,18 @@ class _FakeGate:
 
     def request_verbose(self, target, state, *, force=False):
         self.calls.append((target, force))
+        if not state.bus_active:
+            # What the real gate does with the ignition off. Worth honouring
+            # here: "no taps went out" is what the retry budget counts on.
+            return RequestOutcome(False, 0, True, "blocked: bus is quiet (car off?)")
+        # Both entry points feed request_calls: _reconcile switched to
+        # request_verbose when the retry budget needed the tap count, and a
+        # test asking "did it walk?" should not care which one it used.
+        self.request_calls.append(target)
         return self.outcome
 
     def request(self, target, state):
-        self.request_calls.append(target)
-        return self.outcome.sent
+        return self.request_verbose(target, state).sent
 
     def cooldown_remaining(self):
         return 0.0
@@ -663,6 +670,77 @@ def test_reload_bad_config_reports_error(tmp_path):
     assert "reload failed" in reply["error"]
 
 
+# --- charge-sustaining block ------------------------------------------
+#
+# The 2026-09-05 drive: restart on a written-off pack and the car comes up
+# with the engine running in NORMAL and no HOLD on the menu. Without this the
+# daemon walked, failed, and walked again every 10 s cooldown all drive.
+
+def _spent_state(**kw):
+    kw.setdefault("drive_mode", DriveMode.NORMAL)
+    kw.setdefault("shift", ShiftPosition.DRIVE)
+    kw.setdefault("engine_state", EngineState.RUNNING)
+    return _active_state(**kw)
+
+
+def test_reconcile_does_not_tap_when_the_menu_has_no_hold():
+    d = _daemon(position="hold-now")
+    d._state = _spent_state(soc_percent=21.0)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._reconcile()
+    assert d._gate.request_calls == []
+    assert d._last_action.endswith("ICE no-hold")
+    assert d._status_snapshot()["ice_block"] is not None
+
+
+def test_reconcile_resumes_once_the_engine_stops():
+    d = _daemon(position="hold-now")
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._state = _spent_state(soc_percent=21.0)
+    d._reconcile()
+    assert d._gate.request_calls == []
+    d._state = _spent_state(soc_percent=21.0, engine_state=EngineState.OFF)
+    d._reconcile()
+    assert d._gate.request_calls == [DriveMode.HOLD]
+    assert d._status_snapshot()["ice_block"] is None
+
+
+def test_the_block_is_logged_on_the_edges_not_every_pass(caplog):
+    """A 1 Hz reconcile loop with a stuck block would otherwise fill the
+    journal for the rest of the drive."""
+    d = _daemon(position="hold-now")
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    d._state = _spent_state(soc_percent=21.0)
+    with caplog.at_level("INFO", logger="voltdmf.daemon"):
+        for _ in range(5):
+            d._reconcile()
+        assert sum("holding off" in r.message for r in caplog.records) == 1
+        d._state = _spent_state(soc_percent=21.0, engine_state=EngineState.OFF)
+        d._reconcile()
+        assert sum("block cleared" in r.message for r in caplog.records) == 1
+
+
+def test_the_lcd_selector_carries_the_block():
+    d = _daemon(position="hold-now")
+    d._state = _spent_state(soc_percent=21.0)
+    d._gate = _FakeGate(RequestOutcome(True, 1, False, "ok"))
+    assert d._lcd_selector()["ice_blocked"] is False
+    d._reconcile()
+    assert d._lcd_selector()["ice_blocked"] is True
+
+
+def test_status_snapshot_reports_the_engine_read():
+    d = _daemon()
+    d._state = _spent_state(soc_percent=21.0)
+    d._state.note_engine_run_counter(0x0102)
+    d._gate = _FakeGate(RequestOutcome(False, 0, False, ""))
+    snap = d._status_snapshot()
+    json.dumps(snap)  # EngineState is a str enum -- must stay serialisable
+    assert snap["engine_state"] == "running"
+    assert snap["engine_running"] is True
+    assert snap["engine_run_counter"] == 0x0102
+
+
 # --- status snapshot -------------------------------------------------
 def test_status_snapshot_is_json_serialisable():
     d = _daemon()
@@ -741,3 +819,117 @@ def test_lcd_selector_reports_the_position_and_floor():
     assert snap["index"] == 2
     assert snap["cycle_len"] == 4
     assert snap["floor_latched"] is False
+
+
+# --- retry backoff: give up on a target the car will not take ----------
+#
+# The level-triggered reconciler has no memory of its own: "mode != target"
+# stays true forever if the walk never lands, so before this the only thing
+# between it and a whole drive of 10 s tap bursts was the cooldown. The ICE
+# block covers the one failure we understand; this covers the rest.
+
+def _walking(position="mountain", *, presses=1, sent=True):
+    """A daemon whose selector wants MOUNTAIN and whose car reads NORMAL, with
+    a gate that reports ``presses`` taps on the wire every time."""
+    d = _daemon(position=position)
+    d._state = _active_state(shift=ShiftPosition.DRIVE,
+                             drive_mode=DriveMode.NORMAL)
+    d._gate = _FakeGate(RequestOutcome(sent, presses, not sent, "walked"))
+    return d
+
+
+def _passes(d, n):
+    for _ in range(n):
+        d._walk_settle_until = 0.0   # skip the post-walk settle
+        d._reconcile()
+
+
+def test_it_stops_walking_after_the_attempt_budget_is_spent():
+    d = _walking()
+    _passes(d, 6)
+    assert d._gate.request_calls == [DriveMode.MOUNTAIN] * 3
+    assert d._status_snapshot()["give_up"] is not None
+
+
+def test_a_walk_that_failed_mid_menu_still_burns_an_attempt():
+    """sent=False but taps went out -- the case the closed loop raises on."""
+    d = _walking(presses=12, sent=False)
+    _passes(d, 6)
+    assert len(d._gate.request_calls) == 3
+
+
+def test_a_walk_the_gate_never_dispatched_costs_nothing():
+    """Cooldown / precondition blocks report 0 presses: not an attempt."""
+    d = _walking(presses=0, sent=False)
+    _passes(d, 6)
+    assert len(d._gate.request_calls) == 6
+    assert d._status_snapshot()["give_up"] is None
+
+
+def test_the_count_clears_when_the_car_reaches_the_mode():
+    d = _walking()
+    _passes(d, 2)
+    d._state.drive_mode = DriveMode.MOUNTAIN     # the commit landed
+    _passes(d, 1)
+    assert d._attempts.attempts == 0
+    d._state.drive_mode = DriveMode.NORMAL       # driver bumped it back out
+    _passes(d, 3)
+    assert len(d._gate.request_calls) == 5       # 2 + a fresh budget of 3
+
+
+def test_giving_up_is_logged_once_not_every_pass(caplog):
+    d = _walking()
+    with caplog.at_level("INFO", logger="voltdmf.daemon"):
+        _passes(d, 8)
+    assert sum("giving up:" in r.message for r in caplog.records) == 1
+
+
+def test_a_sw1_tap_is_the_drivers_way_out():
+    d = _walking()
+    _passes(d, 5)
+    d._handle_command("setpoint", {"mode": "mountain"})   # same detent, retap
+    _passes(d, 1)
+    assert len(d._gate.request_calls) == 4
+    assert d._status_snapshot()["give_up"] is None
+
+
+def test_set_mode_by_hand_unsticks_a_given_up_target():
+    d = _walking()
+    _passes(d, 5)
+    d._handle_command("set-mode", {"mode": "mountain"})
+    assert d._attempts.target is None
+    _passes(d, 1)
+    assert len(d._gate.request_calls) == 5   # the manual one, then a fresh walk
+
+
+def test_arming_hands_the_budget_back():
+    d = _walking()
+    _passes(d, 5)
+    d._handle_command("arm", {})
+    _passes(d, 1)
+    assert len(d._gate.request_calls) == 4
+
+
+def test_the_bus_going_quiet_ends_the_key_cycle():
+    d = _walking()
+    _passes(d, 5)
+    d._state.last_signal_monotonic = time.monotonic() - 60.0  # ignition off
+    _passes(d, 1)
+    d._state.mark_signal_seen()                               # and back on
+    _passes(d, 1)
+    assert len(d._gate.request_calls) == 4
+
+
+def test_the_selector_dict_carries_the_give_up_for_the_lcd():
+    d = _walking()
+    assert d._lcd_selector()["gave_up"] is False
+    _passes(d, 5)
+    assert d._lcd_selector()["gave_up"] is True
+
+
+def test_the_attempt_count_is_json_serialisable():
+    d = _walking()
+    _passes(d, 2)
+    snap = json.loads(json.dumps(d._status_snapshot()))
+    assert snap["attempts"] == {"target": "mountain", "attempts": 2,
+                                "max_attempts": 3, "gave_up": False}

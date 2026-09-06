@@ -93,6 +93,65 @@ LEGACY_POSITION_NAMES: dict[str, Position] = {
 #: gives the poll at startup before it will latch off the coarse proxy.
 DEFAULT_POLL_STALE_S = 45.0
 
+#: Modes the centre-stack menu stops offering once the car has run itself
+#: into charge-sustaining. NORMAL is what it drops *to*, and SPORT stays
+#: selectable, so only these two can be blocked.
+_CHARGE_SUSTAINING_BLOCKS: frozenset[DriveMode] = frozenset(
+    (DriveMode.HOLD, DriveMode.MOUNTAIN))
+
+#: Diag SOC above which a running engine is taken to be running for some
+#: reason *other* than an empty pack -- cabin heat (ERDTT) in the cold, an
+#: engine-maintenance cycle, or simply our own HOLD doing its job. In all of
+#: those the menu still offers HOLD, so the block must not apply.
+#:
+#: Session-9 fit: gauge bars ~= (SOC - 19.6) / 7.07, so 0 bars is ~19.6 % and
+#: 1 bar ~26.7 %. 24 % sits between them -- comfortably under the 30 % floor
+#: (2 bars) the reconciler works at, and comfortably over the point the car
+#: actually gives up on the pack.
+DEPLETED_PERCENT = 24.0
+
+
+def charge_sustaining_block(
+    state: VehicleState, target: DriveMode, *,
+    poll_stale_s: float = DEFAULT_POLL_STALE_S,
+) -> str | None:
+    """Why ``target`` cannot be selected right now, or ``None`` to go ahead.
+
+    The case this exists for, seen on the 2026-09-05 drive: park a car whose
+    pack is nearly flat, restart it, and it comes up with the engine running
+    in NORMAL, having decided the pack is done for this key cycle. The
+    drive-mode menu then does not offer HOLD at all, so walking to it cannot
+    work -- every attempt just spends taps and hits the cooldown again 10 s
+    later, for the rest of the drive.
+
+    The rule is "engine turning + car in NORMAL => HOLD and MOUNTAIN are not
+    on the menu", with one release: a *fresh* SOC reading comfortably above
+    :data:`DEPLETED_PERCENT` means the engine is running for some other
+    reason and the menu is still complete.
+
+    Deliberately fail-open on ignorance. An engine reading of ``None`` (no
+    0x4C5 / 0x3F9 frame decoded on this car) allows the walk, so a vehicle
+    where these two signals do not exist behaves exactly as it did before
+    they were discovered. Deliberately fail-*closed* on a missing SOC: with
+    the engine confirmed running and no idea how full the pack is, not
+    tapping is the cheap mistake.
+    """
+    if target not in _CHARGE_SUSTAINING_BLOCKS:
+        return None
+    if state.drive_mode is not DriveMode.NORMAL:
+        return None
+    if not state.engine_running:      # False or None -- no evidence, no block
+        return None
+    if (state.soc_percent is not None
+            and state.soc_percent_fresh(poll_stale_s)
+            and state.soc_percent > DEPLETED_PERCENT):
+        return None
+    soc = ("unknown SOC" if state.soc_percent is None
+           else f"SOC {state.soc_percent:.0f}%")
+    return (f"engine running in NORMAL ({soc}) -- the pack is spent and "
+            f"{target.value.upper()} is not on the menu")
+
+
 #: What each position asks for above the floor. ``None`` == "leave the car
 #: alone"; ``OFF`` is absent because it short-circuits before this is read.
 _POSITION_TARGET: dict[Position, DriveMode | None] = {
@@ -138,6 +197,10 @@ class Reconciler:
         self._position: Position = default_position
         self._floor_latched = False
         self._floor_source: str | None = None  # "poll" | "bar" while latched
+        #: Why the last desired_mode() pass declined to ask for a mode it
+        #: otherwise wanted, or None. Set by charge_sustaining_block; read by
+        #: the daemon for the log line, the status snapshot and the LCD.
+        self._ice_block: str | None = None
 
     # -- selector position ---------------------------------------------------
     @property
@@ -168,6 +231,15 @@ class Reconciler:
     @property
     def floor_latched(self) -> bool:
         return self._floor_latched
+
+    @property
+    def ice_block(self) -> str | None:
+        """Why the last pass withheld its target, or ``None``.
+
+        Not latched -- it is recomputed from live state every pass and clears
+        by itself the moment the engine stops or the car leaves NORMAL.
+        """
+        return self._ice_block
 
     @property
     def poll_stale_s(self) -> float:
@@ -212,13 +284,27 @@ class Reconciler:
         plugged in". Otherwise the floor wins when latched, then the position's
         own target, else ``None`` ("leave the car alone"). The daemon acts on
         a concrete result when armed and ignores ``None``.
+
+        A target the car cannot currently offer is withheld as ``None`` too,
+        with the reason left in :attr:`ice_block` -- see
+        :func:`charge_sustaining_block`.
         """
         if self._position is Position.OFF:
+            self._ice_block = None
             return None
         self._update_floor(state)
-        if self._floor_latched:
-            return DriveMode.HOLD
-        return _POSITION_TARGET[self._position]
+        target = (DriveMode.HOLD if self._floor_latched
+                  else _POSITION_TARGET[self._position])
+        if target is None:
+            self._ice_block = None
+            return None
+        # The floor gets no exemption here. A latched floor asking for HOLD on
+        # a pack the car has already written off is exactly the drive that
+        # produced this check: the target is right, and the menu still will
+        # not take it.
+        self._ice_block = charge_sustaining_block(
+            state, target, poll_stale_s=self._poll_stale_s)
+        return None if self._ice_block else target
 
     def _update_floor(self, state: VehicleState) -> None:
         # Latched is latched: the floor holds for the rest of the key cycle.
@@ -257,6 +343,7 @@ class Reconciler:
             "cycle": [p.value for p in CYCLE],
             "floor_latched": self._floor_latched,
             "floor_source": self._floor_source,
+            "ice_block": self._ice_block,
             "hold_threshold_percent": self._hold_threshold,
             "bar_failsafe_raw": self._bar_failsafe,
         }

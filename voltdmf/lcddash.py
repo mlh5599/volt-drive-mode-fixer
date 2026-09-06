@@ -23,6 +23,10 @@ Row 2  committed drive mode (0x1F4 byte 1, labelled DM) + PRNDL gear
 Row 3  diag SOC % from the 22 005B poll -- the one number the instrument
        cluster never shows. A trailing ``~`` marks a % that is not a live
        poll reading (poll gone stale, or the coarse bar failsafe took over).
+       Right-aligned after it: ``ICE`` while the range-extender is running,
+       or ``NO HOLD`` when it is running on a spent pack, which is the state
+       in which the car stops offering HOLD and the daemon stops asking --
+       or ``GAVE UP`` when a walk was tried and the mode would not take.
 
 Everything here is fail-soft: the thread never raises into the daemon, a
 missing / unusable serial port just means the screen stays dark, and a
@@ -103,9 +107,32 @@ def _soc_label(state: VehicleState) -> str:
     return f"{state.soc_percent:.1f}%"
 
 
+def _status_tag(state: VehicleState, ice_blocked: bool,
+                gave_up: bool = False) -> str:
+    """Right-hand tag for the SOC row: why the device is or is not acting.
+
+    Most specific first, because only one fits in the row:
+
+    * ``NO HOLD`` -- the engine is running on a spent pack, so the car is not
+      offering HOLD and the device is deliberately not reaching for it. The
+      one the driver actually needs.
+    * ``GAVE UP`` -- the walk was tried and did not take (see
+      :class:`voltdmf.safety.AttemptBudget`); the device has stopped asking
+      until the driver taps SW1 or the car reaches the mode by itself.
+    * ``ICE`` -- the benign case: engine on, HOLD still on the menu (or
+      already engaged).
+    """
+    if ice_blocked:
+        return "NO HOLD"
+    if gave_up:
+        return "GAVE UP"
+    return "ICE" if state.engine_running else ""
+
+
 def render_screen(state: VehicleState, *, bus_label: str, position_label: str,
                   position_index: int, cycle_len: int, floor_latched: bool,
-                  soc_fresh: bool, flashing: bool = False) -> list[str]:
+                  soc_fresh: bool, ice_blocked: bool = False,
+                  gave_up: bool = False, flashing: bool = False) -> list[str]:
     """Compose the four watch-screen rows. Pure -- easy to unit-test.
 
     ``bus_label`` is a resolved string, not the :func:`bus_label` function --
@@ -126,18 +153,23 @@ def render_screen(state: VehicleState, *, bus_label: str, position_label: str,
         if floor_latched:
             sel += " FLR"
     stale_mark = "" if (state.soc_percent is None or soc_fresh) else "~"
+    soc_row = f"SOC {_soc_label(state):>6}{stale_mark}"
+    tag = _status_tag(state, ice_blocked, gave_up)
+    if tag:
+        soc_row = f"{soc_row}{tag:>{20 - len(soc_row)}}"
     rows = [
         bus_label,
         sel,
         f"gear {gear}  DM {mode}",
-        f"SOC {_soc_label(state):>6}{stale_mark}",
+        soc_row,
     ]
     return [r[:20] for r in rows]
 
 
 def _default_selector() -> dict:
     return {"label": "--", "index": 0, "floor_latched": False,
-            "soc_fresh": False, "flashing": False}
+            "soc_fresh": False, "ice_blocked": False, "gave_up": False,
+            "flashing": False}
 
 
 class LcdDashboard:
@@ -244,6 +276,8 @@ class LcdDashboard:
             cycle_len=sel.get("cycle_len", 4),
             floor_latched=sel["floor_latched"],
             soc_fresh=sel.get("soc_fresh", False),
+            ice_blocked=sel.get("ice_blocked", False),
+            gave_up=sel.get("gave_up", False),
             flashing=sel.get("flashing", False),
         )
         for i, text in enumerate(rows):

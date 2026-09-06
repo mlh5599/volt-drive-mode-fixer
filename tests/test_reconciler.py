@@ -2,10 +2,11 @@ import time
 
 import pytest
 
-from voltdmf.reconciler import (CYCLE, Position, Reconciler, build_reconciler,
+from voltdmf.reconciler import (CYCLE, DEPLETED_PERCENT, Position, Reconciler,
+                                build_reconciler, charge_sustaining_block,
                                 resolve_position)
 from voltdmf.config import parse_config
-from voltdmf.signals import DriveMode
+from voltdmf.signals import DriveMode, EngineState
 from voltdmf.state import VehicleState
 
 #: Older than the reconciler's poll_stale_s, so the b3 failsafe is live.
@@ -331,3 +332,119 @@ def test_poll_stale_s_exposes_the_configured_threshold():
     the same number the floor logic itself uses, not a second guess at it."""
     assert _rec(poll_stale_s=45.0).poll_stale_s == 45.0
     assert _rec(poll_stale_s=12.0).poll_stale_s == 12.0
+
+
+# -- charge-sustaining block ---------------------------------------------
+#
+# The 2026-09-05 drive: a nearly-flat pack, parked, restarted -- the car came
+# up with the engine running in NORMAL and no HOLD on the menu at all, so the
+# reconciler walked, failed, and walked again every cooldown for the rest of
+# the drive.
+
+def _spent(*, mode=DriveMode.NORMAL, engine=EngineState.RUNNING, pct=None,
+           pct_age_s=0.0) -> VehicleState:
+    """A car in the failure state, with each ingredient overridable."""
+    st = _state(pct=pct, pct_age_s=pct_age_s)
+    st.drive_mode = mode
+    st.engine_state = engine
+    return st
+
+
+@pytest.mark.parametrize("target", [DriveMode.HOLD, DriveMode.MOUNTAIN])
+def test_block_names_the_target_the_menu_will_not_offer(target):
+    reason = charge_sustaining_block(_spent(pct=21.0), target)
+    assert reason is not None
+    assert target.value.upper() in reason
+    assert "21%" in reason
+
+
+@pytest.mark.parametrize("target", [DriveMode.NORMAL, DriveMode.SPORT])
+def test_only_hold_and_mountain_can_be_blocked(target):
+    # NORMAL is what the car drops *to*, and SPORT stays selectable.
+    assert charge_sustaining_block(_spent(pct=21.0), target) is None
+
+
+def test_no_block_once_the_car_is_out_of_normal():
+    """If the car reads HOLD, the menu took it -- engine or no engine. This
+    is the ordinary case of HOLD working: it runs the engine on purpose."""
+    st = _spent(mode=DriveMode.HOLD, pct=21.0)
+    assert charge_sustaining_block(st, DriveMode.HOLD) is None
+
+
+def test_no_block_with_the_engine_off():
+    st = _spent(engine=EngineState.OFF, pct=21.0)
+    assert st.engine_running is False
+    assert charge_sustaining_block(st, DriveMode.HOLD) is None
+
+
+def test_fails_open_when_the_engine_is_unknown():
+    """A car that never puts 0x4C5 or 0x3F9 on the wire must behave exactly
+    as it did before these signals were found."""
+    st = _spent(engine=EngineState.UNKNOWN, pct=21.0)
+    assert st.engine_running is None
+    assert charge_sustaining_block(st, DriveMode.HOLD) is None
+
+
+def test_a_healthy_pack_releases_the_block():
+    """Engine running at 60 % is ERDTT cabin heat or a maintenance cycle --
+    the pack is not spent, so HOLD is still on the menu."""
+    assert charge_sustaining_block(_spent(pct=60.0), DriveMode.HOLD) is None
+
+
+def test_the_release_needs_a_fresh_reading():
+    """A healthy number from before the car was parked proves nothing about
+    the pack now."""
+    st = _spent(pct=60.0, pct_age_s=600.0)
+    assert charge_sustaining_block(st, DriveMode.HOLD, poll_stale_s=45.0)
+
+
+def test_fails_closed_when_soc_is_unknown():
+    """Engine confirmed running and no idea how full the pack is: not
+    tapping is the cheap mistake."""
+    reason = charge_sustaining_block(_spent(pct=None), DriveMode.HOLD)
+    assert reason is not None and "unknown SOC" in reason
+
+
+def test_a_spent_pack_just_under_the_line_still_blocks():
+    assert charge_sustaining_block(_spent(pct=DEPLETED_PERCENT), DriveMode.HOLD)
+    assert charge_sustaining_block(
+        _spent(pct=DEPLETED_PERCENT + 0.1), DriveMode.HOLD) is None
+
+
+# -- the block as the reconciler applies it ------------------------------
+
+def test_desired_mode_withholds_a_blocked_target():
+    rec = _rec(default_position=Position.HOLD_NOW)
+    st = _spent(pct=21.0)
+    assert rec.desired_mode(st) is None
+    assert rec.ice_block is not None
+    assert rec.snapshot()["ice_block"] == rec.ice_block
+
+
+def test_the_soc_floor_gets_no_exemption():
+    """A latched floor asking for HOLD on a pack the car has already written
+    off is exactly the drive that produced this check."""
+    rec = _rec(default_position=Position.HOLD_SOC)
+    st = _spent(pct=21.0)
+    assert rec.desired_mode(st) is None
+    assert rec.floor_latched is True     # the floor did latch...
+    assert rec.ice_block is not None     # ...and still could not be enforced
+
+
+def test_the_block_is_level_triggered_not_latched():
+    """Nothing about it persists: the pass after the engine stops enforces
+    again, with no reset needed."""
+    rec = _rec(default_position=Position.HOLD_NOW)
+    assert rec.desired_mode(_spent(pct=21.0)) is None
+    assert rec.ice_block is not None
+    healthy = _spent(engine=EngineState.OFF, pct=21.0)
+    assert rec.desired_mode(healthy) is DriveMode.HOLD
+    assert rec.ice_block is None
+
+
+def test_off_clears_the_block_without_evaluating_it():
+    rec = _rec(default_position=Position.HOLD_NOW)
+    rec.desired_mode(_spent(pct=21.0))
+    rec.set_position(Position.OFF)
+    assert rec.desired_mode(_spent(pct=21.0)) is None
+    assert rec.ice_block is None

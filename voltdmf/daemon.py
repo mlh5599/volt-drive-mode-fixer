@@ -32,7 +32,7 @@ from .config import Config, ConfigError, load_config
 from .lcddash import LcdDashboard
 from .modecycle import ModeCycleController
 from .reconciler import CYCLE, Position, Reconciler, build_reconciler
-from .safety import SafetyGate
+from .safety import AttemptBudget, SafetyGate
 from .signals import UDS_SOC_REQ_IDS, DriveMode
 from .state import VehicleState
 
@@ -224,6 +224,20 @@ class Daemon:
         # walk -- see WALK_SETTLE_S.
         self._walk_settle_until = 0.0
 
+        # Last charge-sustaining block reported by the reconciler. Only used to
+        # log the edges: the block is recomputed every pass and would otherwise
+        # put an identical line in the journal at LOOP_PERIOD_S for the rest of
+        # the drive.
+        self._ice_block_logged: str | None = None
+
+        # Retry budget: how many walks this key cycle has spent on the mode it
+        # is currently chasing. Owned here rather than by the gate because the
+        # thing it needs -- "did the car actually end up in that mode?" -- is
+        # only visible a walk-settle later, back in _reconcile. Same
+        # edge-logging treatment as the ICE block, for the same reason.
+        self._attempts = AttemptBudget()
+        self._give_up_logged: str | None = None
+
         self._cmd_queue: "queue.Queue[control.Command]" = queue.Queue()
 
     def request_stop(self) -> None:
@@ -408,11 +422,31 @@ class Daemon:
         # healthy pack lands here until the first 0x1F4 frame decodes.)
         if state.drive_mode is None:
             return
+        # Bus gone quiet = ignition off = a new key cycle next time it speaks.
+        # Hand the retry budget back, the way a restart would.
+        if not state.bus_active:
+            self._attempts.reset()
+
         desired = self._reconciler.desired_mode(state)
+        self._note_ice_block(self._reconciler.ice_block)
         # desired is None => the selector is on `hold-soc` with the floor
-        # still clear, or on `off`: enforce nothing, leave the car alone.
-        if desired is None or desired == state.drive_mode:
+        # still clear, on `off`, or the car has taken the target off the menu
+        # (_note_ice_block above has the reason): enforce nothing.
+        if desired is None:
             return
+        if desired == state.drive_mode:
+            # Where we wanted to be. However it got here -- our last walk
+            # committing, or the driver's own thumb -- the walks spent
+            # chasing it are done being counted.
+            self._attempts.note_reached(desired)
+            self._note_give_up(None)
+            return
+
+        gave_up = self._attempts.give_up_reason(desired)
+        if gave_up is not None:
+            self._note_give_up(gave_up)
+            return
+        self._note_give_up(None)
 
         floor = "floor" if self._reconciler.floor_latched else "set"
         self._manual_target = None  # the reconciler owns the mode
@@ -421,12 +455,71 @@ class Daemon:
             self._last_action = (
                 f"{self._action_prefix()}{floor}->{desired.value.upper()}")
             log.info("reconcile: %s -> %s (%s)", actual, desired.value, floor)
-            if self._gate.request(desired, state):
+            outcome = self._gate.request_verbose(desired, state)
+            if outcome.presses:
+                # Taps went out. Whether the walk reported success or failed
+                # mid-menu, the car is not confirmed in `desired` until a
+                # later pass sees byte 1 agree -- so this counts either way,
+                # and note_reached() above is what forgives it.
+                self._note_attempt(desired)
+            if outcome.sent:
                 self._walk_settle_until = time.monotonic() + WALK_SETTLE_S
         else:
             self._last_action = f"DIS {floor}->{desired.value.upper()}"
             log.info("reconcile (disarmed): %s -> %s (%s) -- not acting",
                      actual, desired.value, floor)
+
+    def _reset_attempts(self, why: str) -> None:
+        """Hand the retry budget back on an explicit-intent event."""
+        if self._attempts.target is None and self._give_up_logged is None:
+            return
+        log.info("retry budget reset (%s)", why)
+        self._attempts.reset()
+        self._give_up_logged = None
+
+    def _note_attempt(self, target: DriveMode) -> None:
+        """Count a walk that went on the wire, and log the last one loudly."""
+        n = self._attempts.record_attempt(target)
+        if self._attempts.exhausted(target):
+            log.warning("attempt %d/%d toward %s; that was the last one",
+                        n, self._attempts.max_attempts, target.value)
+        else:
+            log.info("attempt %d/%d toward %s",
+                     n, self._attempts.max_attempts, target.value)
+
+    def _note_give_up(self, reason: str | None) -> None:
+        """Log a give-up when it starts and when it clears.
+
+        Edge-triggered for the same reason as :meth:`_note_ice_block`: the
+        condition is re-derived every pass and can stand for a whole drive,
+        so only the transitions are worth a journal line. The standing state
+        lives in ``last_action``, ``status`` and the LCD.
+        """
+        if reason == self._give_up_logged:
+            return
+        if reason is not None:
+            log.warning("giving up: %s", reason)
+            self._last_action = f"{self._action_prefix()}GAVE UP"
+        else:
+            log.info("retry budget clear; enforcing again")
+        self._give_up_logged = reason
+
+    def _note_ice_block(self, block: str | None) -> None:
+        """Log a charge-sustaining block when it starts and when it clears.
+
+        The block itself is level-triggered and costs nothing to re-evaluate,
+        but it can stand for a whole drive -- so only the edges go to the
+        journal, and ``last_action`` carries the standing state for anyone
+        looking at ``status`` or the LCD in between.
+        """
+        if block == self._ice_block_logged:
+            return
+        if block is not None:
+            log.warning("holding off: %s", block)
+            self._last_action = f"{self._action_prefix()}ICE no-hold"
+        else:
+            log.info("charge-sustaining block cleared; enforcing again")
+        self._ice_block_logged = block
 
     def _maybe_log_trip(self) -> None:
         now = time.monotonic()
@@ -448,12 +541,17 @@ class Daemon:
         b3 = "--" if st.soc_bar_raw is None else str(st.soc_bar_raw)
         floor = "latched" if self._reconciler.floor_latched else "off"
         mode = st.drive_mode.value if st.drive_mode else "?"
+        running = st.engine_running
+        ice = ("?" if running is None
+               else f"{st.engine_state.value}{'' if running else ' (idle)'}")
         log.info(
             "trip: soc=%s (%s @%s, age %s) b3=%s floor=%s setpoint=%s "
-            "mode=%s armed=%s replies=%d nrc=%d%s",
+            "mode=%s ice=%s armed=%s replies=%d nrc=%d%s%s%s",
             soc, raw, resp, age_s, b3, floor, self._reconciler.setpoint_label,
-            mode, self._armed, st.uds_replies, st.uds_nrcs,
+            mode, ice, self._armed, st.uds_replies, st.uds_nrcs,
             " TEST-MODE" if self._test_mode else "",
+            " NO-HOLD" if self._reconciler.ice_block else "",
+            " GAVE-UP" if self._give_up_logged else "",
         )
 
     def _wait_next(self) -> None:
@@ -481,6 +579,7 @@ class Daemon:
     def _handle_command(self, name: str, args: dict) -> dict:
         if name == "arm":
             self._armed = True
+            self._reset_attempts("armed")
             log.warning("ARMED via control socket -- transmission enabled")
             return {"ok": True, "armed": True}
         if name == "disarm":
@@ -513,6 +612,9 @@ class Daemon:
                     "error": "daemon disarmed; run `voltdmf-ctl arm` first",
                     "would_switch_to": mode.value}
         assert self._gate is not None and self._state is not None
+        # Someone is asking for this by hand: give the target a clean slate,
+        # so `set-mode hold` is also the way to un-stick a given-up target.
+        self._reset_attempts("set-mode")
         outcome = self._gate.request_verbose(mode, self._state, force=force)
         self._last_action = f"MANUAL {mode.value.upper()}"
         if outcome.sent:
@@ -549,6 +651,7 @@ class Daemon:
         if after is not before:
             self._selector_flash_until = time.monotonic() + SELECTOR_FLASH_S
         self._walk_settle_until = 0.0  # an explicit choice acts now
+        self._reset_attempts("selector moved")
         self._wake.set()  # reconcile on the next tick, not after the full sleep
         return {"ok": True, "setpoint": after.value,
                 "position": after.value, "previous": before.value,
@@ -568,6 +671,7 @@ class Daemon:
         # under someone's hand. The SOC-floor latch is in-memory state and is
         # dropped; the next pass re-derives it from a live reading.
         new_reconciler.set_position(self._reconciler.position)
+        self._reset_attempts("config reloaded")
         self._config = new_config
         self._reconciler = new_reconciler
         self._walk_settle_until = 0.0  # re-evaluate against the new policy now
@@ -838,6 +942,13 @@ class Daemon:
             "drive_mode": (st.drive_mode.value
                            if st is not None and st.drive_mode else None),
             "shift": st.shift.value if st is not None else None,
+            "engine_state": (st.engine_state.value if st is not None else None),
+            "engine_running": st.engine_running if st is not None else None,
+            "engine_run_counter": (st.engine_run_counter
+                                   if st is not None else None),
+            "ice_block": rec.ice_block,
+            "give_up": self._give_up_logged,
+            "attempts": self._attempts.snapshot(),
             "menu_cursor": (st.menu_cursor.value
                             if st is not None and st.menu_cursor else None),
             "soc_percent": (round(st.soc_percent, 1)
@@ -890,6 +1001,8 @@ class Daemon:
                 "cycle_len": len(CYCLE),
                 "floor_latched": self._reconciler.floor_latched,
                 "soc_fresh": fresh,
+                "ice_blocked": self._reconciler.ice_block is not None,
+                "gave_up": self._give_up_logged is not None,
                 "flashing": time.monotonic() < self._selector_flash_until}
 
     def _await_bus(self, state: VehicleState) -> None:

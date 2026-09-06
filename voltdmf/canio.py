@@ -402,6 +402,12 @@ class _DecodeListener(can.Listener):
                 self._state.speed_mph = mph
         elif addr == self._shift_addr:  # 0x1F5 byte 3 = PRNDL
             self._state.shift = signals.decode_shift(data)
+        elif addr == signals.ENGINE_STATE_ADDR:  # 0x4C5 b2 = engine run state
+            self._state.engine_state = signals.decode_engine_state(data)
+        elif addr == signals.ENGINE_RUN_COUNTER_ADDR:  # 0x3F9 b1-2 = run counter
+            counter = signals.decode_engine_run_counter(data)
+            if counter is not None:
+                self._state.note_engine_run_counter(counter)
         elif addr == self._status_addr:  # 0x1F4 byte 1 = committed drive mode
             mode = signals.decode_drive_mode(data)
             if mode is not None:

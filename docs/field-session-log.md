@@ -6,6 +6,79 @@ decoded-signal reference). Newest session first.
 
 ---
 
+## Session 12 — 2026-09-05 (offline — the engine is on the bus; the reconciler no longer taps a menu that is empty)
+
+No car time. The 2026-09-04 drive produced a real failure, in the owner's
+words:
+
+> SOC hold worked ok but after parking for a while then restarting, the
+> battery had drained enough that the car switched itself over to the gasoline
+> engine. When this happens the hold option isn't available and the drive mode
+> fixer tried, but wasn't able to set hold.
+
+Once the car writes the pack off for a key cycle it runs the engine and sits
+in NORMAL, and the centre stack stops offering HOLD/MOUNTAIN at all. The
+reconciler is level-triggered, so it walked, failed, and walked again every
+10 s cooldown for the rest of the drive.
+
+**The signal was already in the repo.** Rather than plan another drive, the
+three captures in `captures/` were mined: session 8 drove the pack to 0 bars
+and into forced charge-sustaining, session 9 has a driver-selected HOLD leg
+that held SOC flat at 32.9 % for 13 min at 70 mph, and the 4.7 min errand
+capture never started the engine at all — two labelled starts and a negative
+control, which is all a per-byte diff needs.
+
+- **`0x4C5` byte 2** — the only byte in the frame that ever changes. `0x49`
+  off, `0xDD` on an engine leg, `0x59`/`0x87`/`0xB5` a ~1.5 s ramp at *either*
+  edge (session 9 has the shutdown ramp, which is why they decode to
+  `TRANSITION`, not "starting").
+- **`0x3F9` bytes 1–2 BE** — a monotone accumulator, **0 steps** across ~50 min
+  of EV driving, 2 349 across session 9's engine leg. It tracks *fuelling*,
+  not rotation: it leads `0x4C5` by 33–42 s at the head of a leg and freezes
+  for 13–43 s mid-leg. One freeze lines up exactly with a 70 mph → stop → 35
+  mph decel on `0x3E9` — overrun fuel cut, then a standstill.
+- Read as a **union**, because each is blind where the other sees. Both of the
+  union's errors are in the safe direction, and the cost is a walk that waits.
+
+Session 8 caught the failure state itself on the wire: engine on at the 0-bar
+mark with `0x1F4` byte 1 still `0x00` (NORMAL). Session 9's leg ran at `0x08`
+(HOLD) throughout — same engine, complete menu, because HOLD was selected
+*before* the pack was written off. That difference is the gate:
+
+> engine running **and** car in NORMAL **and** no fresh SOC reading above 24 %
+> ⇒ HOLD and MOUNTAIN are not on the menu, so do not walk to them.
+
+The 24 % release is what keeps a cold-morning ERDTT start, an engine
+maintenance cycle, or our own working HOLD from blocking anything. The block
+is level-triggered and self-clearing, fails **open** on an unknown engine
+reading (a car without these frames behaves exactly as before) and **closed**
+on an unknown SOC. The SOC floor gets no exemption — a latched floor asking
+for HOLD on a written-off pack is precisely the drive that produced this.
+
+Shipped: `signals`/`state`/`reconciler`/`safety`/`daemon`/`lcddash`/`ctl`,
+plus `tools/engine_check.py` (replays any capture through the decoders) and
+[`analysis/session12-engine-signal.md`](analysis/session12-engine-signal.md).
+`voltdmf-ctl status` now prints the engine read and a `NOT ACTING:` line; the
+LCD SOC row carries `ICE` / `NO HOLD`.
+
+Then the belt-and-braces backstop for every *other* way a walk can fail:
+`safety.AttemptBudget` gives up on a target after **three** walks that put
+taps on the wire, and stays given up until the car reaches the mode, the
+target changes, or a person intervenes (SW1 tap, `set-mode`, `arm`, `reload`;
+the bus going quiet counts as the key-cycle boundary). A walk the gate never
+dispatched — cooldown, precondition, ICE block — is not an attempt, so a
+parked car never burns the budget. Surfaced as `give_up` / `attempts` in
+`status`, `GAVE UP` on the LCD SOC row, and one journal line per edge.
+Verified end-to-end against a controller whose taps all vanish: 36 taps (3 ×
+the 12-tap closed-loop walk) and then silence, where before it was 12 taps
+every 10 s for the rest of the drive.
+
+**Still open:** the 24 % release in the ICE gate is reasoned from the
+Session-9 gauge calibration, not observed — a cold ERDTT start on a full pack
+would exercise it.
+
+---
+
 ## Session 9 — 2026-08-31 (in-car — SOC anchor drive; `22 005B` poll confirmed as the SOC source, gauge↔SOC calibrated, HOLD verified charge-sustaining, Session-8 broadcast candidates falsified)
 
 The scaling-anchor drive. `soc_log.py --diag-soc` polled UDS `22 005B` every

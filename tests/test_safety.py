@@ -1,8 +1,9 @@
 import pytest
 
 from voltdmf.modecycle import ModeSwitchFailed
-from voltdmf.safety import MODE_SWITCH_COOLDOWN_S, SafetyGate
-from voltdmf.signals import DriveMode, ShiftPosition
+from voltdmf.safety import (AttemptBudget, MODE_SWITCH_COOLDOWN_S,
+                            SafetyGate)
+from voltdmf.signals import DriveMode, EngineState, ShiftPosition
 from voltdmf.state import VehicleState
 
 
@@ -159,3 +160,129 @@ def test_failed_walk_without_a_tap_count_still_reports_zero():
     outcome = gate.request_verbose(DriveMode.HOLD, _state(), force=True)
     assert outcome.presses == 0
     assert outcome.blocked is True
+
+
+# -- charge-sustaining block (shared with the reconciler) ----------------
+def _spent(**kw):
+    """Engine running, car in NORMAL, pack written off -- the 2026-09-05
+    drive. A hand-typed ``set-mode hold`` here has to get a sentence back,
+    not twelve taps and a timeout."""
+    kw.setdefault("drive_mode", DriveMode.NORMAL)
+    kw.setdefault("engine_state", EngineState.RUNNING)
+    return _state(**kw)
+
+
+def test_set_mode_hold_is_refused_with_a_reason_not_taps():
+    ctl = FakeController()
+    gate = SafetyGate(ctl)
+    out = gate.request_verbose(DriveMode.HOLD, _spent())
+    assert out.blocked is True
+    assert out.sent is False
+    assert ctl.calls == 0
+    assert out.reason.startswith("blocked: engine running in NORMAL")
+
+
+def test_force_does_not_bypass_the_charge_sustaining_block():
+    """force only means "walk even if the car already reads the target" --
+    it cannot conjure a menu entry the car is not offering."""
+    ctl = FakeController()
+    gate = SafetyGate(ctl)
+    assert gate.request_verbose(DriveMode.HOLD, _spent(), force=True).blocked
+    assert ctl.calls == 0
+
+
+def test_sport_is_still_allowed_with_the_engine_running():
+    ctl = FakeController()
+    gate = SafetyGate(ctl)
+    assert gate.request(DriveMode.SPORT, _spent()) is True
+    assert ctl.calls == 1
+
+
+def test_no_block_when_the_engine_is_not_running():
+    ctl = FakeController()
+    gate = SafetyGate(ctl)
+    assert gate.request(DriveMode.HOLD, _spent(engine_state=EngineState.OFF))
+    assert ctl.calls == 1
+
+
+# -- AttemptBudget: give up on a target the car will not take -------------
+def _budget(max_attempts=3):
+    return AttemptBudget(max_attempts=max_attempts)
+
+
+def test_a_fresh_budget_gives_up_on_nothing():
+    b = _budget()
+    assert b.exhausted(DriveMode.HOLD) is False
+    assert b.give_up_reason(DriveMode.HOLD) is None
+    assert b.target is None and b.attempts == 0
+
+
+def test_it_gives_up_only_after_the_last_attempt():
+    b = _budget()
+    for n in (1, 2):
+        assert b.record_attempt(DriveMode.HOLD) == n
+        assert b.exhausted(DriveMode.HOLD) is False
+    assert b.record_attempt(DriveMode.HOLD) == 3
+    assert b.exhausted(DriveMode.HOLD) is True
+
+
+def test_the_give_up_reason_names_the_mode_and_the_way_out():
+    b = _budget()
+    for _ in range(3):
+        b.record_attempt(DriveMode.MOUNTAIN)
+    reason = b.give_up_reason(DriveMode.MOUNTAIN)
+    assert "MOUNTAIN" in reason and "3 attempts" in reason
+    assert "SW1" in reason  # the driver-facing escape hatch
+
+
+def test_a_different_target_starts_its_own_count():
+    """New intent, new budget -- a spent HOLD budget must not blank MOUNTAIN."""
+    b = _budget()
+    for _ in range(3):
+        b.record_attempt(DriveMode.HOLD)
+    assert b.exhausted(DriveMode.MOUNTAIN) is False
+    assert b.record_attempt(DriveMode.MOUNTAIN) == 1
+    assert b.exhausted(DriveMode.HOLD) is False  # the count moved with it
+
+
+def test_reaching_the_target_clears_the_count():
+    b = _budget()
+    b.record_attempt(DriveMode.HOLD)
+    b.record_attempt(DriveMode.HOLD)
+    b.note_reached(DriveMode.HOLD)
+    assert b.attempts == 0 and b.target is None
+
+
+def test_reaching_some_other_mode_does_not_clear_the_count():
+    """The driver bumping the car into SPORT says nothing about our HOLD."""
+    b = _budget()
+    b.record_attempt(DriveMode.HOLD)
+    b.note_reached(DriveMode.SPORT)
+    assert b.attempts == 1 and b.target is DriveMode.HOLD
+
+
+def test_reset_hands_the_whole_budget_back():
+    b = _budget()
+    for _ in range(3):
+        b.record_attempt(DriveMode.HOLD)
+    b.reset()
+    assert b.exhausted(DriveMode.HOLD) is False
+    assert b.snapshot()["gave_up"] is False
+
+
+def test_snapshot_is_json_shaped():
+    b = _budget()
+    b.record_attempt(DriveMode.HOLD)
+    assert b.snapshot() == {"target": "hold", "attempts": 1,
+                            "max_attempts": 3, "gave_up": False}
+
+
+def test_a_budget_of_one_gives_up_immediately():
+    b = _budget(max_attempts=1)
+    b.record_attempt(DriveMode.HOLD)
+    assert b.exhausted(DriveMode.HOLD) is True
+
+
+def test_a_budget_below_one_is_a_configuration_error():
+    with pytest.raises(ValueError):
+        AttemptBudget(max_attempts=0)

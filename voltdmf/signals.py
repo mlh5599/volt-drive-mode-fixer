@@ -46,6 +46,27 @@ class ShiftPosition(str, Enum):
     UNKNOWN = "unknown"
 
 
+class EngineState(str, Enum):
+    """Range-extender state from ``0x4C5`` byte 2.
+
+    RUNNING means "the car is on an engine leg", which is slightly broader
+    than "the crankshaft is turning this instant": in charge-sustaining the
+    engine cycles, and 0x4C5 stays on 0xDD across the gaps (see the 0x3F9
+    note in :data:`SIGNAL_IDS`). Broader is what this project wants -- the
+    menu entry stays missing across those gaps too.
+    """
+
+    #: Engine leg over -- the car is running as an EV.
+    OFF = "off"
+    #: The ~1.5 s ramp 0x59/0x87/0xB5 between the two. Seen at BOTH edges of
+    #: an engine leg, up and down, so it is not a "starting" state.
+    TRANSITION = "transition"
+    #: Engine leg (charge-sustaining, HOLD/MOUNTAIN, or ERDTT).
+    RUNNING = "running"
+    #: No 0x4C5 frame decoded yet, or an unmapped byte-2 value.
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class SignalId:
     name: str
@@ -94,6 +115,45 @@ SIGNAL_IDS: dict[str, SignalId] = {
         "held the full 90 s while moving (21-51 mph), can0 ERROR-ACTIVE "
         "throughout. Verified independently in the raw capture: 0x1F4 byte 1 "
         "held N/S/M/H for each 90 s block.",
+    ),
+    "engine_state": SignalId(
+        "Range-extender engine running (status)",
+        0x4C5,
+        confirmed=True,
+        note="Confirmed 2026-09-05 offline against three in-repo captures "
+        "(tools/engine_check.py re-derives all of this). Byte 2 takes exactly "
+        "five values, the rest of the 5-byte payload is always zero: 0x49 "
+        "OFF, 0xDD RUNNING, and 0x59/0x87/0xB5 as a ~1.5 s ramp at either "
+        "edge -- the same three appear on the way down, so they are a "
+        "transition, not a start. It never left 0x49 across 561 EV-only "
+        "frames and the 2296 + 3452 EV frames of the two drives, and held "
+        "0xDD for the whole 701 s the session-9 HOLD leg kept SOC flat at "
+        "32.9 %, INCLUDING five 13-43 s stretches where the engine stopped "
+        "burning fuel (0x3F9 frozen) at city speeds -- so this reads 'on an "
+        "engine leg', not 'crank turning now', which is the more useful of "
+        "the two here. Session 8 caught the same ramp at the 0-bar mark with "
+        "0x1F4 byte 1 still 0x00 (NORMAL) -- the forced charge-sustaining "
+        "state this signal exists to detect.",
+    ),
+    "engine_run_counter": SignalId(
+        "Range-extender engine run counter",
+        0x3F9,
+        confirmed=True,
+        note="Confirmed 2026-09-05 offline. Bytes 1-2 big-endian are a "
+        "monotone accumulator that only advances on an engine leg (byte 0 "
+        "was 0x00 in all 15478 frames across the three captures, so it is "
+        "either the unused high byte or padding). Dead-frozen through 1076 s "
+        "of EV driving in session 9, all 1694 s of session 8's EV leg, and "
+        "the entire EV-only capture -- 0 changes -- then 2349 changes over "
+        "the session-9 engine leg and 160 over session 8's 40 s tail. It "
+        "tracks fuelling, not rotation: it starts moving 33 s (session 8) to "
+        "42 s (session 9) BEFORE 0x4C5 leaves 0x49, and it freezes for "
+        "13-43 s at a time on overrun and at rest (one freeze lines up "
+        "exactly with a 70 mph -> 0 -> 35 mph decel and stop) while 0x4C5 "
+        "holds 0xDD. Rate 4-159 counts/s, median 60; the unit is not pinned "
+        "down and is not used -- only 'did it change recently' is. Never "
+        "observed wrapping. Read together with 0x4C5 (union), the pair "
+        "covers the whole leg including that lead-in.",
     ),
     "drive_mode_status": SignalId(
         "Current drive mode (status)",
@@ -329,10 +389,69 @@ def decode_shift(data: bytes) -> ShiftPosition:
     return _SHIFT_BY_BYTE3.get(data[3], ShiftPosition.UNKNOWN)
 
 
+# --- Range-extender engine (0x4C5 byte 2, corroborated by 0x3F9) ---------
+#
+# Discovered 2026-09-05 by diffing the in-repo captures across two labelled
+# engine starts -- see the SIGNAL_IDS notes above and
+# docs/analysis/session12-engine-signal.md. Both frames are passive; nothing
+# here transmits.
+#
+# Why the project needs this: with the pack run down to the charge-sustaining
+# floor the car starts the engine and drops to NORMAL, and the centre-stack
+# menu stops offering HOLD/MOUNTAIN. Walking the menu at a mode that is not on
+# it can only burn taps, so the reconciler has to be able to see the engine.
+#
+# The two are read as a union (see VehicleState.engine_running), because
+# neither alone covers a whole engine leg: 0x3F9 leads 0x4C5 by 33-42 s at the
+# start of one and then freezes whenever the engine is not burning fuel, while
+# 0x4C5 rides through those gaps.
+ENGINE_STATE_ADDR = 0x4C5
+ENGINE_RUN_COUNTER_ADDR = 0x3F9
+
+#: 0x4C5 byte 2 -> engine state. Every value observed on this car; anything
+#: else decodes to UNKNOWN rather than being guessed at.
+_ENGINE_STATE_BY_BYTE2: dict[int, EngineState] = {
+    0x49: EngineState.OFF,
+    0x59: EngineState.TRANSITION,
+    0x87: EngineState.TRANSITION,
+    0xB5: EngineState.TRANSITION,
+    0xDD: EngineState.RUNNING,
+}
+
+
+def decode_engine_state(data: bytes) -> EngineState:
+    """Engine leg state from byte 2 of frame 0x4C5 (~2 Hz).
+
+    Returns :data:`EngineState.UNKNOWN` for a short frame or an unmapped
+    byte-2 value -- callers treat UNKNOWN as "no information", never as
+    "off", because a wrong "off" is the reading that puts taps on the wire.
+    """
+    if len(data) < 3:
+        return EngineState.UNKNOWN
+    return _ENGINE_STATE_BY_BYTE2.get(data[2], EngineState.UNKNOWN)
+
+
+def decode_engine_run_counter(data: bytes) -> int | None:
+    """Bytes 1-2 of frame 0x3F9 (~4 Hz), big-endian, as an opaque counter.
+
+    Only its *movement* is meaningful: it advances while the engine is
+    burning fuel and is frozen otherwise -- including for tens of seconds
+    mid-leg, which is why it corroborates 0x4C5 rather than replacing it.
+    Deliberately 16-bit rather than 24-bit: byte 0 was 0x00 in every captured
+    frame, so whether it belongs to this field is unproven, and reading it in
+    would turn an unrelated flag byte into a false "engine running". Wrapping
+    is harmless for the same reason -- a wrap is still a change.
+    """
+    if len(data) < 3:
+        return None
+    return data[1] << 8 | data[2]
+
+
 def is_signal_frame(addr: int) -> bool:
     """True if ``addr`` is one we know how to decode into VehicleState."""
     if addr == SOC_BAR_ADDR or UDS_RESP_ID_LO <= addr <= UDS_RESP_ID_HI:
         return True
     known = {SIGNAL_IDS["speed"].addr, SIGNAL_IDS["shift"].addr,
-             SIGNAL_IDS["drive_mode_status"].addr, _ALT_SHIFT_ADDR}
+             SIGNAL_IDS["drive_mode_status"].addr, _ALT_SHIFT_ADDR,
+             ENGINE_STATE_ADDR, ENGINE_RUN_COUNTER_ADDR}
     return addr in known

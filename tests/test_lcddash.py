@@ -4,7 +4,7 @@ import pytest
 
 from voltdmf import lcdlock
 from voltdmf.lcddash import LcdDashboard, bus_label, render_screen
-from voltdmf.signals import DriveMode, ShiftPosition
+from voltdmf.signals import DriveMode, EngineState, ShiftPosition
 from voltdmf.state import VehicleState
 
 
@@ -185,3 +185,87 @@ def test_selector_fn_exceptions_do_not_escape_the_run_loop():
     dash._selector_fn = boom
     dash._run()  # the tick raises; _run must swallow it and return
     assert dash._lcd is None  # closed on the way out of the failed tick
+
+
+# -- the engine tag on the SOC row ----------------------------------------
+def _engine_state(running: bool, soc=21.0):
+    st = _state(soc=soc)
+    st.engine_state = EngineState.RUNNING if running else EngineState.OFF
+    return st
+
+
+def test_render_tags_the_soc_row_when_the_engine_runs():
+    rows = render_screen(_engine_state(True), bus_label="ACTIVE-",
+                         position_label="hold-soc", position_index=1,
+                         cycle_len=4, floor_latched=False, soc_fresh=True)
+    assert rows[3].endswith("ICE")
+    assert "21.0%" in rows[3]
+    assert len(rows[3]) <= 20
+
+
+def test_render_says_no_hold_when_the_device_is_standing_down():
+    """The tag the driver actually needs: not just "the engine is on" but
+    "the engine is on, and that is why nothing is being set"."""
+    rows = render_screen(_engine_state(True), bus_label="ACTIVE-",
+                         position_label="hold-soc", position_index=1,
+                         cycle_len=4, floor_latched=True, soc_fresh=True,
+                         ice_blocked=True)
+    assert rows[3].endswith("NO HOLD")
+    assert len(rows[3]) <= 20
+
+
+def test_render_says_gave_up_when_the_walk_would_not_take():
+    rows = render_screen(_engine_state(False), bus_label="ACTIVE-",
+                         position_label="mountain", position_index=3,
+                         cycle_len=4, floor_latched=False, soc_fresh=True,
+                         gave_up=True)
+    assert rows[3].endswith("GAVE UP")
+    assert len(rows[3]) <= 20
+
+
+def test_no_hold_outranks_gave_up():
+    """Only one tag fits, and the live reason beats the standing one: while
+    the car is refusing to offer HOLD, that is what the driver needs to read."""
+    rows = render_screen(_engine_state(True), bus_label="ACTIVE-",
+                         position_label="hold-soc", position_index=1,
+                         cycle_len=4, floor_latched=True, soc_fresh=True,
+                         ice_blocked=True, gave_up=True)
+    assert rows[3].endswith("NO HOLD")
+
+
+def test_tick_paints_the_gave_up_tag_from_the_selector():
+    dash = LcdDashboard(_engine_state(False),
+                        selector_fn=lambda: dict(_selector(), gave_up=True),
+                        dry_run=True)
+    dash._tick(0)
+    assert dash._lcd.snapshot()[3].rstrip().endswith("GAVE UP")
+
+
+def test_render_has_no_engine_tag_when_the_engine_is_off():
+    rows = render_screen(_engine_state(False), bus_label="ACTIVE-",
+                         position_label="hold-soc", position_index=1,
+                         cycle_len=4, floor_latched=False, soc_fresh=True)
+    assert "ICE" not in rows[3]
+
+
+def test_render_has_no_engine_tag_before_the_engine_is_known():
+    rows = render_screen(_state(soc=21.0), bus_label="ACTIVE-",
+                         position_label="hold-soc", position_index=1,
+                         cycle_len=4, floor_latched=False, soc_fresh=True)
+    assert "ICE" not in rows[3]
+
+
+def test_tick_paints_the_no_hold_tag_from_the_selector():
+    dash = LcdDashboard(_engine_state(True),
+                        selector_fn=lambda: dict(_selector(), ice_blocked=True),
+                        dry_run=True)
+    dash._tick(0)
+    assert dash._lcd.snapshot()[3].rstrip().endswith("NO HOLD")
+
+
+def test_tick_survives_a_selector_without_the_ice_key():
+    """Older callers (and the placeholder selector) omit it entirely."""
+    dash = LcdDashboard(_engine_state(True), selector_fn=_selector,
+                        dry_run=True)
+    dash._tick(0)
+    assert dash._lcd.snapshot()[3].rstrip().endswith("ICE")

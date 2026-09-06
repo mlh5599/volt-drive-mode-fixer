@@ -175,6 +175,19 @@ def _print_status(state: dict) -> None:
           + (f"  (manual override -> {state['manual_override']})"
              if state.get("manual_override") else ""))
     print(f"shift:      {g('shift')}")
+    running = state.get("engine_running")
+    if state.get("engine_state") is not None:
+        verdict = "?" if running is None else ("running" if running else "off")
+        print(f"engine:     {verdict}  (0x4C5 {g('engine_state')}, "
+              f"0x3F9 {g('engine_run_counter')})")
+    if state.get("ice_block"):
+        print(f"NOT ACTING: {state['ice_block']}")
+    elif state.get("give_up"):
+        print(f"NOT ACTING: {state['give_up']}")
+    attempts = state.get("attempts") or {}
+    if attempts.get("target") and not attempts.get("gave_up"):
+        print(f"attempts:   {attempts['attempts']}/{attempts['max_attempts']} "
+              f"toward {attempts['target']}")
     soc_line = f"soc:        {g('soc_percent')}%"
     extras = []
     if state.get("soc_source"):
