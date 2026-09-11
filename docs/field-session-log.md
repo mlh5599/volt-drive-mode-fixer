@@ -1,8 +1,30 @@
 # On-Vehicle Field Session Log
 
-Running narrative of the field sessions against the real car. Pairs with
-`phase-c-field-checklist.md` (the procedure) and `signals-confirmed.md` (the
-decoded-signal reference). Newest session first.
+Running narrative of the field sessions against the real car — the project's
+running-status log. Pairs with `phase-c-field-checklist.md` (the procedure)
+and `signals-confirmed.md` (the decoded-signal reference). Newest session
+first.
+
+## Status summary
+
+| Item | Status | Session(s) |
+|---|---|---|
+| Mode-button input (`0x1E1`) | confirmed on-road | 2, 4 |
+| Current-mode status (`0x1F4` byte 1) | confirmed on-road | 2 |
+| Shift/PRNDL (`0x1F5` byte 3) | confirmed on-road | 4 |
+| Closed-loop menu walk | confirmed on-road PASS | 3, 4, 10 |
+| SOC (`22 005B` UDS poll, gauge↔SOC calibration) | confirmed | 9 |
+| Range-extender engine (`0x4C5` + `0x3F9`) | confirmed, offline | 12 |
+| Reconciler + SOC-HOLD floor | implemented, deployed | 9 |
+| ICE no-hold gate + `AttemptBudget` give-up | implemented, deployed | 12 |
+| Passive SOC signal (retiring the poll) | not found — poll stands | 8, 9 |
+| 30 % floor timing over several drives | not yet validated | — |
+| `roles/voltdmf` config migration | not yet done | — |
+| Ignition-cycle behavior (`ignition_check.py`) | not started | — |
+| Charge-current setpoint (12 A stretch goal) | capture done, not injected | — |
+
+Each session below links its captures and any write-up in `docs/analysis/`
+— that's where drive-by-drive outcomes live.
 
 ---
 

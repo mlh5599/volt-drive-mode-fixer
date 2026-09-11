@@ -1,19 +1,21 @@
 # Volt Drive Mode Fixer — Design
 
-**Status (2026-08-31):** deployed on the Pi (`voltpi`), field testing (Phase
-C). Mode-button input (`0x1E1`), current-mode status (`0x1F4` byte 1) and
-shift/PRNDL (`0x1F5` byte 3) are confirmed on-road; the closed-loop menu walk
-has an on-road PASS. Session 9 resolved SOC: the `22 005B` UDS poll gives
-exact pack percent (`raw·100/255`) and the gauge↔SOC curve is near-linear
-(`SOC% ≈ 7.07·bars + 19.6`, r = 0.999), so the level-triggered reconciler in
-"Mode policy" — with the SOC-HOLD floor keyed off that poll and `0x096`
-byte 3 as a coarse failsafe — is now **implemented**. `--dry-run` is gone:
-the daemon boots **armed** on the first detent of a four-position selector
-(`default_position: hold-soc` → passive until the SOC floor engages), and
-`voltdmf-ctl disarm` is the mid-drive stop. The out-of-repo `roles/voltdmf` still needs its ExecStart /
-`config.yaml` migrated to match. Progress and per-drive procedures live in
-`docs/phase-c-field-checklist.md`; the on-vehicle narrative in
-`docs/field-session-log.md`.
+**Status:** deployed on the Pi (`voltpi`), field testing (Phase C).
+
+- **Done:** mode-button input (`0x1E1`), current-mode status (`0x1F4` byte
+  1), and shift/PRNDL (`0x1F5` byte 3) are confirmed on-road; the
+  closed-loop menu walk has an on-road PASS. SOC is resolved via the
+  `22 005B` UDS poll (`raw·100/255`, gauge↔SOC ≈ `7.07·bars + 19.6`,
+  r = 0.999), so the level-triggered reconciler in "Mode policy" — SOC-HOLD
+  floor keyed off that poll, `0x096` byte 3 as a coarse failsafe — is
+  **implemented**. `--dry-run` is gone: the daemon boots **armed** on the
+  first detent of the four-position selector (passive until the SOC floor
+  engages), and `voltdmf-ctl disarm` is the mid-drive stop.
+- **Not done:** migrating the out-of-repo `roles/voltdmf` ExecStart /
+  `config.yaml` to match.
+
+Running status, per-drive procedures, and outcomes: `docs/field-session-log.md`
+and `docs/phase-c-field-checklist.md`.
 
 ## Problem
 
@@ -147,18 +149,17 @@ with it.
   a word in — rather than committing the whole drive off a ~13 %-per-count
   proxy before the exact reading has had a chance to arrive. After that grace
   it fails safe into charge-sustaining HOLD.
-- **Floor target = 2 gauge bars remaining.** From the Session-8 full-drain
-  drive the last bar (`1→0`) fell in **53 s** against a ~170 s average for
-  the other nine — the bottom of the gauge is a cliff, so the floor engages
-  while 2 bars still show. Session 9 pinned the numbers: `SOC% ≈
-  7.07·bars + 19.6` (r = 0.999); the 3→2 bar drop is **33.7 %** (raw 0x56),
-  the 4→3 bar mark **41.2 %** (raw 0x69). The engage point is **30 %** —
-  mid-2-bar, and the driver-facing name of position 1.
+- **Floor target = 2 gauge bars remaining.** On a full-drain drive the last
+  bar (`1→0`) fell in **53 s** against a ~170 s average for the other nine —
+  the bottom of the gauge is a cliff, so the floor engages while 2 bars still
+  show. Gauge↔SOC: `SOC% ≈ 7.07·bars + 19.6` (r = 0.999); the 3→2 bar drop is
+  **33.7 %** (raw 0x56), the 4→3 bar mark **41.2 %** (raw 0x69). The engage
+  point is **30 %** — mid-2-bar, and the driver-facing name of position 1.
 - **A spent pack takes HOLD off the menu.** Once the car gives up on the pack
   for a key cycle it starts the range extender and sits in NORMAL, and the
-  centre stack stops offering HOLD and MOUNTAIN at all — observed on the
-  2026-09-04 drive (restart after parking on a nearly-flat pack) and caught on
-  the wire in the Session-8 capture. Walking a menu that has no such entry can
+  centre stack stops offering HOLD and MOUNTAIN at all — observed in the field
+  (a restart after parking on a nearly-flat pack) and caught on the wire in a
+  full-drain capture. Walking a menu that has no such entry can
   only spend taps, so **engine running + car in NORMAL + no fresh SOC reading
   above 24 % ⇒ the reconciler withholds its target** and reports why
   (`reconciler.charge_sustaining_block`, surfaced as `ice_block` in `status`,
@@ -191,8 +192,8 @@ with it.
   every switch still goes through `SafetyGate` (preconditions + the 10 s
   cooldown), so if the driver fights the selector the daemon re-asserts at
   most once every ten seconds. The cooldown started at 60 s, when a runaway
-  walk was the fear; Session 11 landed 35/35 legs in ≤ 4 taps, and at 60 s a
-  driver who bumps the stalk could spend most of a minute in the wrong mode.
+  walk was the fear; field testing has landed 35/35 legs in ≤ 4 taps, and at
+  60 s a driver who bumps the stalk could spend most of a minute in the wrong mode.
   10 s still rules out sustained transmission. The button is the intended
   override — tap round to `off` and the daemon stops asserting anything.
 
@@ -202,8 +203,8 @@ N depends on the current mode. The current-mode status signal is confirmed
 (`0x1F4` byte 1), so the controller reads it directly and closes the loop on
 the live menu cursor (`0x1F4` bytes 4+5) rather than blind-counting. The
 blind count `index(target) + 1` is in fact correct from any mode — the menu
-always opens on NORMAL (measured 2026-09-03) — so the closed loop buys early
-exit and a hard failure on a dropped tap, not correctness.
+always opens on NORMAL — so the closed loop buys early exit and a hard
+failure on a dropped tap, not correctness.
 
 **Trip Mode (DR5, future work — not building this yet).** The
 [prior-art project](https://github.com/vix597/chevy-volt-trip-mode)'s
@@ -263,15 +264,15 @@ layer of defense.
 | Signal | ID | Notes |
 |---|---|---|
 | EV battery SOC (exact) | `22 005B` (UDS PID) | **The daemon's SOC source.** `0x206` (the Gen 2 broadcast candidate) is not on this bus, and no passive frame carries SOC at usable resolution, so the daemon polls diagnostic PID `22 005B` ("Hybrid/EV Battery Pack Remaining Charge") every ~10 s: request `03 22 00 5B 55 55 55 55` to `0x7E4` then `0x7E0` (lock onto whichever answers), reply on `0x7E8..0x7EF`, `SOC% = d[4]·100/255`. Stays in the default diagnostic session, service-22 only — no session switch, no TesterPresent — so it can't suppress normal broadcasts. The poll is a second hard-coded TX path (`canio.send_soc_poll`), ungated by arm state, gated only by `soc_poll.enabled`. |
-| EV battery SOC (coarse proxy / failsafe) | `0x096`, byte 3 | Only valid in the `x F0 0A xx` mux (`data[1]==0xF0 and data[2]==0x0A`). Steps ~13 % SOC per count — far too coarse to key the floor off, used only as the failsafe when the `22 005B` poll goes stale: b3 ≤ `bar_failsafe_raw` (9 ≈ 2 gauge bars ≈ 30 %) forces HOLD. Session-9 provenance; `signals.decode_soc_bar_raw`. |
-| Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1 (2026-08-29, on-road).** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. `voltdmf/canio.send_mode_button_press()` (tracking-echo press) — one of the daemon's two hard-coded TX frames (the other is the `22 005B` SOC poll); this is the only one gated by arm state. |
+| EV battery SOC (coarse proxy / failsafe) | `0x096`, byte 3 | Only valid in the `x F0 0A xx` mux (`data[1]==0xF0 and data[2]==0x0A`). Steps ~13 % SOC per count — far too coarse to key the floor off, used only as the failsafe when the `22 005B` poll goes stale: b3 ≤ `bar_failsafe_raw` (9 ≈ 2 gauge bars ≈ 30 %) forces HOLD. `signals.decode_soc_bar_raw`. |
+| Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1, on-road.** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. `voltdmf/canio.send_mode_button_press()` (tracking-echo press) — one of the daemon's two hard-coded TX frames (the other is the `22 005B` SOC poll); this is the only one gated by arm state. |
 | Ignition/drive-cycle start | — | **Not documented as a single CAN signal, and no longer needed as one.** Since the Pi is powered from the switched accessory socket (see "Hardware design"), the daemon only runs while the car is on. The reconciler is level-triggered, so it needs no ignition edge and no separate ignition-sense signal. Bus activity (Global A buses go quiet with the car off) remains a fallback cross-check if needed. |
 | Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki, cross-checked against a full-drain capture; not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` logs it plus a derived accel). |
-| Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1 (2026-08-29).** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Reported in `status` / the trip log, **not** a `SafetyGate` precondition — a drive-mode change has no driveline implication, so PRNDL does not block a switch (see "Safety model"). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
+| Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1.** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Reported in `status` / the trip log, **not** a `SafetyGate` precondition — a drive-mode change has no driveline implication, so PRNDL does not block a switch (see "Safety model"). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** The `22 005B` SOC poll (above) is the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
 | Reduced-propulsion / limp-mode indicator | — | **Not documented.** Not needed for this design since the goal is to act *before* this state, using the SOC threshold instead. |
-| Range-extender engine running | `0x4C5` byte 2 (+ `0x3F9` bytes 1-2) | **CONFIRMED on Gen 1 (2026-09-05, offline from the session-8/9 captures).** `0x4C5` b2: `0x49` off, `0xDD` on an engine leg, `0x59`/`0x87`/`0xB5` a ~1.5 s ramp at either edge. `0x3F9` b1-2 BE is a fuelling accumulator whose *movement* corroborates it -- it leads `0x4C5` by 33-42 s at the head of a leg and freezes on overrun and at rest, so the two are read as a union (`VehicleState.engine_running`). Purpose: once the pack is spent the car runs the engine in NORMAL and drops HOLD/MOUNTAIN from the centre-stack menu, so the reconciler must stop walking to a mode that is not on offer (see "Mode policy" / `reconciler.charge_sustaining_block`). `docs/analysis/session12-engine-signal.md`. |
-| Current drive mode (status, not button-press) | `0x1F4`, byte 1 | **CONFIRMED on Gen 1 (2026-08-29).** Latched mode: `0x00` NORMAL, `0x80` SPORT, `0x20` MOUNTAIN, `0x08` HOLD. byte 4 = live drive-mode menu cursor (steps ~40 ms after each tap; distinct byte codes), byte 5 bit 7 = menu-open hint. The daemon reads byte 1 as its current-mode source — the press-counting fallback is retired. |
+| Range-extender engine running | `0x4C5` byte 2 (+ `0x3F9` bytes 1-2) | **CONFIRMED on Gen 1, offline from field captures.** `0x4C5` b2: `0x49` off, `0xDD` on an engine leg, `0x59`/`0x87`/`0xB5` a ~1.5 s ramp at either edge. `0x3F9` b1-2 BE is a fuelling accumulator whose *movement* corroborates it -- it leads `0x4C5` by 33-42 s at the head of a leg and freezes on overrun and at rest, so the two are read as a union (`VehicleState.engine_running`). Purpose: once the pack is spent the car runs the engine in NORMAL and drops HOLD/MOUNTAIN from the centre-stack menu, so the reconciler must stop walking to a mode that is not on offer (see "Mode policy" / `reconciler.charge_sustaining_block`). `docs/analysis/session12-engine-signal.md`. |
+| Current drive mode (status, not button-press) | `0x1F4`, byte 1 | **CONFIRMED on Gen 1.** Latched mode: `0x00` NORMAL, `0x80` SPORT, `0x20` MOUNTAIN, `0x08` HOLD. byte 4 = live drive-mode menu cursor (steps ~40 ms after each tap; distinct byte codes), byte 5 bit 7 = menu-open hint. The daemon reads byte 1 as its current-mode source — the press-counting fallback is retired. |
 
 ## Hardware design
 
@@ -450,7 +451,7 @@ this project needs. Tighten that:
   correctness requirement, not an optimization. The tracking-echo press must
   mirror the module's *current* `0x1E1` counter — a stale counter is the
   frozen-counter frame the cluster ignores — and sharing one socket breaks
-  that two different ways, both measured on-vehicle (2026-09-03):
+  that two different ways, both measured on-vehicle:
   `recv()` alongside the Notifier lost 21% of taps, because SocketCAN gives
   each frame to exactly one reader; taking the frame from the Notifier's
   decoded state instead was *worse* at 36%, because that thread lags on a busy
@@ -466,7 +467,7 @@ this project needs. Tighten that:
 - **Bounded persistence.** Rate limiting bounds how *fast* the daemon can
   tap; it does nothing about how *long*. A level-triggered reconciler chasing
   a mode the car will not take is a slow-motion runaway, and one whole drive
-  of it is what the 2026-09-04 failure looked like. `safety.AttemptBudget`
+  of it is what a real field failure looked like. `safety.AttemptBudget`
   bounds the total: three walks per target, then it stops and says so, until
   the car reaches the mode or a person intervenes (see "Mode policy").
 - **Preconditions before injecting**: a live bus and a plausible speed. Both
@@ -520,16 +521,15 @@ invocations. State changes come in over an `AF_UNIX` stream socket
 | `test-mode <on\|off>` | suspend / resume the reconciler for an interactive probe session (in memory — a restart brings protection back) | queued → loop thread sets a flag; the reconcile pass is skipped while on |
 | `probe <mode>` | one operator-chosen closed-loop walk to `<mode>`, densely tracing the `0x1F4` cursor; records a `LANDED` / `CURSOR_ONLY` / `MISS` / `BLOCKED` verdict in `status` + the journal | queued → sets a flag; the loop thread runs it inline with a ~50 ms cursor sampler thread |
 
-> **All commands are implemented.** `setpoint` and the reconciler it
-> feeds landed in Session 9; `tools/button_helper.py`'s SW1 tap now drives a
-> real toggle. `walk-test` (SW1 solo hold ≥ 8 s) drives its own cooldown-free,
-> cooldown-free `SafetyGate` around the shared controller, so the real 10 s
-> gate and the single-threaded TX path are untouched; it needs the daemon
-> armed and refuses if a run is already queued. `test-mode` + `probe`
-> (Session 10) are the focused replacement for blind walk-test debugging: an
-> operator suspends the reconciler, sets a known start mode by hand, asks for
-> one target, and reads the per-tap + dense-sample cursor trace back — see
-> `docs/analysis/session10-walk-probe.md`.
+> **All commands are implemented.** `setpoint` drives the reconciler;
+> `tools/button_helper.py`'s SW1 tap drives a real toggle. `walk-test` (SW1
+> solo hold ≥ 8 s) drives its own cooldown-free `SafetyGate` around the shared
+> controller, so the real 10 s gate and the single-threaded TX path are
+> untouched; it needs the daemon armed and refuses if a run is already queued.
+> `test-mode` + `probe` are the focused replacement for blind walk-test
+> debugging: an operator suspends the reconciler, sets a known start mode by
+> hand, asks for one target, and reads the per-tap + dense-sample cursor trace
+> back — see `docs/analysis/session10-walk-probe.md`.
 
 - **Privilege boundary = file mode.** The `.socket` unit binds it
   `0660 root:voltdmf`; operators join the `voltdmf` group. No setuid, no
@@ -623,7 +623,7 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 - **Ignition/drive-cycle start** — no dedicated signal needed. The Pi is
   powered only while the car is usable and the reconciler is level-triggered,
   so there is no ignition edge to catch.
-- **SOC → `22 005B` UDS poll** (Session 9). Exact pack percent = `raw·100/255`
+- **SOC → `22 005B` UDS poll.** Exact pack percent = `raw·100/255`
   from a ~10 s service-22 poll; the gauge↔SOC curve is `SOC% ≈
   7.07·bars + 19.6` (r = 0.999). The floor engages at 30 % (mid-2-bar) and
   latches for the rest of the key cycle. This unblocked the armed reconciler.
@@ -633,7 +633,7 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
 - **Drop the poll for a passive signal.** The `22 005B` poll works but it is
   an active TX on the vehicle bus every 10 s; a passive broadcast field would
   be cleaner. `0x096` byte 3 (the failsafe proxy) is far too coarse
-  (~13 % SOC/count). The three Session-8 broadcast candidates — `0x3E3` bytes
+  (~13 % SOC/count). The three broadcast candidates found in field captures — `0x3E3` bytes
   0/1/6, `0x228` byte 2, `0x186` byte 6 — still have no raw→% scaling anchor;
   the running trip logs (SOC % vs. each candidate raw, stamped every line by
   `soc_log.py`) are the data set to calibrate one against and eventually

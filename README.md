@@ -34,20 +34,19 @@ Normal → Sport → Mountain → Hold, so reaching a target mode means computin
 how many presses to send from the current mode — see DESIGN.md for why that
 makes a current-mode status signal a hard requirement.
 
-**Status (2026-08-31):** deployed on the Pi (`voltpi`), field testing in
-Phase C. Confirmed on-road: the mode-button input (`0x1E1`), the current-mode
-status signal (`0x1F4` byte 1, the daemon's mode source), and shift/PRNDL
-(`0x1F5` byte 3); the closed-loop menu walk has an on-road PASS. Session 9
-resolved SOC — the `22 005B` UDS poll gives exact pack percent and the
-gauge↔SOC curve is near-linear — so the reconciler and its SOC-HOLD floor are
-now **implemented**. `--dry-run` is gone: the daemon boots **armed** on the
-first detent of the selector (`default_position: hold-soc` — passive until the
-SOC floor engages), and `voltdmf-ctl disarm` is the mid-drive stop. Still to
-do: migrate the out-of-repo `roles/voltdmf` ExecStart / `config.yaml`, then
-validate the 30 % floor timing over several drives.
-Progress and next steps:
-[`docs/phase-c-field-checklist.md`](docs/phase-c-field-checklist.md) and
-[`docs/field-session-log.md`](docs/field-session-log.md).
+**Status:** deployed on the Pi (`voltpi`), field testing in Phase C.
+
+- **Done:** mode-button input (`0x1E1`), current-mode status (`0x1F4` byte
+  1), shift/PRNDL (`0x1F5` byte 3), and SOC (`22 005B` UDS poll) are all
+  confirmed on-road; the closed-loop menu walk has an on-road PASS. The
+  reconciler and its SOC-HOLD floor are implemented and deployed — the
+  daemon boots **armed**, passive until the floor engages.
+- **Not done:** migrating the out-of-repo `roles/voltdmf` ExecStart /
+  `config.yaml`, and validating the 30 % floor timing over several drives.
+
+Running status and drive-session outcomes:
+[`docs/field-session-log.md`](docs/field-session-log.md). Field procedures:
+[`docs/phase-c-field-checklist.md`](docs/phase-c-field-checklist.md).
 
 ## Repository layout
 
