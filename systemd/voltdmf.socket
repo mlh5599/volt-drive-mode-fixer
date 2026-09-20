@@ -2,6 +2,14 @@
 Description=Volt Drive Mode Fixer control socket
 # No PartOf=: the listening socket is kept up across voltdmf.service restarts
 # so voltdmf-ctl calls queue for a moment during a restart instead of failing.
+# Only real dependency is /run being mounted (tmpfs, present before PID1
+# executes any unit file), so DefaultDependencies=yes's implicit
+# After=sysinit.target only adds a wait on cloud-init for no reason.
+DefaultDependencies=no
+# Re-added manually -- see systemd.special(7) -- so RemoveOnStop=true still
+# cleans up control.sock in an orderly stop rather than racing shutdown.
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Socket]
 # Passed to voltdmf.service as fd 3 (LISTEN_FDS=1). voltdmf.control.inherited_listener()

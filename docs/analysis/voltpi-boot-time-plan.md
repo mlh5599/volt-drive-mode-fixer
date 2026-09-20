@@ -129,14 +129,44 @@ manual action; Tailscale / SSH / node_exporter come up independently.
 Result: `voltdmf` active right after `basic.target` + `can0-up` (~10–11 s
 now, earlier once Tier 2 shortens the pre-sysinit chain).
 
-### Tier 2 — disable cloud-init  ·  ≈ −4–5 s  ·  shortens the pre-sysinit chain
+### Tier 1.5 — decouple voltdmf's units from sysinit.target  ·  ≈ −4.4 s  ·  ansible, reversible  ·  **done 2026-09-19**
+
+`voltdmf.service`, `voltdmf.socket`, and `voltdmf-can0-up.service` all still
+used the *default* `DefaultDependencies=yes`, which silently adds an implicit
+`After=sysinit.target`/`After=basic.target` — that's what kept them behind
+`cloud-init-network` → `cloud-init-local` → `cloud-init-main` even after Tier 1
+removed `network-online.target`. Added `DefaultDependencies=no` to all three
+units' `[Unit]` sections, plus a manually re-added `Conflicts=shutdown.target`
+/ `Before=shutdown.target` pair on each (per `systemd.special(7)`, since
+`DefaultDependencies=no` also strips the automatic orderly-shutdown ordering,
+and this daemon holds an open SocketCAN raw socket + a serial LCD line).
+Explicitly did **not** add `After=local-fs.target` — root `/` is mounted by
+the kernel before PID 1 runs regardless, and adding it would silently
+re-couple voltdmf to the `/boot/firmware` fsck on exactly the boots (post
+dirty-shutdown, e.g. the ignition-off power blip) where that fsck runs
+longest. cloud-init, NetworkManager, wifi_failover, and tailscaled are
+untouched and keep running on their normal schedule — this only changes what
+voltdmf's own units wait on.
+
+Verified via reboot: `voltdmf.service` active at **@6.569s** (was @11.013s),
+chain now ends cleanly at `sys-subsystem-net-devices-can0.device`, no
+cloud-init in the path. `voltdmf-ctl status`, WiFi (`wlan0`/`home-iot`), and
+Tailscale all confirmed still converging normally and independently.
+
+### Tier 2 — disable cloud-init  ·  ≈ −4–5 s  ·  shortens the pre-sysinit chain  ·  **done 2026-09-19**
 
 `touch /etc/cloud/cloud-init.disabled` (fast, reversible) or
 `apt purge cloud-init` (permanent). Manage the flag file from the role.
 Nothing on this host needs it. Removes `cloud-init-main` (3.2 s) +
 `cloud-init-local` (1.0 s) from the chain and unblocks `sysinit.target`.
 
-### Tier 3 — network `wait-online` barriers off the boot path  ·  ≈ −3.8 s
+Implemented as declarative `roles/voltdmf` tasks gated by
+`voltdmf_disable_cloud_init` (host_vars, voltpi only) — flipping the var back
+to `false` and reconverging removes the flag file and re-enables cloud-init,
+no manual cleanup. Pre-change state + a no-network/no-SSH SD-card rollback
+procedure recorded at `docs/analysis/voltpi-tier2-3-backup.md`.
+
+### Tier 3 — network `wait-online` barriers off the boot path  ·  ≈ −3.8 s  ·  **done 2026-09-19**
 
 `systemctl disable NetworkManager-wait-online.service` (and
 `systemd-networkd-wait-online.service` if enabled). These are **barrier
@@ -146,39 +176,107 @@ guaranteed present at a fixed point in boot, which is fine because nothing
 on this box needs to *block* on it. **Keep `NetworkManager.service` itself
 enabled** — it is what brings Wi-Fi up.
 
-**Tiers 1–3 together: `voltdmf` active in ~6–8 s instead of ~19–25 s.**
-All reversible, all ansible-managed, no reboot-bricking risk.
+Implemented alongside Tier 2 as declarative `roles/voltdmf` tasks gated by
+`voltdmf_disable_wait_online` (host_vars, voltpi only), same
+undo-by-reconverge pattern. `systemd-networkd-wait-online.service` was
+already disabled (confirmed 2026-09-03) — nothing to do there.
 
-### Tier 4 — kernel / firmware phase  ·  ≈ −2–4 s  ·  config.txt / cmdline.txt, reboot-risk
+Verified via reboot: userspace boot **19.937s → 13.911s**, `multi-user.target`
+**17.842s → 13.910s** (measured immediately before vs. after this change,
+both already on top of Tier 1.5). `voltdmf.service` itself unchanged at
+@6.499s, as expected — Tier 1.5 already took it off this chain; Tiers 2/3
+shorten the rest of boot instead. All 5 cloud-init units confirmed `enabled`
++ `inactive` (the flag suppressed their run, not just re-labeled it),
+`NetworkManager-wait-online.service` confirmed `disabled` + `inactive`.
+`wlan0` connected via `home-iot`, Tailscale connected, `voltdmf-ctl status`
+answered normally, no new journal errors.
+
+**Tiers 1–3 together: `voltdmf` active @6.5s, full userspace boot ~13.9s —
+down from the ~19.2s / ~26.6s baseline.** All reversible, all
+ansible-managed, no reboot-bricking risk.
+
+### Tier 4 — kernel / firmware phase  ·  ≈ −2–4 s  ·  config.txt / cmdline.txt, reboot-risk  ·  **done 2026-09-19**
 
 - `auto_initramfs=0` — plain ext4 + `rootwait` needs no initramfs.
-- Drop the graphics stack on this headless unit: remove
+- Dropped the graphics stack on this headless unit: removed
   `dtoverlay=vc4-kms-v3d`, set `max_framebuffers=0`, `camera_auto_detect=0`,
   `display_auto_detect=0`, `dtparam=audio=off`, `gpu_mem=16`.
-- `disable_splash=1`, `boot_delay=0`; add `quiet logo.nologo` to cmdline.
+- `disable_splash=1`, `boot_delay=0`; appended `quiet logo.nologo` to
+  cmdline.
 - `/boot/firmware` fstab passno -> 0 (stop fsck'ing the FAT partition every
-  boot — that is the 1.3 s).
-- **Test-reboot after each change.** Keep a known-good copy of both files and
-  have the SD reader on hand — a bad `config.txt`/`cmdline.txt` can stop boot.
-- First check which homelab-ansible role (if any) manages `config.txt` /
-  `cmdline.txt` before editing them there. The `voltdmf` role owns only the
-  `mcp2515-can0` overlay line.
+  boot).
 
-### Tier 5 — mask unused services  ·  ≈ −1–3 s + less 4-core contention  ·  ansible
+`geerlingguy.raspberry_pi` isn't in `playbooks/voltpi.yml`'s role list, so
+nothing else touches these files on this host — `roles/voltdmf` owns them
+outright via paired do/undo tasks (`voltdmf_tune_boot_config`, host_vars,
+voltpi only) that edit/restore the exact original values already in the
+file rather than templating a whole-file overwrite, so a stray SD-card-
+specific value (the root `PARTUUID`) is never hardcoded anywhere in the
+role. `cmdline.txt` in particular is handled as a token add/strip against
+its own live content (slurp + compute + copy), not a static template, for
+the same reason. Pre-change state + an SD-card disaster-rollback procedure
+(FAT-partition mount for `config.txt`/`cmdline.txt`, rootfs mount for
+`fstab`) recorded at `docs/analysis/voltpi-tier4-backup.md`.
 
-Mask: `udisks2`, `ModemManager`, `e2scrub_reap` + `e2scrub_all.timer`,
-`keyboard-setup`, `console-setup`, `rpi-eeprom-update`, `systemd-pstore`,
-`bluetooth`, and the background-work timers (`apt-daily*`, `man-db`,
-`system-upgrade-check`, `binary-version-check`) — a car Pi should not apt in
-the background.
+Verified via reboot: kernel time **4.912s → 3.211s** (no more initramfs load
+or FAT-partition fsck), userspace **13.559s → 12.515s**, `voltdmf.service`
+**@6.248s → @5.939s**. Zero `systemctl --failed` units; `can0` up; WiFi
+(`wlan0`/`home-iot`), Tailscale, and `voltdmf-ctl status` all confirmed
+healthy post-reboot. Journal shows the expected, harmless fallout of
+dropping the graphics stack on a headless box with no framebuffer consumer
+(`bcm2708_fb`/`vc_sm_cma_vchi_init`/MMAL VCHI probe failures) — not a
+regression, nothing else references those drivers.
 
-Conditional (verify first — see "Connectivity guarantee"):
-`avahi-daemon`(+socket) only if `voltpi.local` is unused. **Not
-`wpa_supplicant`** — confirmed load-bearing on this box (2026-09-03).
+### Tier 5 — mask unused services  ·  ≈ −1–3 s + less 4-core contention  ·  ansible  ·  **done 2026-09-19**
 
-**Never mask:** `NetworkManager`, `ssh`, `tailscaled`. Keep: `node_exporter`,
-`cron`, `systemd-timesyncd`, `voltdmf*`. Put the mask list in the role as
-declarative state so it survives a reimage.
+Masked: `udisks2`, `e2scrub_reap` + `e2scrub_all.timer`, `keyboard-setup`,
+`console-setup`, `rpi-eeprom-update`, `systemd-pstore`, `bluetooth`, and the
+background-work timers (`apt-daily*`, `man-db`, `system-upgrade-check`) — a
+car Pi should not apt in the background. `ModemManager`/`hciuart` from the
+original list don't exist on this trixie image, so they were dropped rather
+than masked. `binary-version-check.timer` was deliberately **excluded**:
+`roles/node_exporter` (which runs on every voltpi converge regardless of
+this tier) re-templates it fresh every time, so masking it would just get
+silently undone on the next `make voltpi` — fighting another role's
+ownership instead of a real held-masked state.
+
+Conditional item resolved: `avahi-daemon`(+socket) masked — confirmed with
+the user that `voltpi.local` is genuinely unused; Unbound DNS
+(`voltpi.haguehome.lan`) and Tailscale MagicDNS (`voltpi`) are the only names
+anything resolves this host by. **Not `wpa_supplicant`** — confirmed
+load-bearing on this box (2026-09-03).
+
+**Never masked:** `NetworkManager`, `ssh`, `tailscaled`. Kept: `node_exporter`,
+`cron`, `systemd-timesyncd`, `voltdmf*`. The mask list lives in
+`roles/voltdmf/defaults/main.yml` (`voltdmf_masked_services`) as declarative
+state gated by `voltdmf_mask_unused_services` / `voltdmf_mask_avahi`
+(host_vars, voltpi only) — flip either back to `false` and reconverge to
+unmask everything, no manual host cleanup. A generic pre-mask task removes
+any stale real unit-file override at `/etc/systemd/system/<name>` before
+masking (a no-op for genuine stock units, which only ever have a `.wants/`
+symlink there) — needed because `system-upgrade-check.timer` turned out to
+be a leftover real file from `roles/system_upgrade`, a role that is
+permanently excluded from voltpi's playbook (`mobile_hosts`) and so will
+never regenerate it.
+
+Verified via reboot: userspace boot **13.911s → 13.559s**, `multi-user.target`
+**13.910s → 13.542s**, `voltdmf.service` **@6.499s → @6.248s**. Smaller win
+than the ≈1–3s estimate — most of these units were background/on-demand
+rather than sitting on the critical chain, so the gain is mostly less
+4-core contention during the busy first ~6s, not a shortened dependency
+path. All 14 masked units + avahi-daemon confirmed `masked`/`inactive`
+post-reboot (the four masked timers showed a one-boot `active=failed`
+between the live mask and the reboot — an expected artifact of masking a
+unit mid-run, not a recurring issue; clean `inactive` after the reboot).
+NetworkManager, tailscaled, ssh, cron, timesyncd, voltdmf + can0-up + btn all
+active; `wlan0` connected via `home-iot`; Tailscale connected; `voltdmf-ctl
+status` answered normally.
+
+**Tiers 1–5 together: `voltdmf.service` active @5.939s, full userspace boot
+12.515s, total boot (kernel + userspace) 15.727s — down from the ~19.2s /
+~26.6s baseline.** All reversible, all ansible-managed except Tier 4's
+higher (but SD-card-recoverable) risk. Only Tier 6 (structural, next
+reimage) remains, and it's optional.
 
 ### Tier 6 — structural, next reimage  ·  optional
 
@@ -194,10 +292,9 @@ declarative state so it survives a reimage.
 
 | Stage        | voltdmf active after power-on |
 |--------------|-------------------------------|
-| Today        | ~19–25 s                      |
-| Tier 1–3     | ~6–8 s                        |
-| + Tier 4–5   | ~4–6 s, total boot < ~10 s    |
-| + Tier 6     | ~4–6 s, corruption-proof      |
+| Original baseline (2026-09-02) | ~19.2 s / ~26.6 s total |
+| Tier 1–5 (measured, 2026-09-19) | **@5.939s, ~12.5s userspace, ~15.7s total** |
+| + Tier 6     | same active time, corruption-proof |
 
 ## Measuring
 

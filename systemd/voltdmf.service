@@ -2,15 +2,27 @@
 Description=Volt Drive Mode Fixer
 # See DESIGN.md and host/README.md in the source tree for setup and rationale.
 Documentation=file:///usr/share/doc/voltdmf/DESIGN.md
-After=network-online.target voltdmf.socket
-Wants=network-online.target
-# Pull in the control socket, but the daemon runs continuously regardless of
+# Plain services get an implicit After=basic.target from
+# DefaultDependencies=yes; strip it so this unit isn't gated behind
+# sysinit.target/cloud-init once its real prerequisite (the control socket)
+# is satisfied. Root `/` is mounted before PID1 starts, so no
+# local-fs.target wait is needed either.
+DefaultDependencies=no
+# No network-online.target: the daemon is CAN + a local control socket + a
+# serial LCD + GPIO, nothing IP-based, so there is nothing to wait for there
+# -- it was boilerplate that gated the whole service behind NetworkManager
+# (measured ~18s of a ~25s boot, systemd-analyze critical-chain, 2026-09-19).
+After=voltdmf.socket
 # whether anything has connected (socket activation here just supplies the
 # already-bound listening fd -- it does NOT make the service on-demand).
 Requires=voltdmf.socket
 # fail-passive: if it keeps dying, stop rather than thrash the bus
 StartLimitIntervalSec=120
 StartLimitBurst=5
+# Re-added manually (systemd.special(7)): holds an open SocketCAN raw socket
+# and a serial LCD line -- needs an orderly stop before final unmounts.
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=simple
