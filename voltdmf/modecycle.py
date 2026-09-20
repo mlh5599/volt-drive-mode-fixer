@@ -84,6 +84,22 @@ WALK_GAP_S = 1.4
 #: ~40 ms after the tap; give it margin against RX jitter).
 CURSOR_SETTLE_S = 0.2
 
+#: If the cursor has not opened even once (stayed ``None``) after this many
+#: taps, stop early instead of burning the rest of ``MAX_WALK_TAPS``.
+#:
+#: Added after a 2026-09-19 field report: the car was switched off without
+#: opening a door, which leaves the cluster/bus alive (a retained-power-like
+#: window) but the mode menu itself unresponsive. There is no confirmed CAN
+#: signal that distinguishes that window from true ignition-on (see
+#: ``docs/field-session-log.md`` Session 13, ``tools/ignition_diff.py``), so
+#: this is a blast-radius reduction, not a real ignition gate: a menu that
+#: never opens at all is never going to open by tap 12 either, so there is no
+#: correctness cost, only fewer taps thrown at a module that is not
+#: listening. A cursor that opens and then gets stuck partway still gets the
+#: full ``MAX_WALK_TAPS`` budget -- that is the dropped-tap/recovery case
+#: this must not regress.
+MENU_UNRESPONSIVE_TAPS = 3
+
 #: Deprecated alias. This value was previously mis-described as a post-switch
 #: cooldown; it is the intra-walk gap (see above).
 BUTTON_PRESS_COOLDOWN_S = WALK_GAP_S
@@ -239,8 +255,14 @@ class ModeCycleController:
         after every tap means a coalesced double-step or a dropped tap just
         changes how many more taps we send -- we never overshoot past the
         target and hold, because we stop the moment the cursor matches.
+
+        Bails out early, at ``MENU_UNRESPONSIVE_TAPS``, if the cursor has
+        never once opened (stayed ``None``) -- see that constant's docstring.
+        Once the cursor has opened at least once, a stuck/coalesced walk still
+        gets the full ``MAX_WALK_TAPS`` budget.
         """
         taps = 0
+        menu_opened = False
         for _ in range(MAX_WALK_TAPS):
             self._presser.send_mode_button_press()
             taps += 1
@@ -251,6 +273,15 @@ class ModeCycleController:
             if cursor == target:
                 self._report(target)
                 return taps
+            if cursor is not None:
+                menu_opened = True
+            if not menu_opened and taps >= MENU_UNRESPONSIVE_TAPS:
+                raise ModeSwitchFailed(
+                    f"menu never opened in {taps} taps -- module not "
+                    "responding (ignition off, retained-power window, or "
+                    "cluster asleep?)",
+                    taps=taps,
+                )
             self._sleep(WALK_GAP_S)
         # No _report on the failure path: we tapped MAX_WALK_TAPS times and the
         # cursor is somewhere unknown -- claiming it landed on `target` would

@@ -397,6 +397,16 @@ any of it with `tools/engine_check.py <capture> [--since <epoch>]`.
 - Seconds from "on" to first frames: `______`
 - => sets `ASSUMED_START_MODE` validity in `voltdmf/daemon.py`
 
+**Session 13 (2026-09-19):** the "bus goes quiet with car off" question above
+is now known to have a third answer -- *not always*. A real ignition-off
+(without opening a door) left the cluster, the Pi, and cluster-related
+traffic (`0x1F4`/`0x1F5`/`0x3E9`) all live, so `state.bus_active` read `True`
+straight through it and the reconciler tried to walk the menu. No signal to
+distinguish that retained-power window from true ignition-on is confirmed
+(or even a candidate) yet. `tools/ignition_diff.py` is the follow-up capture
+for the next drive that ends this way -- see `docs/field-session-log.md`
+Session 13.
+
 ## Charge current setpoint — 8 A / 12 A Level 1  (stretch goal — NOT CONFIRMED)
 
 Goal: force 12 A 120 V charging (`DESIGN.md` → "Stretch goal — force 12 A

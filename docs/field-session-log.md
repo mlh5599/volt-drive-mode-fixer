@@ -20,11 +20,84 @@ first.
 | Passive SOC signal (retiring the poll) | not found — poll stands | 8, 9 |
 | 30 % floor timing over several drives | not yet validated | — |
 | `roles/voltdmf` config migration | not yet done | — |
-| Ignition-cycle behavior (`ignition_check.py`) | not started | — |
+| Ignition-off-without-door-open (RAP) signal (`ignition_diff.py`) | not found — interim fast-abort mitigation shipped | 13 |
 | Charge-current setpoint (12 A stretch goal) | capture done, not injected | — |
 
 Each session below links its captures and any write-up in `docs/analysis/`
 — that's where drive-by-drive outcomes live.
+
+---
+
+## Session 13 — 2026-09-19 (no car time — a real failure report; fast-abort mitigation, no root cause yet)
+
+No new captures. A couple of good, real test runs surfaced a new failure
+mode, in the owner's words:
+
+> I had stopped the car (turned off the ignition but didn't open the door).
+> When this happens the instrument cluster stays on and the pi stays
+> powered. I observed the reconciler attempt to set hold mode and fail. We
+> should not attempt to change the drive mode if the ignition isn't yet on.
+
+This contradicts a founding assumption written into `DESIGN.md` and the
+"continuous reconciler" design note: that the Pi only has power while the
+car runs, so there is no ignition edge to track. The car has a
+retained-accessory-power-like window ("RAP") — key off, door not opened —
+where the cluster, the Pi, and `0x1F4`/`0x1F5`/`0x3E9` cluster traffic all
+stay alive. `state.bus_active` (`voltdmf/state.py`) is fed by that same
+traffic, so it stays `True` right through the window — it cannot tell RAP
+from ignition-on, and neither can anything else already in the repo. No
+confirmed signal for true ignition state exists.
+
+Guessing one now was rejected: a wrong guess risks misfiring on a bus this
+project doesn't fully understand yet, and worse, risks blocking the
+legitimate "settle the mode in the driveway with the ignition on" use case
+that `safety.py` already went out of its way to protect (the reason shift
+isn't a precondition). Instead, shipped the safe interim move plus the
+tooling to find the real signal on the next drive:
+
+- **Fast-abort on an unresponsive menu** (`voltdmf/modecycle.py`,
+  `MENU_UNRESPONSIVE_TAPS = 3`). `_walk_closed_loop` now tracks whether the
+  live menu cursor has ever opened (gone non-`None`) at all; if it hasn't by
+  tap 3, it raises `ModeSwitchFailed` right there instead of continuing to
+  the full `MAX_WALK_TAPS` (12). This is *not* an ignition gate — the walk
+  still has no idea why the module isn't responding — it just cuts the cost
+  of a doomed attempt from ~19 s of futile button-tap injection down to
+  ~0.8 s. A cursor that opens and then gets stuck (the dropped-tap /
+  recovery case) is unaffected and still gets the full budget.
+- **`tools/ignition_diff.py`**, modeled on `headlight_diff.py`: a three-window
+  capture (ignition ON → OFF-without-opening-a-door → ON again) reporting
+  both byte-level candidates and, new here, whole IDs that appear or
+  disappear between windows — including a specific check on whether `0x1E1`
+  (the mode-button/module frame) goes quiet in RAP even though `0x1F4`
+  doesn't. Run this the next time the car gets parked without opening a
+  door.
+
+**Also found, not fixed:** `voltpi`'s `journald` is non-persistent
+(`journalctl --header` shows `/run/log/journal/...`, no
+`/var/log/journal/<machine-id>`), so no log evidence of the actual incident
+survived the intervening reboot. Worth fixing in `homelab-ansible` before the
+next test drive so a failure like this leaves a trail.
+
+**Addendum, same session:** the "Pi stayed powered" part of the report has a
+sharper explanation. Pressing the ignition button puts a momentary
+blip/brownout on the switched accessory socket that resets the Pi outright —
+it reboots into the RAP window, daemon starting fresh (systemd brings it up
+**armed**) straight into a bus still carrying cluster traffic. So this was a
+cold boot walking into RAP, not a long-running daemon misreading a stale
+signal. Candidate hardware fix (not yet sized/installed): bulk capacitance on
+the Pi's supply to ride through the blip. Practical fallout: `ignition_diff.py`
+is one process holding one `can.Bus` across all three capture windows, so it
+needs the Pi on an external battery/UPS for a clean run, not the stock USB
+charger — otherwise the reset kills the capture mid-`off`-window. Recorded in
+`DESIGN.md` "Hardware design" → "Power".
+
+**Still open:** the real ignition-vs-RAP signal. `desired_mode()`
+(`voltdmf/reconciler.py`) still has no ignition awareness and will keep
+trying to enforce a setpoint through a RAP window — the fast-abort just
+makes each attempt cheap. `DESIGN.md`'s "Ignition/drive-cycle start" row and
+"continuous reconciler" note need a correction pass to stop asserting the
+now-falsified premise. Also still open: sizing/installing the bulk-cap fix
+for the power blip itself.
 
 ---
 

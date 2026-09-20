@@ -3,6 +3,7 @@ import pytest
 from voltdmf.modecycle import (
     CURSOR_SETTLE_S,
     MAX_WALK_TAPS,
+    MENU_UNRESPONSIVE_TAPS,
     WALK_GAP_S,
     ModeCycleController,
     ModeSwitchFailed,
@@ -225,6 +226,45 @@ def test_closed_loop_raises_when_cursor_never_arrives():
     assert presser.presses == MAX_WALK_TAPS
     # The failure has to carry the tap count -- it is the dropped-tap evidence,
     # and SafetyGate reports it. Losing it made every probe MISS read "taps 0".
+    assert exc.value.taps == MAX_WALK_TAPS
+
+
+def test_closed_loop_bails_early_when_menu_never_opens():
+    # cursor stays None -- module never responding (e.g. ignition off / RAP).
+    class DeadCursor:
+        def on_tap(self):
+            pass
+
+        def read(self):
+            return None
+
+    cur = DeadCursor()
+    ctl, presser = _closed_controller([S], cur)
+    with pytest.raises(ModeSwitchFailed) as exc:
+        ctl.switch_to(H)
+    assert presser.presses == MENU_UNRESPONSIVE_TAPS
+    assert exc.value.taps == MENU_UNRESPONSIVE_TAPS
+    assert "never opened" in str(exc.value)
+
+
+def test_closed_loop_gets_full_budget_once_menu_has_opened():
+    # cursor opens once (tap 1 -> NORMAL) then sticks -- not the "never
+    # opened" case, so the walk still gets the full MAX_WALK_TAPS.
+    class OpensThenSticksCursor:
+        def __init__(self):
+            self._tap = 0
+
+        def on_tap(self):
+            self._tap += 1
+
+        def read(self):
+            return N if self._tap >= 1 else None
+
+    cur = OpensThenSticksCursor()
+    ctl, presser = _closed_controller([S], cur)
+    with pytest.raises(ModeSwitchFailed) as exc:
+        ctl.switch_to(H)
+    assert presser.presses == MAX_WALK_TAPS
     assert exc.value.taps == MAX_WALK_TAPS
 
 
