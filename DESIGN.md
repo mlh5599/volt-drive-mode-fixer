@@ -92,9 +92,10 @@ per mode. See "Mode policy" and "Software architecture" below.
 > retained-power-like window (ignition off, door not opened) where the Pi,
 > cluster, and cluster-related bus traffic all stay alive, and the reconciler
 > kept trying to walk the menu in it. The level-triggered design itself still
-> stands on the argument above, independent of ignition; what was missing is
-> a *precondition* — the reconciler has no ignition awareness yet (see "Open
-> items" → "Still open").
+> stands on the argument above, independent of ignition; what was missing was
+> a *precondition* — **added Session 14 (2026-09-19):** `0x3ED` presence is a
+> confirmed ignition-on signal, and `SafetyGate._precondition_failure()` now
+> blocks both the reconciler and manual `set-mode` while it reads off.
 
 **Desired mode = f(selector position, SOC).** One loop pass computes the mode
 the car *should* be in. The result is concrete (HOLD / MOUNTAIN) **or `None`**
@@ -274,7 +275,7 @@ layer of defense.
 | EV battery SOC (exact) | `22 005B` (UDS PID) | **The daemon's SOC source.** `0x206` (the Gen 2 broadcast candidate) is not on this bus, and no passive frame carries SOC at usable resolution, so the daemon polls diagnostic PID `22 005B` ("Hybrid/EV Battery Pack Remaining Charge") every ~10 s: request `03 22 00 5B 55 55 55 55` to `0x7E4` then `0x7E0` (lock onto whichever answers), reply on `0x7E8..0x7EF`, `SOC% = d[4]·100/255`. Stays in the default diagnostic session, service-22 only — no session switch, no TesterPresent — so it can't suppress normal broadcasts. The poll is a second hard-coded TX path (`canio.send_soc_poll`), ungated by arm state, gated only by `soc_poll.enabled`. |
 | EV battery SOC (coarse proxy / failsafe) | `0x096`, byte 3 | Only valid in the `x F0 0A xx` mux (`data[1]==0xF0 and data[2]==0x0A`). Steps ~13 % SOC per count — far too coarse to key the floor off, used only as the failsafe when the `22 005B` poll goes stale: b3 ≤ `bar_failsafe_raw` (9 ≈ 2 gauge bars ≈ 30 %) forces HOLD. `signals.decode_soc_bar_raw`. |
 | Drive mode cycle button press | `0x1E1`, byte 4 bit 7 | **CONFIRMED on Gen 1, on-road.** `ASCMSteeringButton`; byte 4 low bits are a rolling counter, bit 7 is the press flag. Same ID/bit the Gen 2 prior art injects. `voltdmf/canio.send_mode_button_press()` (tracking-echo press) — one of the daemon's two hard-coded TX frames (the other is the `22 005B` SOC poll); this is the only one gated by arm state. |
-| Ignition/drive-cycle start | — | **Not documented, and known to be needed after all (Session 13, 2026-09-19).** The Pi being powered from the switched accessory socket does *not* imply the daemon only runs while the car is on: a real drive found a retained-power-like window ("RAP") — ignition off, door not opened — where the cluster, the Pi, and cluster-related bus traffic (`0x1F4`/`0x1F5`/`0x3E9`) all stay alive. `state.bus_active` is fed by that same traffic, so it cannot tell RAP from ignition-on, and no other confirmed signal can either. The reconciler still tried to walk the menu in that window and failed. Interim mitigation: a doomed walk now aborts fast (`voltdmf/modecycle.py` `MENU_UNRESPONSIVE_TAPS`) instead of spending the full `MAX_WALK_TAPS`; the real fix needs a confirmed ignition signal, to be hunted with `tools/ignition_diff.py` on the next drive. |
+| Ignition on/off | `0x3ED` (presence) | **CONFIRMED 2026-09-19, Session 14.** The Pi being powered from the switched accessory socket does *not* imply the daemon only runs while the car is on: Session 13 found a retained-power-like window ("RAP") — ignition off, door not opened — where the cluster, the Pi, and cluster-related bus traffic (`0x1F4`/`0x1F5`/`0x3E9`) all stay alive, and `state.bus_active` (fed by that same traffic) cannot tell RAP from ignition-on. Session 14's in-car ON/OFF/ON capture (reproduced across two cycles) found the ID that can: `0x3ED` is present (constant payload `80 00 00 00 00 FF`) only while the ignition is on, and vanishes entirely — the whole ID, not a byte within it — through the RAP window. `state.ignition_on`, fed by it, is now a `SafetyGate._precondition_failure()` precondition, so both the reconciler and manual `set-mode` refuse a switch in RAP. The Session-13 fast-abort mitigation (`MENU_UNRESPONSIVE_TAPS`) stays in place as defense in depth. Not yet measured: `0x3ED`'s own transmit period (`IGNITION_QUIET_TIMEOUT_S` borrows `BUS_QUIET_TIMEOUT_S` as a placeholder). |
 | Vehicle speed | `0x3E9` | Bytes 0-1 big-endian ÷ 64 → km/h (× 0.621371 → mph). Per the GM Volt reverse-engineering wiki, cross-checked against a full-drain capture; not yet speedo-verified. DLC 8, 10 Hz; bytes 2 & 6 are a mux/rolling counter. Not needed for the SOC-triggered design but useful for bench testing/logging (`tools/soc_log.py` logs it plus a derived accel). |
 | Shift/PRNDL position | `0x1F5`, byte 3 | **CONFIRMED on Gen 1.** `1` PARK, `2` REVERSE, `3` NEUTRAL, `4` DRIVE, `5` LOW. Reported in `status` / the trip log, **not** a `SafetyGate` precondition — a drive-mode change has no driveline implication, so PRNDL does not block a switch (see "Safety model"). `0x135` byte 0 also tracks the shifter but with a messier non-sequential encoding — left undecoded. |
 | EV range remaining | — | **Not documented anywhere found.** The `22 005B` SOC poll (above) is the trigger signal instead — satisfies the design requirement to trigger on range or battery % (DR1/DR3) and is the metric that's actually accessible. |
@@ -381,7 +382,13 @@ capacitance on the Pi's supply to ride through the blip — not yet sized or
 installed. Until then, any capture meant to isolate the ignition-off
 transition cleanly (e.g. `tools/ignition_diff.py`) needs the Pi on an
 external battery/UPS, not the stock USB charger, or the capture process
-dies with the reset.
+dies with the reset. **Session 14 update:** a cold boot into RAP is no
+longer a walk waiting to happen — `state.ignition_on` (fed by `0x3ED`) is a
+`SafetyGate` precondition, so a fresh daemon booting straight into a RAP
+window now reads ignition off and refuses to walk, same as any other RAP
+case. The power-blip hardware fix is still worth doing (an unplanned reboot
+mid-drive is its own problem), but it is no longer what stands between a
+cold boot and a doomed menu walk.
 
 ## Software architecture
 
@@ -647,6 +654,11 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   from a ~10 s service-22 poll; the gauge↔SOC curve is `SOC% ≈
   7.07·bars + 19.6` (r = 0.999). The floor engages at 30 % (mid-2-bar) and
   latches for the rest of the key cycle. This unblocked the armed reconciler.
+- **Ignition on/off → `0x3ED` presence** (Session 14, 2026-09-19). Present
+  with a constant payload while the ignition is on; the whole ID vanishes,
+  including through the RAP window, the instant it goes off. A
+  `SafetyGate._precondition_failure()` precondition for both the reconciler
+  and manual `set-mode`, closing the gap Session 13 found.
 
 ### Still open
 
@@ -662,18 +674,14 @@ Full detail in `docs/signals-confirmed.md`; decoders in `voltdmf/signals.py`.
   several drives — does the floor engage early enough that the pack never
   reaches the 1→0 bar cliff, and does the b3 failsafe hold if a poll gap
   lands at the wrong moment.
-- **A real ignition-state signal.** Elevated from "deferred" by Session 13
-  (2026-09-19, `docs/field-session-log.md`): the car has a retained-power-like
-  window (ignition off, door not opened) where the Pi, cluster, and
-  cluster-related bus traffic (`0x1F4`/`0x1F5`/`0x3E9`) all stay alive, so
-  `state.bus_active` cannot tell it apart from ignition-on and the reconciler
-  tried to walk the menu into it. Interim mitigation shipped
-  (`voltdmf/modecycle.py` `MENU_UNRESPONSIVE_TAPS` aborts a doomed walk after
-  3 taps instead of 12), but it is a blast-radius reduction, not an ignition
-  gate — the reconciler still has no idea the ignition is off. Hunt the real
-  signal with `tools/ignition_diff.py` (three-window on/off/on capture,
-  modeled on `headlight_diff.py`) on the next drive that ends without opening
-  a door.
+- **Measure `0x3ED`'s transmit period.** Session 14 (2026-09-19) confirmed
+  `0x3ED` presence as the real ignition-state signal (see the "Known CAN
+  signals" table and `docs/field-session-log.md` Session 14) and wired it
+  into `SafetyGate._precondition_failure()`, but its own frame rate wasn't
+  captured before the Pi dropped off the network mid-session.
+  `IGNITION_QUIET_TIMEOUT_S` (`voltdmf/state.py`) currently borrows
+  `BUS_QUIET_TIMEOUT_S` (2.0 s) as a placeholder — tighten or loosen once a
+  real rate is measured.
 
 ### Deferred (not blocking)
 

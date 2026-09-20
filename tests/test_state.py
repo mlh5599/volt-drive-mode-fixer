@@ -10,7 +10,8 @@ import pytest
 
 from voltdmf import state as state_module
 from voltdmf.signals import EngineState
-from voltdmf.state import ENGINE_COUNTER_IDLE_S, VehicleState
+from voltdmf.state import (ENGINE_COUNTER_IDLE_S, IGNITION_QUIET_TIMEOUT_S,
+                           VehicleState)
 
 
 @pytest.fixture
@@ -157,3 +158,38 @@ def test_a_mid_leg_fuel_cut_does_not_read_as_engine_off(clock):
     clock.advance(40.0)                       # a 70 -> 0 -> 35 mph decel
     assert st.engine_counter_advancing() is False
     assert st.engine_running is True
+
+
+# -- ignition_on: 0x3ED presence (Session 14, 2026-09-19) -----------------
+
+def test_ignition_on_is_false_with_no_frame_yet(clock):
+    """Fails closed, unlike engine_running -- no 0x3ED yet means the gate
+    that reads this must not let a walk go out."""
+    assert VehicleState().ignition_on is False
+
+
+def test_ignition_on_is_true_right_after_a_frame(clock):
+    st = VehicleState()
+    st.mark_ignition_seen()
+    assert st.ignition_on is True
+
+
+def test_ignition_on_goes_false_once_the_frame_goes_stale(clock):
+    """The whole point: 0x3ED stops during the RAP window even though the
+    rest of the bus keeps talking, and this has to notice within one
+    timeout window, not linger on the last frame forever."""
+    st = VehicleState()
+    st.mark_ignition_seen()
+    clock.advance(IGNITION_QUIET_TIMEOUT_S - 0.1)
+    assert st.ignition_on is True
+    clock.advance(0.2)
+    assert st.ignition_on is False
+
+
+def test_ignition_on_recovers_when_the_frame_resumes(clock):
+    st = VehicleState()
+    st.mark_ignition_seen()
+    clock.advance(IGNITION_QUIET_TIMEOUT_S + 1.0)
+    assert st.ignition_on is False
+    st.mark_ignition_seen()
+    assert st.ignition_on is True

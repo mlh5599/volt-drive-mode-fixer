@@ -83,6 +83,11 @@ def can_state(channel: str) -> str:
 def _bus_tag(channel: str, state: VehicleState) -> str:
     if not state.bus_active:
         return "QUIET"
+    if not state.ignition_on:
+        # Bus alive, ignition confirmed off (0x3ED gone) -- the RAP window
+        # (Session 13/14). Distinct from QUIET: this is the exact state that
+        # used to read as ACTIVE and let the reconciler try to walk the menu.
+        return "RAP"
     raw = can_state(channel)
     return _BUS_WORD.get(raw, raw)
 

@@ -20,11 +20,87 @@ first.
 | Passive SOC signal (retiring the poll) | not found — poll stands | 8, 9 |
 | 30 % floor timing over several drives | not yet validated | — |
 | `roles/voltdmf` config migration | not yet done | — |
-| Ignition-off-without-door-open (RAP) signal (`ignition_diff.py`) | not found — interim fast-abort mitigation shipped | 13 |
+| Ignition on/off (`0x3ED` presence) | confirmed on-road, wired into `SafetyGate` | 13, 14 |
 | Charge-current setpoint (12 A stretch goal) | capture done, not injected | — |
 
 Each session below links its captures and any write-up in `docs/analysis/`
 — that's where drive-by-drive outcomes live.
+
+---
+
+## Session 14 — 2026-09-19 (in the car, ignition on/off/on x2 — the RAP signal, found and wired in)
+
+Same day as Session 13, later. Owner sat in the parked car and ran the
+capture Session 13 asked for: ignition ON → OFF (door not opened, into RAP)
+→ ON, coordinated live over chat rather than through `tools/ignition_diff.py`
+directly (its `input()`-driven prompts don't fit a remote/chat-paced
+session, so the ON/OFF/ON windows were captured with ad-hoc `candump`
+snapshots over SSH instead and diffed by hand using the same appear/disappear
+logic the tool already implements).
+
+First cycle surfaced one clean candidate: **`0x3ED`**. Present with a
+constant payload `80 00 00 00 00 FF` whenever the ignition is on; the ID
+disappears from the bus entirely — not a byte change, the whole arbitration
+ID stops arriving — the instant the ignition goes off, and stays gone through
+the RAP window while the rest of the driving-relevant traffic
+(`0x1E1`/`0x1F4`/`0x1F5`/`0x3E9`/`0x4C5`/`0x3F9`) keeps transmitting
+unchanged. That is exactly the property Session 13 needed: something that
+distinguishes RAP from true ignition-on, since `state.bus_active` cannot.
+
+Per this project's usual bar for a new signal, ran a second independent
+ON/OFF/ON cycle before treating it as confirmed. `0x3ED` reproduced exactly:
+present on, silent off (including through RAP), back the instant ignition
+was pressed on again. Two-for-two — confirmed.
+
+One measurement didn't happen: `0x3ED`'s own transmit rate. The Pi dropped
+off the network mid-session (unreachable to `ping` and `ssh`, cause
+unconfirmed — plausibly the vehicle moving out of range, plausibly another
+reboot) before a frame-rate check could run. `IGNITION_QUIET_TIMEOUT_S`
+(`voltdmf/state.py`) borrows `BUS_QUIET_TIMEOUT_S` (2.0 s) as a documented
+placeholder pending that measurement — same shape as `bus_active`'s existing
+timeout, and conservative if `0x3ED`'s real period turns out to be faster.
+
+**Wired in, same session** (per instruction: write up and write the change,
+push deferred to next lab session):
+
+- `voltdmf/signals.py` — `IGNITION_ADDR = 0x3ED`, `SIGNAL_IDS["ignition"]`
+  (`confirmed=True`), added to `is_signal_frame()`.
+- `voltdmf/state.py` — `VehicleState.last_ignition_signal_monotonic`,
+  `mark_ignition_seen()`, and the `ignition_on` property. Fails **closed**
+  on ignorance (no frame yet, or gone stale ⇒ ignition reads off) — the
+  opposite of `engine_running`'s fail-open union, and deliberately so: this
+  property's only job is gating whether the reconciler is allowed to put
+  taps on the wire, so the safe default on "don't know" is "don't send."
+- `voltdmf/canio.py` — `_DecodeListener` marks `0x3ED` presence.
+- `voltdmf/safety.py` — `SafetyGate._precondition_failure()` gets a third
+  "about the bus" check, `not state.ignition_on`, between `bus_active` and
+  the speed-plausibility check. This is the single gate shared by the
+  reconciler's auto-walk and manual `set-mode`, so both paths now refuse a
+  RAP-window switch instead of only the reconciler skipping its own retry.
+- `voltdmf/daemon.py` — `_reconcile()` now hands the retry budget back on
+  `not state.bus_active or not state.ignition_on`, the same as a bus-quiet
+  reset, so a key cycle that starts and ends inside a RAP window doesn't
+  inherit a spent `AttemptBudget` from the leg before it. Status snapshot
+  gained `"ignition_on"` alongside `"bus_active"`.
+- `voltdmf/lcddash.py` — `_bus_tag()` reports `"RAP"` (bus alive, ignition
+  confirmed off) as its own state, distinct from `"QUIET"` — this is exactly
+  the state that used to read `"ACTIVE"` and let the reconciler try to walk
+  the menu.
+- Tests: `tests/test_state.py`, `test_canio.py`, `test_safety.py`,
+  `test_daemon_control.py`, `test_lcddash.py`, `test_signals.py` all gained
+  coverage, including a regression mirroring the existing bus-quiet
+  key-cycle test but for the RAP-only case (bus active, ignition gone).
+  Full suite green (456 passed) after fixing up the shared "car is on" test
+  fixtures, which built state via `mark_signal_seen()` alone and needed
+  `mark_ignition_seen()` added.
+
+**Still open:** `0x3ED`'s actual transmit period (see above — sets whether
+2.0 s is the right timeout or overly generous/tight); `roles/voltdmf`
+ansible config migration mentioned in Session 9 is unrelated and separately
+still pending; and this change has not yet been driven — everything here is
+bench/parked-car validated (the ON/OFF/ON cycles), not confirmed against a
+moving reconciler pass. Push deferred to the next lab session per the
+owner's instruction.
 
 ---
 

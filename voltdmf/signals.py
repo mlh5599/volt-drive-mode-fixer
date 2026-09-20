@@ -163,6 +163,17 @@ SIGNAL_IDS: dict[str, SignalId] = {
         "latched mode: 0x00 NORMAL, 0x80 SPORT, 0x20 MOUNTAIN, 0x08 HOLD "
         "(720/720 frames steady per mode across a full button walk).",
     ),
+    "ignition": SignalId(
+        "Ignition on/off (presence signal)",
+        0x3ED,
+        confirmed=True,
+        note="Confirmed 2026-09-19 (Session 14, in-car ON/OFF/ON capture via "
+        "tools/ignition_diff.py, reproduced across two independent cycles). "
+        "Constant payload `80 00 00 00 00 FF` while on; the ID vanishes "
+        "entirely, including through the RAP window, the instant the "
+        "ignition goes off. Presence is the signal -- no payload field to "
+        "decode.",
+    ),
 }
 
 #: 0x135 also moves with the shifter (byte 0: 0/1/2/3, non-sequential) but
@@ -447,11 +458,27 @@ def decode_engine_run_counter(data: bytes) -> int | None:
     return data[1] << 8 | data[2]
 
 
+# --- Ignition state (0x3ED) -------------------------------------------
+#
+# Confirmed 2026-09-19 (Session 14, docs/field-session-log.md) by an in-car
+# ON/OFF/ON capture (tools/ignition_diff.py), reproduced across two
+# independent cycles. 0x3ED carries a constant 6-byte payload
+# `80 00 00 00 00 FF` whenever the ignition is on, and is completely ABSENT
+# -- the whole arbitration ID drops off the bus, not a byte changing -- the
+# instant the ignition goes off, including through the retained-power
+# ("RAP") window (Session 13) where 0x1E1/0x1F4/0x1F5/0x3E9/0x4C5/0x3F9 all
+# keep transmitting. This is the signal Session 13 went looking for. Presence
+# is the whole signal -- there is nothing in the payload to decode, so unlike
+# the other frames here there is no ``decode_*`` function: see
+# ``VehicleState.ignition_on`` / ``mark_ignition_seen``.
+IGNITION_ADDR = 0x3ED
+
+
 def is_signal_frame(addr: int) -> bool:
     """True if ``addr`` is one we know how to decode into VehicleState."""
     if addr == SOC_BAR_ADDR or UDS_RESP_ID_LO <= addr <= UDS_RESP_ID_HI:
         return True
     known = {SIGNAL_IDS["speed"].addr, SIGNAL_IDS["shift"].addr,
              SIGNAL_IDS["drive_mode_status"].addr, _ALT_SHIFT_ADDR,
-             ENGINE_STATE_ADDR, ENGINE_RUN_COUNTER_ADDR}
+             ENGINE_STATE_ADDR, ENGINE_RUN_COUNTER_ADDR, IGNITION_ADDR}
     return addr in known

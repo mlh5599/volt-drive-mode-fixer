@@ -482,3 +482,13 @@ def test_decode_listener_ignores_a_short_engine_frame():
     listener.on_message_received(_Frame(signals.ENGINE_RUN_COUNTER_ADDR, b"\x00"))
     assert state.engine_state is signals.EngineState.UNKNOWN
     assert state.engine_run_counter is None
+
+
+# -- _DecodeListener: ignition (0x3ED presence, Session 14) --------------
+def test_decode_listener_marks_ignition_seen_from_3ed():
+    state = VehicleState()
+    assert state.ignition_on is False
+    listener = _DecodeListener(state)
+    listener.on_message_received(
+        _Frame(signals.IGNITION_ADDR, bytes.fromhex("800000000000")))
+    assert state.ignition_on is True

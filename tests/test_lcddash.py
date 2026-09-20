@@ -3,7 +3,7 @@
 import pytest
 
 from voltdmf import lcdlock
-from voltdmf.lcddash import LcdDashboard, bus_label, render_screen
+from voltdmf.lcddash import LcdDashboard, _bus_tag, bus_label, render_screen
 from voltdmf.signals import DriveMode, EngineState, ShiftPosition
 from voltdmf.state import VehicleState
 
@@ -28,6 +28,28 @@ def _selector(label="hold-soc", index=1, floor_latched=False, soc_fresh=True,
              flashing=False):
     return {"label": label, "index": index, "floor_latched": floor_latched,
             "soc_fresh": soc_fresh, "flashing": flashing}
+
+
+# -- _bus_tag ---------------------------------------------------------------
+def test_bus_tag_is_quiet_with_no_traffic():
+    assert _bus_tag("can0", VehicleState()) == "QUIET"
+
+
+def test_bus_tag_is_rap_when_the_bus_is_active_but_ignition_is_off():
+    """The state Session 13/14 exist for: bus alive, 0x3ED gone. Distinct
+    from QUIET -- this used to read ACTIVE and let the reconciler try to
+    walk the menu."""
+    st = VehicleState()
+    st.mark_signal_seen()
+    assert st.ignition_on is False
+    assert _bus_tag("can0", st) == "RAP"
+
+
+def test_bus_tag_checks_can_state_once_ignition_is_confirmed_on():
+    st = VehicleState()
+    st.mark_signal_seen()
+    st.mark_ignition_seen()
+    assert _bus_tag("can0", st) != "RAP"
 
 
 # -- bus_label --------------------------------------------------------------

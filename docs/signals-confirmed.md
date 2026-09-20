@@ -390,22 +390,41 @@ any of it with `tools/engine_check.py <capture> [--since <epoch>]`.
   `voltdmf-ctl status` prints the engine read and any `NOT ACTING:` reason;
   the LCD SOC row gains an `ICE` / `NO HOLD` tag.
 
-## Ignition behavior (from `ignition_check.py`)  (NOT CONFIRMED)
+## Ignition on/off -- `0x3ED` (presence)  (CONFIRMED 2026-09-19, session 14)
 
-- Bus goes quiet with car off? `yes / no`
-- Mode resets to NORMAL on ignition, or remembered? `______`
-- Seconds from "on" to first frames: `______`
-- => sets `ASSUMED_START_MODE` validity in `voltdmf/daemon.py`
-
-**Session 13 (2026-09-19):** the "bus goes quiet with car off" question above
-is now known to have a third answer -- *not always*. A real ignition-off
-(without opening a door) left the cluster, the Pi, and cluster-related
-traffic (`0x1F4`/`0x1F5`/`0x3E9`) all live, so `state.bus_active` read `True`
-straight through it and the reconciler tried to walk the menu. No signal to
-distinguish that retained-power window from true ignition-on is confirmed
-(or even a candidate) yet. `tools/ignition_diff.py` is the follow-up capture
-for the next drive that ends this way -- see `docs/field-session-log.md`
-Session 13.
+- **Bus goes quiet with car off?** *Not always* -- the finding that started
+  this hunt (Session 13, same day): a real ignition-off without opening a
+  door leaves the cluster, the Pi, and cluster-related traffic
+  (`0x1E1`/`0x1F4`/`0x1F5`/`0x3E9`/`0x4C5`/`0x3F9`) all live through a
+  retained-accessory-power-like window ("RAP"). `state.bus_active` cannot
+  tell RAP from true ignition-on, because it is fed by that same traffic.
+- **The signal:** arbitration ID `0x3ED`. Present with a constant payload
+  `80 00 00 00 00 FF` whenever the ignition is on. The *entire ID* stops
+  arriving -- not a byte within it changing -- the instant the ignition goes
+  off, and stays absent through the RAP window while the rest of the bus
+  above keeps transmitting unchanged. Presence is the signal; there is no
+  payload field to decode.
+- **Method:** in-car ON -> OFF (no door open, into RAP) -> ON capture,
+  coordinated live over chat (owner operating the ignition, reporting state
+  changes) rather than through `tools/ignition_diff.py`'s interactive
+  prompts directly -- captured with ad-hoc `candump` snapshots over SSH and
+  diffed by hand (same appear/disappear-ID logic `ignition_diff.py`
+  implements). Reproduced across **two independent ON/OFF/ON cycles** before
+  being treated as confirmed, per this project's usual bar.
+- **Not yet measured:** `0x3ED`'s own transmit period -- the Pi dropped off
+  the network mid-session before a frame-rate check could run.
+  `IGNITION_QUIET_TIMEOUT_S` (`voltdmf/state.py`) borrows
+  `BUS_QUIET_TIMEOUT_S` (2.0 s) as a documented placeholder pending that
+  measurement.
+- Implemented: `signals.IGNITION_ADDR` / `SIGNAL_IDS["ignition"]`
+  (`confirmed=True`, in `is_signal_frame`); `state.VehicleState.ignition_on`
+  (fails **closed** on ignorance, unlike `engine_running`'s fail-open union
+  -- see the property's docstring); `_DecodeListener` marks it in
+  `canio.py`; `SafetyGate._precondition_failure()` gates both the
+  reconciler's auto-walk and manual `set-mode` on it; the daemon hands the
+  retry budget back on ignition-loss the same as bus-quiet; the LCD's
+  `_bus_tag()` reports a distinct `"RAP"` state. Full write-up:
+  `docs/field-session-log.md` Session 14.
 
 ## Charge current setpoint — 8 A / 12 A Level 1  (stretch goal — NOT CONFIRMED)
 

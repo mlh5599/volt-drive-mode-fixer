@@ -43,6 +43,10 @@ class _FakeGate:
             # What the real gate does with the ignition off. Worth honouring
             # here: "no taps went out" is what the retry budget counts on.
             return RequestOutcome(False, 0, True, "blocked: bus is quiet (car off?)")
+        if not state.ignition_on:
+            # RAP window: bus_active alone stays True, so this needs its own
+            # check -- see SafetyGate._precondition_failure.
+            return RequestOutcome(False, 0, True, "blocked: ignition is off (RAP window?)")
         # Both entry points feed request_calls: _reconcile switched to
         # request_verbose when the retry budget needed the tap count, and a
         # test asking "did it walk?" should not care which one it used.
@@ -64,6 +68,7 @@ def _active_state(**kw):
         st.soc_percent_monotonic = time.monotonic()
         st.soc_source = "poll"
     st.mark_signal_seen()
+    st.mark_ignition_seen()
     return st
 
 
@@ -760,6 +765,25 @@ def test_status_snapshot_is_json_serialisable():
     assert "dry_run" not in snap
 
 
+def test_status_snapshot_reports_ignition_on():
+    d = _daemon()
+    d._state = _active_state()  # marks both bus_active and ignition_on
+    d._gate = _FakeGate(RequestOutcome(False, 0, False, ""))
+    assert d._status_snapshot()["ignition_on"] is True
+
+
+def test_status_snapshot_reports_ignition_off_in_the_rap_window():
+    """bus_active alone would still read True here -- ignition_on is the
+    field that actually distinguishes RAP (Session 13/14)."""
+    d = _daemon()
+    d._state = _active_state()
+    d._state.last_ignition_signal_monotonic = None
+    d._gate = _FakeGate(RequestOutcome(False, 0, False, ""))
+    snap = d._status_snapshot()
+    assert snap["bus_active"] is True
+    assert snap["ignition_on"] is False
+
+
 def test_unhandled_command_name():
     reply = _daemon()._handle_command("frobnicate", {})
     assert reply["ok"] is False
@@ -916,6 +940,21 @@ def test_the_bus_going_quiet_ends_the_key_cycle():
     d._state.last_signal_monotonic = time.monotonic() - 60.0  # ignition off
     _passes(d, 1)
     d._state.mark_signal_seen()                               # and back on
+    _passes(d, 1)
+    assert len(d._gate.request_calls) == 4
+
+
+def test_the_rap_window_also_ends_the_key_cycle():
+    """Session 13/14: bus_active alone stays True through RAP (door not
+    opened), so a spent budget must also hand itself back on 0x3ED alone
+    going stale -- otherwise a driver who cycles the key inside the RAP
+    window comes back to a budget that thinks it already tried and failed."""
+    d = _walking()
+    _passes(d, 5)
+    assert len(d._gate.request_calls) == 3          # budget spent
+    d._state.last_ignition_signal_monotonic = None  # RAP: bus stays live, 0x3ED gone
+    _passes(d, 1)
+    d._state.mark_ignition_seen()                    # ignition confirmed back on
     _passes(d, 1)
     assert len(d._gate.request_calls) == 4
 

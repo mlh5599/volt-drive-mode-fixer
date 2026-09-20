@@ -177,18 +177,29 @@ class SafetyGate:
     ) -> str | None:
         """Why a switch to ``target`` must not go out now, or ``None``.
 
-        Two checks about the *bus* rather than the driveline -- a quiet bus
-        means nobody is listening, and an implausible speed means the frames
-        we are reading are garbage (see the note on shift above) -- plus one
-        about the target: a mode the car has taken off the menu cannot be
-        walked to, so trying only spends taps.
+        Three checks about the *bus* rather than the driveline -- a quiet bus
+        means nobody is listening, ignition-off means the ignition itself is
+        confirmed off even if the bus is not quiet, and an implausible speed
+        means the frames we are reading are garbage (see the note on shift
+        above) -- plus one about the target: a mode the car has taken off the
+        menu cannot be walked to, so trying only spends taps.
 
         That last one lives here rather than only in the reconciler so that a
         hand-typed ``voltdmf-ctl set-mode hold`` gets the same answer, and
         gets it as a sentence instead of as twelve taps and a timeout.
+
+        The ignition check is what actually covers the retained-power (RAP)
+        window (docs/field-session-log.md Session 13): the car has a window
+        -- ignition off, door not opened -- where the cluster and most of the
+        bus (0x1E1/0x1F4/0x1F5/0x3E9/0x4C5/0x3F9) all keep transmitting, so
+        ``bus_active`` alone stays True right through it. 0x3ED (Session 14)
+        is confirmed to go silent for the whole window, so ``ignition_on`` is
+        checked separately rather than folded into ``bus_active``.
         """
         if not state.bus_active:
             return "bus is quiet (car off?)"
+        if not state.ignition_on:
+            return "ignition is off (RAP window?)"
         if state.speed_mph is not None and state.speed_mph > MAX_PLAUSIBLE_SPEED_MPH:
             return f"implausible speed {state.speed_mph:.0f} mph"
         return charge_sustaining_block(state, target)

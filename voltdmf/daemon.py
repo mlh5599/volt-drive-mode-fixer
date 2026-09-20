@@ -422,9 +422,11 @@ class Daemon:
         # healthy pack lands here until the first 0x1F4 frame decodes.)
         if state.drive_mode is None:
             return
-        # Bus gone quiet = ignition off = a new key cycle next time it speaks.
-        # Hand the retry budget back, the way a restart would.
-        if not state.bus_active:
+        # Bus quiet, or ignition confirmed off (0x3ED gone -- covers the RAP
+        # window a quiet-bus check alone misses, Session 13/14) = a new key
+        # cycle next time it speaks. Hand the retry budget back, the way a
+        # restart would.
+        if not state.bus_active or not state.ignition_on:
             self._attempts.reset()
 
         desired = self._reconciler.desired_mode(state)
@@ -963,6 +965,7 @@ class Daemon:
             "uds_resp_id": st.uds_resp_id if st is not None else None,
             "speed_mph": st.speed_mph if st is not None else None,
             "bus_active": bool(st is not None and st.bus_active),
+            "ignition_on": bool(st is not None and st.ignition_on),
             "manual_override": (self._manual_target.value
                                 if self._manual_target else None),
             "cooldown_remaining_s": (round(gate.cooldown_remaining(), 1)

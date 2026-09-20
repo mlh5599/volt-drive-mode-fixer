@@ -408,6 +408,8 @@ class _DecodeListener(can.Listener):
             counter = signals.decode_engine_run_counter(data)
             if counter is not None:
                 self._state.note_engine_run_counter(counter)
+        elif addr == signals.IGNITION_ADDR:  # 0x3ED presence = ignition on
+            self._state.mark_ignition_seen()
         elif addr == self._status_addr:  # 0x1F4 byte 1 = committed drive mode
             mode = signals.decode_drive_mode(data)
             if mode is not None:

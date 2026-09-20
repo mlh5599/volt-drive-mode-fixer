@@ -193,14 +193,17 @@ def test_confirmed_signal_set():
     # the button injection (0x1E1), and PRNDL (0x1F5 b3) are all confirmed
     # on-vehicle. The two engine signals (0x4C5 b2, 0x3F9 b1-2) were confirmed
     # 2026-09-05 offline against three in-repo captures spanning two labelled
-    # engine starts. Speed still needs a longer discharge drive; SOC is a UDS
-    # poll now, not a SIGNAL_IDS entry.
+    # engine starts. Ignition (0x3ED presence) was confirmed 2026-09-19
+    # (Session 14, in-car ON/OFF/ON capture, reproduced twice). Speed still
+    # needs a longer discharge drive; SOC is a UDS poll now, not a SIGNAL_IDS
+    # entry.
     confirmed = {name for name, s in signals.SIGNAL_IDS.items() if s.confirmed}
     assert confirmed == {"drive_mode_status", "drive_mode_button", "shift",
-                         "engine_state", "engine_run_counter"}
+                         "engine_state", "engine_run_counter", "ignition"}
     assert signals.SIGNAL_IDS["drive_mode_status"].addr == 0x1F4
     assert signals.SIGNAL_IDS["drive_mode_button"].addr == 0x1E1
     assert signals.SIGNAL_IDS["shift"].addr == 0x1F5
+    assert signals.SIGNAL_IDS["ignition"].addr == 0x3ED
     assert "soc" not in signals.SIGNAL_IDS
 
 

@@ -35,6 +35,7 @@ def _state(**kw):
     kw.setdefault("shift", ShiftPosition.DRIVE)
     st = VehicleState(**kw)
     st.mark_signal_seen()
+    st.mark_ignition_seen()
     return st
 
 
@@ -43,6 +44,29 @@ def test_blocks_when_bus_quiet():
     gate = SafetyGate(ctl)
     assert gate.request(DriveMode.HOLD, VehicleState()) is False
     assert ctl.calls == 0
+
+
+def test_blocks_in_the_rap_window_even_though_the_bus_is_active():
+    """The case Session 13/14 exist for: bus_active alone stays True through
+    the retained-power window (ignition off, door not opened), so ignition
+    must be its own precondition -- see the SafetyGate._precondition_failure
+    docstring."""
+    ctl = FakeController()
+    gate = SafetyGate(ctl)
+    st = _state()
+    st.last_ignition_signal_monotonic = None  # never seen 0x3ED this cycle
+    outcome = gate.request_verbose(DriveMode.HOLD, st)
+    assert outcome.sent is False
+    assert outcome.blocked is True
+    assert "ignition" in outcome.reason
+    assert ctl.calls == 0
+
+
+def test_allows_when_ignition_is_confirmed_on():
+    ctl = FakeController(result=1)
+    gate = SafetyGate(ctl)
+    assert gate.request(DriveMode.HOLD, _state()) is True
+    assert ctl.calls == 1
 
 
 @pytest.mark.parametrize("shift", list(ShiftPosition))

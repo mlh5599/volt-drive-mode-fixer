@@ -11,6 +11,17 @@ from .signals import DriveMode, EngineState, ShiftPosition
 #: quiet -> car is off (Global A buses go silent with the ignition off).
 BUS_QUIET_TIMEOUT_S = 2.0
 
+#: If no 0x3ED frame has been seen for this long, ignition is off. Confirmed
+#: 2026-09-19 (Session 14, docs/field-session-log.md): unlike ``bus_active``,
+#: 0x3ED itself goes silent through the retained-power ("RAP") window
+#: (Session 13) where the rest of the bus -- including 0x1E1/0x1F4/0x1F5/
+#: 0x3E9/0x4C5/0x3F9 -- keeps transmitting, so this is what actually
+#: distinguishes RAP from true ignition-on. 0x3ED's own transmit rate has not
+#: been measured yet (the Pi dropped off the network mid-session before that
+#: check could run); this borrows ``BUS_QUIET_TIMEOUT_S`` as a conservative
+#: placeholder pending that measurement.
+IGNITION_QUIET_TIMEOUT_S = BUS_QUIET_TIMEOUT_S
+
 #: How long the 0x3F9 engine run counter may sit still before we stop calling
 #: it a sign of life. It steps on essentially every one of that frame's ~4 Hz
 #: slots while the engine is burning fuel, so 3 s is ~12 missed chances --
@@ -71,15 +82,36 @@ class VehicleState:
     #: ``signals.CURSOR_NORMAL_BIT``.)
     menu_open_hint: bool = False
     last_signal_monotonic: float | None = field(default=None)
+    #: ``time.monotonic()`` of the last 0x3ED frame -- the confirmed ignition
+    #: signal (see :data:`IGNITION_QUIET_TIMEOUT_S`).
+    last_ignition_signal_monotonic: float | None = field(default=None)
 
     def mark_signal_seen(self) -> None:
         self.last_signal_monotonic = time.monotonic()
+
+    def mark_ignition_seen(self) -> None:
+        self.last_ignition_signal_monotonic = time.monotonic()
 
     @property
     def bus_active(self) -> bool:
         if self.last_signal_monotonic is None:
             return False
         return (time.monotonic() - self.last_signal_monotonic) < BUS_QUIET_TIMEOUT_S
+
+    @property
+    def ignition_on(self) -> bool:
+        """True if 0x3ED has arrived within :data:`IGNITION_QUIET_TIMEOUT_S`.
+
+        Fails CLOSED on ignorance, like ``bus_active`` and unlike
+        ``engine_running``'s union: no frame yet, or the frame has gone
+        stale, reads as ignition off. That is the safe default for a signal
+        whose only job is gating whether the reconciler is allowed to put
+        taps on the wire -- see ``SafetyGate._precondition_failure``.
+        """
+        if self.last_ignition_signal_monotonic is None:
+            return False
+        return ((time.monotonic() - self.last_ignition_signal_monotonic)
+                < IGNITION_QUIET_TIMEOUT_S)
 
     def soc_percent_age(self) -> float | None:
         """Seconds since the last poll reply, or ``None`` if none yet."""
